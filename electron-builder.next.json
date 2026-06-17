@@ -1,0 +1,53 @@
+{
+  "appId": "com.cascade.videobatchgenerator.next",
+  "productName": "VideoBatchGeneratorNext",
+  "directories": {
+    "output": "release-next"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "package.json"
+  ],
+  "extraResources": [
+    {
+      "from": "nuitka-dist/backend_entry.dist",
+      "to": "backend/wizstar-server",
+      "filter": [
+        "**/*"
+      ]
+    },
+    {
+      "from": "oiioii-sdk",
+      "to": "oiioii-sdk",
+      "filter": [
+        "**/*"
+      ]
+    },
+    {
+      "from": "dola-video-standalone",
+      "to": "dola-video-standalone",
+      "filter": [
+        "**/*",
+        "!node_modules/.cache/**/*",
+        "!**/.DS_Store"
+      ]
+    }
+  ],
+  "win": {
+    "target": [
+      {
+        "target": "nsis",
+        "arch": [
+          "x64"
+        ]
+      }
+    ]
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "deleteAppDataOnUninstall": false
+  }
+}
