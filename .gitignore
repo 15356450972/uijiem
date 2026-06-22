@@ -1,0 +1,95 @@
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Build outputs
+dist/
+build/
+release*/
+nuitka-dist/
+py-build/
+py-dist/
+*.dmg
+*.exe
+*.app
+*.zip
+*.7z
+*.rar
+
+# Python environments / build outputs
+.venv/
+.venv-build/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.spec.log
+
+# Runtime caches / local app data
+.cache/
+.electron-dev-user-data/
+_wizstar_data_test/
+.wizstar/
+**/.wizstar/
+dola-video-standalone/.doubao-state.json
+dola-video-standalone/.doubao_browsers/
+dola-video-standalone/.mstoken
+dola-video-standalone/.tmp*
+dola-video-standalone/diag-*.json
+dola-video-standalone/evidence/
+dola-video-standalone/img_chunk_*.txt
+dola-video-standalone/temp_img_b64.txt
+dola-video-standalone/run_node_*.log
+*.log
+*.mp4
+*.playable.mp4
+*.pma
+*.network-request
+*.network-response
+electron_log.txt
+electron_only_log.txt
+nuitka-crash-report.xml
+
+# Local source dumps / scratch files
+doubao2api_github_source*/
+_check_accounts.py
+_qf_hosts.py
+
+# Local secrets and environment files
+.env
+.env.*
+**/.env.dola
+!.env.example
+*.pem
+*.key
+*.crt
+credentials*.json
+secrets*.json
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary / generated files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Large local archives / private exports
+wizstar.rar
+order_*.txt
+
+# Captured network data / local SDK test artifacts
+quickframe-sdk-full/videogen_data/
+quickframe-sdk-full/_*.json
+quickframe-sdk-full/_*.txt
+quickframe-sdk-full/generated_*.mp4
+quickframe-sdk-full/*.mp4
+quickframe-sdk-full/storyboard.png
+quickframe-sdk-full/tests/live_*.py
+quickframe-sdk-full/tests/integration_*.py
+quickframe-sdk-full/examples/e2e_*.py

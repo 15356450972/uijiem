@@ -1,0 +1,29 @@
+{
+  "name": "oiioii-sdk",
+  "version": "1.0.0",
+  "description": "OiiOii.ai 完整 SDK - 注册 / 生成图片 / 生成视频 / 查询积分 / 下载",
+  "main": "oiioii_sdk.js",
+  "bin": {
+    "oiioii": "oiioii_cli.js"
+  },
+  "scripts": {
+    "cli": "node oiioii_cli.js",
+    "register": "node oiioii_cli.js register",
+    "login": "node oiioii_cli.js login",
+    "points": "node oiioii_cli.js points",
+    "signin": "node oiioii_cli.js signin",
+    "pricing": "node oiioii_cli.js pricing",
+    "image": "node oiioii_cli.js image",
+    "video": "node oiioii_cli.js video",
+    "download": "node oiioii_cli.js download",
+    "test-captcha": "node tcaptcha_crack.js",
+    "test-email": "node index.js --direct"
+  },
+  "dependencies": {
+    "jsdom": "^29.1.1",
+    "sharp": "^0.34.5"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
