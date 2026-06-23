@@ -96,6 +96,26 @@ function normalizeCookie(cookies) {
     .join('; ');
 }
 
+function normalizeDolaCookie(cookies) {
+  return normalizeCookie((cookies || []).filter((cookie) => {
+    const domain = String(cookie.domain || '').replace(/^\./, '').toLowerCase();
+    return domain === 'dola.com' || domain.endsWith('.dola.com');
+  }));
+}
+
+async function getDolaBrowserCookie(send) {
+  const byUrl = await send('Network.getCookies', { urls: [DOLA_ORIGIN, DOLA_CHAT_URL, 'https://dola.com', 'https://dola.com/chat'] })
+    .catch(() => ({ cookies: [] }));
+  const cookieByUrl = normalizeCookie(byUrl.cookies || []);
+  if (cookieByUrl) return { cookie: cookieByUrl, source: 'browser-cookies' };
+
+  const all = await send('Network.getAllCookies').catch(() => ({ cookies: [] }));
+  const cookieByDomain = normalizeDolaCookie(all.cookies || []);
+  if (cookieByDomain) return { cookie: cookieByDomain, source: 'browser-all-cookies' };
+
+  return { cookie: '', source: 'browser-cookies' };
+}
+
 async function waitForJson(url, timeoutMs) {
   const startedAt = Date.now();
   let lastError;
@@ -478,25 +498,13 @@ async function sendHiToDolaSocket(send, message = DEFAULT_HI_TEXT) {
         }
 
         input.scrollIntoView({ block: 'center', inline: 'center' });
-        input.focus();
-        if (input.isContentEditable || input.classList.contains('ProseMirror')) {
-          document.execCommand('selectAll', false, null);
-          document.execCommand('delete', false, null);
-          document.execCommand('insertText', false, text);
-          input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-        } else {
-          setNativeValue(input, text);
-          input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-
+        const inputRect = input.getBoundingClientRect();
         const clickableCandidates = [
           ...document.querySelectorAll('button'),
           ...document.querySelectorAll('[role="button"]'),
           ...document.querySelectorAll('svg'),
           ...document.querySelectorAll('[class*="send"], [aria-label*="发送"], [aria-label*="send" i]'),
         ].filter((el) => isVisible(el) && !isDisabled(el));
-        const inputRect = input.getBoundingClientRect();
         const sendCandidates = clickableCandidates
           .map((el) => {
             const rect = el.getBoundingClientRect();
@@ -514,19 +522,12 @@ async function sendHiToDolaSocket(send, message = DEFAULT_HI_TEXT) {
           });
         const sendButton = sendCandidates[0];
         if (sendButton) {
-          const target = sendButton.el;
           const rect = sendButton.rect;
           const x = rect.left + rect.width / 2;
           const y = rect.top + rect.height / 2;
-          target.scrollIntoView({ block: 'center', inline: 'center' });
-          target.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', clientX: x, clientY: y, isPrimary: true }));
-          target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
-          target.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', clientX: x, clientY: y, isPrimary: true }));
-          target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
-          target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y }));
           const inputCenterX = inputRect.left + inputRect.width / 2;
           const inputCenterY = inputRect.top + inputRect.height / 2;
-          return JSON.stringify({ ok: true, method: 'button-click', value: text, inputText: getText(input), sendLabel: sendButton.label.slice(0, 120), x, y, inputX: inputCenterX, inputY: inputCenterY, location: location.href });
+          return JSON.stringify({ ok: true, method: 'cdp-input-click', value: text, inputText: getText(input), sendLabel: sendButton.label.slice(0, 120), x, y, inputX: inputCenterX, inputY: inputCenterY, location: location.href });
         }
 
         return JSON.stringify({ ok: false, reason: 'send_button_not_found', value: text, inputText: getText(input), location: location.href });
@@ -538,19 +539,24 @@ async function sendHiToDolaSocket(send, message = DEFAULT_HI_TEXT) {
     try { parsed = JSON.parse(result.result?.value || '{}'); } catch {}
     lastAttempt = { parsed, dismissedLoginModal: lastDismiss, cookieNotice: lastCookieNotice };
     if (parsed.ok) {
-      if (parsed.method === 'button-click' && Number.isFinite(parsed.x) && Number.isFinite(parsed.y)) {
+      if (parsed.method === 'cdp-input-click' && Number.isFinite(parsed.x) && Number.isFinite(parsed.y)) {
         if (Number.isFinite(parsed.inputX) && Number.isFinite(parsed.inputY)) {
+          const selectModifier = process.platform === 'darwin' ? 4 : 2;
+          const selectKey = process.platform === 'darwin' ? 'Meta' : 'Control';
+          const selectCode = process.platform === 'darwin' ? 'MetaLeft' : 'ControlLeft';
+          const selectKeyCode = process.platform === 'darwin' ? 91 : 17;
           await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: parsed.inputX, y: parsed.inputY }).catch(() => null);
           await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: parsed.inputX, y: parsed.inputY, button: 'left', clickCount: 1 }).catch(() => null);
           await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: parsed.inputX, y: parsed.inputY, button: 'left', clickCount: 1 }).catch(() => null);
-          await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Meta', code: 'MetaLeft', windowsVirtualKeyCode: 91, nativeVirtualKeyCode: 91, modifiers: 4 }).catch(() => null);
-          await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 0, modifiers: 4 }).catch(() => null);
-          await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 0, modifiers: 4 }).catch(() => null);
-          await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Meta', code: 'MetaLeft', windowsVirtualKeyCode: 91, nativeVirtualKeyCode: 91 }).catch(() => null);
+          await sleep(300);
+          await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: selectKey, code: selectCode, windowsVirtualKeyCode: selectKeyCode, nativeVirtualKeyCode: selectKeyCode, modifiers: selectModifier }).catch(() => null);
+          await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: selectModifier }).catch(() => null);
+          await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, nativeVirtualKeyCode: 65, modifiers: selectModifier }).catch(() => null);
+          await send('Input.dispatchKeyEvent', { type: 'keyUp', key: selectKey, code: selectCode, windowsVirtualKeyCode: selectKeyCode, nativeVirtualKeyCode: selectKeyCode }).catch(() => null);
           await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 }).catch(() => null);
           await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8, nativeVirtualKeyCode: 8 }).catch(() => null);
           await send('Input.insertText', { text: message }).catch(() => null);
-          await sleep(700);
+          await sleep(500);
         }
         await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: parsed.x, y: parsed.y }).catch(() => null);
         await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: parsed.x, y: parsed.y, button: 'left', clickCount: 1 }).catch(() => null);
@@ -618,15 +624,19 @@ async function extractFromPage(port, waitMs, options = {}) {
       actions.sendHi.requestCookieCaptured = Boolean(requestCookie?.cookie);
       actions.sendHi.requestCookieSource = requestCookie?.source || '';
       if (!requestCookie?.cookie) {
-        throw new Error(`Dola hello request was submitted, but /chat/completion request Cookie was not captured. Send action: ${JSON.stringify(actions.sendHi || {}).slice(0, 1200)}`);
+        actions.sendHi.requestCookieWarning = 'Dola hello request was not exposed through CDP request headers; falling back to browser cookies.';
       }
     }
-    const cookieResult = await send('Network.getCookies', { urls: [DOLA_ORIGIN, DOLA_CHAT_URL] });
-    const browserCookie = normalizeCookie(cookieResult.cookies || []);
+    const browserCookieResult = await getDolaBrowserCookie(send);
+    const browserCookie = browserCookieResult.cookie;
     const cookie = firstValue(requestCookie?.cookie, browserCookie);
-    const cookieSource = requestCookie?.cookie ? requestCookie.source : 'browser-cookies';
+    const cookieSource = requestCookie?.cookie ? requestCookie.source : browserCookieResult.source;
     actions.cookieSource = cookieSource;
     actions.requestCookieCaptured = Boolean(requestCookie?.cookie);
+    actions.browserCookieCaptured = Boolean(browserCookie);
+    if (actions.sendHi && !requestCookie?.cookie && browserCookie) {
+      actions.sendHi.requestCookieFallback = cookieSource;
+    }
     const runtime = await send('Runtime.evaluate', {
       expression: `(() => {
         const fromUrl = {};
@@ -880,7 +890,7 @@ Options:
   --visible      Open Chrome window, suitable for first login or QR login.
   --headless     Run without UI, suitable for an existing logged-in profile.
   --keep-open    Keep Chrome open after grabbing.
-  --send-hi      Send "你好" and save Cookie from the real /chat/completion request header. Enabled by default.
+  --send-hi      Send "你好" for account validation; prefer the real request Cookie and fall back to browser cookies. Enabled by default.
   --hi-text TEXT Send custom text for the account validation request.
   --close-login  Clear Dola cookies/storage from the selected profile after grabbing.
   --clear-login  Alias of --close-login.
@@ -918,7 +928,7 @@ function printResult(result) {
     if (action.dismissedLoginModal?.found) {
       console.log(`[grab-account] login-modal: dismissed (${action.dismissedLoginModal.closed ? 'closed' : 'escape-only'})`);
     }
-    console.log(`[grab-account] send-hi: submitted (${action.method}, confirmed=${action.confirmed ? 'yes' : 'no'}, request-cookie=${action.requestCookieCaptured ? 'yes' : 'no'}${action.requestCookieSource ? `, source=${action.requestCookieSource}` : ''})`);
+    console.log(`[grab-account] send-hi: submitted (${action.method}, confirmed=${action.confirmed ? 'yes' : 'no'}, request-cookie=${action.requestCookieCaptured ? 'yes' : 'no'}${action.requestCookieSource ? `, source=${action.requestCookieSource}` : ''}${action.requestCookieFallback ? `, fallback=${action.requestCookieFallback}` : ''})`);
   }
   if (result.actions?.clearLogin) {
     console.log(`[grab-account] close-login: ok (cookies=${result.actions.clearLogin.clearedCookies})`);

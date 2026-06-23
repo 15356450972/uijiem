@@ -10,8 +10,8 @@ if (!app.isPackaged) {
   const devUserDataDir = path.join(__dirname, '..', '.electron-dev-user-data');
   app.setPath('userData', devUserDataDir);
 }
-const shouldEnableGpuAcceleration = process.env.UIJIEM_ENABLE_GPU === '1';
-if (!shouldEnableGpuAcceleration) {
+const shouldDisableGpuAcceleration = process.env.UIJIEM_DISABLE_GPU === '1';
+if (shouldDisableGpuAcceleration) {
   app.disableHardwareAcceleration();
   app.commandLine.appendSwitch('disable-gpu');
   app.commandLine.appendSwitch('disable-gpu-compositing');

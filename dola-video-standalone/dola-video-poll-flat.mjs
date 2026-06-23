@@ -55,6 +55,22 @@ if (!envLoaded) {
 
 applyGlobalProxyFromEnv();
 
+let sdkAsyncError = '';
+function isBdmsSdkNoise(error) {
+  const text = String(error?.stack || error?.message || error || '');
+  return text.includes('bdms-sdk.js') || text.includes('_opt_tiger_compile_path') || text.includes('flow_web_monorepo');
+}
+process.on('uncaughtException', (error) => {
+  if (!isBdmsSdkNoise(error)) throw error;
+  sdkAsyncError = String(error?.message || 'bdms-sdk 异步异常');
+  console.warn(`[sdk-warning] ${sdkAsyncError}`);
+});
+process.on('unhandledRejection', (reason) => {
+  if (!isBdmsSdkNoise(reason)) throw reason;
+  sdkAsyncError = String(reason?.message || reason || 'bdms-sdk 异步异常');
+  console.warn(`[sdk-warning] ${sdkAsyncError}`);
+});
+
 // 真实浏览器伪装（与 gen 保持一致）
 const DOLA_BROWSER_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
@@ -153,7 +169,7 @@ function extractMessageFailure(msg, blocks) {
   const code = ext.ai_creation_res_code || '';
   const toolList = ext.ai_creation_tool_list || '';
   const failedTool = /"status"\s*:\s*5|"fail_code"/i.test(toolList);
-  const textFailure = texts.find((text) => /无法|失败|错误|不支持|保护|换其他参考图|生成失败/.test(text));
+  const textFailure = texts.find((text) => /无法|失败|错误|不支持|保护|换其他参考图|生成失败|侵权|违规|违法|违禁|无法返回/.test(text));
   if (code || failedTool || textFailure) {
     return [textFailure, code ? `ai_creation_res_code=${code}` : '', failedTool ? 'tool_status=failed' : '']
       .filter(Boolean)
@@ -265,6 +281,14 @@ function extractFromMessages(messages) {
   };
 }
 
+function withTimeout(promise, ms, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function main() {
   const conversationId = process.argv[2];
   const outputPath = process.argv[3] || '';
@@ -275,6 +299,7 @@ async function main() {
 
   const maxMs = Number(process.env.DOLA_MAX_POLL_TIME_MS) || 720_000;
   const intervalMs = Number(process.env.DOLA_POLL_INTERVAL_MS) || 10_000;
+  const requestTimeoutMs = Number(process.env.DOLA_POLL_REQUEST_TIMEOUT_MS) || 15_000;
   const startTs = Date.now();
 
   console.log(`[poll] conversation_id=${conversationId}`);
@@ -287,7 +312,7 @@ async function main() {
     attempt++;
     const elapsed = Math.round((Date.now() - startTs) / 1000);
     try {
-      const result = await pollOnce(conversationId);
+      const result = await withTimeout(pollOnce(conversationId), requestTimeoutMs, 'pollOnce');
 
       if (result?.code && result.code !== 0) {
         const msg = result.msg || result.message || JSON.stringify(result).slice(0, 200);
@@ -298,11 +323,6 @@ async function main() {
         console.log(`  [${elapsed}s] ok, messages=${messages.length}`);
         const cands = extractFromMessages(messages);
         lastDiagnostics = cands.diagnostics;
-        if (cands.diagnostics.failures?.length) {
-          const reason = cands.diagnostics.failures.join('；');
-          console.error(`[失败] ${reason}`);
-          process.exit(1);
-        }
         if (cands.candidates.length > 0) {
           const pick = cands.candidates[0];
           console.log(`\n[done] video url found:`);
@@ -319,7 +339,7 @@ async function main() {
           console.log(`  mime:     ${pick.mime}`);
           if (outputPath) {
             console.log(`\n[download] -> ${outputPath}`);
-            const res = await fetch(pick.url);
+            const res = await withTimeout(fetch(pick.url), requestTimeoutMs, 'video download');
             if (!res.ok) {
               console.error(`  download failed: HTTP ${res.status}`);
               console.error(`[失败] 视频下载失败: HTTP ${res.status}`);
@@ -338,12 +358,19 @@ async function main() {
           }
           process.exit(0);
         }
+        if (cands.diagnostics.failures.length > 0) {
+          const reason = cands.diagnostics.failures.join('；');
+          console.error(`[diagnostics] 失败: ${reason}`);
+          console.error(`[失败] ${reason}`);
+          process.exit(1);
+        }
       }
     } catch (e) {
       if (!firstError) firstError = e.message;
       console.log(`  [${elapsed}s] exception: ${e.message}`);
     }
 
+    if (!firstError && sdkAsyncError) firstError = sdkAsyncError;
     await new Promise(r => setTimeout(r, intervalMs));
   }
 
@@ -366,14 +393,13 @@ async function main() {
   if (firstError) console.error(`[first-error] ${firstError}`);
   // 给上游 Python 解析器使用的失败原因（取诊断里最有信息量的一条）
   {
-    let reason = firstError;
+    let reason = '';
     if (lastDiagnostics) {
-      if (lastDiagnostics.failures && lastDiagnostics.failures.length) reason = reason ? `${reason}；${lastDiagnostics.failures.join('；')}` : lastDiagnostics.failures.join('；');
-      else if (lastDiagnostics.issues && lastDiagnostics.issues.length) reason = reason ? `${reason}；${lastDiagnostics.issues.join('；')}` : lastDiagnostics.issues.join('；');
-      else if (!lastDiagnostics.hasVideoBlock && !reason) reason = '服务端始终未返回视频块，可能仍在生成中或生成失败';
-    } else if (!reason) {
-      reason = '整个轮询期间未成功拉取到任何消息';
+      if (lastDiagnostics.failures && lastDiagnostics.failures.length) reason = lastDiagnostics.failures.join('；');
+      else if (lastDiagnostics.issues && lastDiagnostics.issues.length) reason = lastDiagnostics.issues.join('；');
+      else if (!lastDiagnostics.hasVideoBlock) reason = '服务端始终未返回视频块，可能仍在生成中或生成失败';
     }
+    if (!reason) reason = firstError || '整个轮询期间未成功拉取到任何消息';
     console.error(`[失败] ${reason || `未在 ${maxMs}ms 内获取到视频`}`);
   }
   process.exit(1);

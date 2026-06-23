@@ -40,6 +40,15 @@ dola-video-standalone/evidence/
 dola-video-standalone/img_chunk_*.txt
 dola-video-standalone/temp_img_b64.txt
 dola-video-standalone/run_node_*.log
+dola-video-standalone/_debug_*.mjs
+dola-video-standalone/debug-*.mjs
+dola-video-standalone/diag-*.mjs
+dola-video-standalone/tmp-*.mjs
+dola-video-standalone/test-*.mjs
+dola-video-standalone/dola-raw-*.mjs
+dola-video-standalone/serve-img.mjs
+dola-video-standalone/DOLA_*_DOWNLOAD.md
+dola-video-standalone/*-flow.md
 *.log
 *.mp4
 *.playable.mp4

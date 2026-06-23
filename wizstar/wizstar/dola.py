@@ -1149,22 +1149,24 @@ def _parse_generation_output(output: str) -> dict:
     saved_path = _extract_first(r"保存到:\s*(.+?)(?:\s*\(|\n|$)", output)
     if not saved_path:
         saved_path = _extract_first(r"保存到:\s*(.+)$", output)
-    failure_reason = _extract_first(r"\[失败\]\s*([^\n]+)", output)
-    if failure_reason:
-        failure_reason = _compact_log_text(failure_reason)
-        pending_or_noise_markers = (
-            "整个轮询期间未成功拉取到任何消息",
-            "服务端始终未返回视频块",
-            "未在",
-            "_opt_tiger_compile_path",
-            "node_modules",
-            "function",
-            "var ",
-        )
-        if any(marker in failure_reason for marker in pending_or_noise_markers):
-            failure_reason = ""
-        elif not _extract_failure_reason(f"[失败] {failure_reason}"):
-            failure_reason = ""
+    failure_reason = ""
+    if not video_url and not saved_path:
+        failure_reason = _extract_first(r"\[失败\]\s*([^\n]+)", output)
+        if failure_reason:
+            failure_reason = _compact_log_text(failure_reason)
+            pending_or_noise_markers = (
+                "整个轮询期间未成功拉取到任何消息",
+                "服务端始终未返回视频块",
+                "未在",
+                "_opt_tiger_compile_path",
+                "node_modules",
+                "function",
+                "var ",
+            )
+            if any(marker in failure_reason for marker in pending_or_noise_markers):
+                failure_reason = ""
+            elif not _extract_failure_reason(f"[失败] {failure_reason}"):
+                failure_reason = ""
     return {
         "conversation_id": conversation_id,
         "video_url": video_url,
@@ -1198,6 +1200,8 @@ def _extract_failure_reason(output: str) -> str:
         return _compact_log_text(reason)[:1200]
 
     failure_patterns = [
+        ("内容未通过，无法返回视频", r"生成内容[^。！？\n]{0,60}(?:疑似包含|包含|涉及)[^。！？\n]{0,40}(?:侵权|违规|违法|违禁)[^。！？\n]{0,80}无法返回"),
+        ("内容未通过，无法返回视频", r"无法返回该内容[^。！？\n]{0,80}(?:换个主题|重新尝试|再试试)"),
         ("Dola 浏览器提交没有进入视频能力", r"Dola\s*浏览器提交没有进入视频能力|ability_type\s*=\s*(?!17\b)\d+"),
         ("返回的是图片，不是视频", r"以下是[^。！？\n]{0,80}(?:图片|图像|照片|海报|封面)"),
         ("返回的是图片，不是视频", r"(?:已|已经|为你|帮你)[^。！？\n]{0,50}(?:生成|创作|制作)[^。！？\n]{0,40}(?:图片|图像|照片|海报|封面)"),
@@ -1690,20 +1694,28 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
     """用 dola-video-poll-flat.mjs 轮询 Dola API (/im/chain/single) 获取视频结果。
 
     直接通过 Node 脚本调 signedFetch，不需要开浏览器。
-    轮询完成后直接更新 task 状态为 completed 或 failed。
+    轮询成功后更新为 completed；API 暂无结果或临时异常时保持 collectable 便于重试。
     """
     conv = _clean_str(conversation_id)
     if not conv:
         _fail_task(task_id, "缺少 conversation_id，无法轮询获取视频结果")
         return
     try:
+        current_task = _get_task(task_id)
+        try:
+            current_progress = int(current_task.get("progress") or 0)
+        except (TypeError, ValueError):
+            current_progress = 0
         start_status = "collecting" if manual_collect else "processing"
-        start_reason = "正在手动采集 Dola 结果..." if manual_collect else ""
-        _set_task(task_id, status=start_status, progress=20, error="", fail_reason=start_reason)
+        start_reason = "正在通过 API 采集 Dola 视频结果..." if manual_collect else ""
+        _set_task(task_id, status=start_status, progress=max(20, current_progress), error="", fail_reason=start_reason)
         _sync_task_db_status(task_id, "processing")
         Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
         output_path = os.path.join(DOWNLOAD_DIR, f"dola-{conv}.mp4")
-        result = _run_node(["dola-video-poll-flat.mjs", conv, output_path], timeout=480, env_overrides=env_overrides)
+        poll_env_overrides = dict(env_overrides or {})
+        if manual_collect:
+            poll_env_overrides.setdefault("DOLA_MAX_POLL_TIME_MS", "60000")
+        result = _run_node(["dola-video-poll-flat.mjs", conv, output_path], timeout=90 if manual_collect else 480, env_overrides=poll_env_overrides)
         output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
         parsed = _parse_generation_output(output)
         updates = {
@@ -1716,7 +1728,16 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
             "fail_reason": parsed.get("failure_reason", ""),
             "progress": 100 if result.returncode == 0 or parsed.get("failure_reason") else 90,
         }
-        if parsed.get("failure_reason"):
+        if parsed.get("video_url") or parsed.get("local_path"):
+            _set_task(
+                task_id,
+                **_task_update_payload(updates, "status", "error", "fail_reason"),
+                status="completed",
+                error="",
+                fail_reason="",
+            )
+            _sync_task_db_status(task_id, "completed", parsed.get("local_path") or parsed.get("video_url") or "")
+        elif parsed.get("failure_reason"):
             _fail_task(task_id, parsed.get("failure_reason", ""), **updates)
         elif result.returncode == 0:
             _set_task(
@@ -1729,16 +1750,27 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
             _sync_task_db_status(task_id, "completed", parsed.get("local_path") or parsed.get("video_url") or "")
         else:
             collectable_updates = _task_update_payload(updates, "status", "error", "fail_reason")
+            retry_reason = parsed.get("failure_reason", "") or "暂未拿到视频，已保留会话，可稍后继续采集。"
+            retry_evidence = "\n".join([retry_reason, output])
+            if "服务端始终未返回视频块" in retry_evidence or "整个轮询期间未成功拉取到任何消息" in retry_evidence:
+                retry_reason = "API 暂未读取到该 Dola 会话的视频消息；如果网页已显示视频，可能是当前账号 API 会话看不到这条页面消息。可稍后重试，或显式打开浏览器调试采集。"
             _set_task(
                 task_id,
                 **collectable_updates,
                 status="collectable",
                 error="",
-                fail_reason="暂未拿到视频，已保留会话，可稍后继续采集。",
+                fail_reason=retry_reason,
             )
             _sync_task_db_status(task_id, "collectable")
     except Exception as e:  # noqa: BLE001
-        _fail_task(task_id, f"轮询任务失败: {e}")
+        _set_task(
+            task_id,
+            status="collectable",
+            progress=90,
+            error="",
+            fail_reason=f"API 采集异常，可稍后重试: {e}",
+        )
+        _sync_task_db_status(task_id, "collectable")
 
 
 def _collect_task_result_browser_context(task_id: str, conversation_id: str) -> bool:
@@ -1916,33 +1948,23 @@ def collect_task(task_id: str = "", conversation_id: str = "", account: dict | N
         status="collecting",
         progress=max(20, int(task.get("progress") or 0) if str(task.get("progress") or "").isdigit() else 20),
         error="",
-        fail_reason="正在手动采集 Dola 结果...",
+        fail_reason="正在通过 API 采集 Dola 视频结果...",
         collect_started_at=time.time(),
     )
     _sync_task_db_status(task_id, "processing")
 
     def _run_collect() -> None:
-        current_task = _get_task(task_id)
-        try:
-            browser_port = int(current_task.get("browser_port") or 0)
-        except (TypeError, ValueError):
-            browser_port = 0
-        if browser_port:
-            if _collect_task_result_browser_context(task_id, conv):
-                return
-        if _reopen_account_browser_and_collect(task_id, conv):
-            return
         _poll_task_result(task_id, conv, env_overrides, True)
 
     threading.Thread(target=_run_collect, daemon=True).start()
     return _get_task(task_id)
 
 
-def get_task_status(task_id: str) -> dict:
+def get_task_status(task_id: str, normalize_failure: bool = True) -> dict:
     task = _get_task(task_id)
     if not task:
         raise DolaError("task not found", status_code=404)
-    if task.get("status") not in ("completed", "failed") and not task.get("video_url") and not task.get("local_path"):
+    if normalize_failure and task.get("status") not in ("completed", "failed") and not task.get("video_url") and not task.get("local_path"):
         evidence_text = "\n".join([
             _clean_str(task.get("error")),
             _clean_str(task.get("fail_reason")),

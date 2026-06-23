@@ -366,6 +366,29 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     return currentModel;
   };
   const getRowMediaLabel = (row) => row?.type === 'image' ? '图片' : '视频';
+  const BASIC_ASPECT_RATIOS = ['16:9', '9:16', '1:1'];
+  const EXTENDED_IMAGE_ASPECT_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4'];
+  const CHATGPT2API_IMAGE_ASPECT_RATIOS = ['3:2', '2:3', '1:1'];
+  const getSupportedAspectRatios = ({ channel = generateChannel, modelName = globalModel, mediaType = getModelMediaType(modelName) } = {}) => {
+    if (channel === 'chatgpt2api' || modelName === '渠道五 GPT-Image2') return CHATGPT2API_IMAGE_ASPECT_RATIOS;
+    if (mediaType === 'image') return EXTENDED_IMAGE_ASPECT_RATIOS;
+    return BASIC_ASPECT_RATIOS;
+  };
+  const normalizeAspectRatio = (value, context = {}) => {
+    const supported = getSupportedAspectRatios(context);
+    if (supported.includes(value)) return value;
+    const fallbackByOrientation = {
+      landscape: ['16:9', '3:2', '4:3'],
+      portrait: ['9:16', '2:3', '3:4'],
+      square: ['1:1'],
+    };
+    const ratioGroup = ['9:16', '2:3', '3:4'].includes(value)
+      ? fallbackByOrientation.portrait
+      : value === '1:1'
+        ? fallbackByOrientation.square
+        : fallbackByOrientation.landscape;
+    return ratioGroup.find(r => supported.includes(r)) || supported[0];
+  };
   const [activePopover, setActivePopover] = useState(null); // 'model' | 'params' | 'suffix' | null
   const [userPromptSuffixTemplates, setUserPromptSuffixTemplates] = useState(() => {
     try {
@@ -497,6 +520,13 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     requestAnimationFrame(() => resizePromptTextarea(promptTextareaRefs.current[rowId]));
   };
   const [fullscreenVideo, setFullscreenVideo] = useState(null); // { src, mediaType } for fullscreen preview
+  const [imageEditorEnabled, setImageEditorEnabled] = useState(false);
+  const [imageEditorSaving, setImageEditorSaving] = useState(false);
+  const imageEditorCanvasRef = useRef(null);
+  const imageEditorImageRef = useRef(null);
+  const imageEditorDrawingRef = useRef(false);
+  const imageEditorLastPointRef = useRef(null);
+  const imageEditorHistoryRef = useRef([]);
   const [batchTab, setBatchTab] = useState('import'); // 'import' | 'process' | 'tasks'
   const [conversionFormat, setConversionFormat] = useState('WebP');
   const [conversionResolution, setConversionResolution] = useState('2K');
@@ -554,9 +584,32 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   };
   const toLocalVideoUrl = toLocalVideoUrlValue;
   const toPlayableUrl = toPlayableVideoUrlValue;
+  const originalLocalVideoPathFromPlayable = (filePath = '') => {
+    const raw = String(filePath || '').trim();
+    if (!/\.playable\.[^.]+$/i.test(raw)) return '';
+    return raw.replace(/\.playable(\.[^.]+)$/i, '$1');
+  };
+  const playableFallbackUrlForMaterial = (material = {}) => {
+    const fallbackPath = material.localPath || '';
+    if (fallbackPath && /\.playable\.[^.]+$/i.test(fallbackPath)) return toLocalVideoUrl(fallbackPath);
+    return '';
+  };
   const playableUrlForMaterial = (material = {}) => {
-    if (material.localPath) return toLocalVideoUrl(material.localPath);
+    if (material.localPath) {
+      const originalPath = originalLocalVideoPathFromPlayable(material.localPath);
+      return toLocalVideoUrl(originalPath || material.localPath);
+    }
     return toPlayableUrl(material.sourceUrl || material.remoteUrl || material.thumbnail || '');
+  };
+  const switchVideoToFallback = (event, fallbackUrl = '', shouldPlay = false) => {
+    const video = event?.currentTarget;
+    if (!video || !fallbackUrl) return false;
+    const currentSrc = video.currentSrc || video.src || '';
+    if (currentSrc === fallbackUrl) return false;
+    video.src = fallbackUrl;
+    video.load();
+    if (shouldPlay) video.play().catch(() => {});
+    return true;
   };
   const toDownloadUrl = (url = '', filename = 'video.mp4') =>
     `${WIZSTAR_API}/download/video?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(filename)}`;
@@ -1274,6 +1327,195 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     }
   };
 
+  const loadImageForEditor = (src = '') => new Promise((resolve, reject) => {
+    if (!src) {
+      reject(new Error('缺少图片地址'));
+      return;
+    }
+    const img = new Image();
+    if (/^https?:\/\//i.test(src)) img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('图片加载失败，无法编辑'));
+    img.src = src;
+  });
+
+  const resetImageEditorCanvas = useCallback(async () => {
+    if (!fullscreenVideo?.src || fullscreenVideo.mediaType === 'video' || isVideoUrl(fullscreenVideo.src)) return;
+    const canvas = imageEditorCanvasRef.current;
+    if (!canvas) return;
+    const img = await loadImageForEditor(fullscreenVideo.src);
+    imageEditorImageRef.current = img;
+    const maxWidth = Math.floor(window.innerWidth * 0.86);
+    const maxHeight = Math.floor(window.innerHeight * 0.76);
+    const naturalWidth = img.naturalWidth || img.width || 1;
+    const naturalHeight = img.naturalHeight || img.height || 1;
+    const scale = Math.min(maxWidth / naturalWidth, maxHeight / naturalHeight, 1);
+    canvas.width = Math.max(1, Math.round(naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(naturalHeight * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    imageEditorHistoryRef.current = [];
+  }, [fullscreenVideo]);
+
+  useEffect(() => {
+    if (!imageEditorEnabled) return undefined;
+    let cancelled = false;
+    resetImageEditorCanvas().catch((e) => {
+      if (!cancelled) {
+        console.warn('Reset image editor failed:', e);
+        alert(`打开编辑失败：${e.message || e}`);
+        setImageEditorEnabled(false);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [imageEditorEnabled, resetImageEditorCanvas]);
+
+  const imageEditorPointFromEvent = (event) => {
+    const canvas = imageEditorCanvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const clientX = event.clientX ?? event.touches?.[0]?.clientX;
+    const clientY = event.clientY ?? event.touches?.[0]?.clientY;
+    if (clientX == null || clientY == null) return null;
+    return {
+      x: ((clientX - rect.left) / rect.width) * canvas.width,
+      y: ((clientY - rect.top) / rect.height) * canvas.height,
+    };
+  };
+
+  const startImageEditorStroke = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const point = imageEditorPointFromEvent(event);
+    if (!point) return;
+    const canvas = imageEditorCanvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      imageEditorHistoryRef.current.push(ctx.getImageData(0, 0, canvas.width, canvas.height));
+      if (imageEditorHistoryRef.current.length > 30) imageEditorHistoryRef.current.shift();
+    }
+    imageEditorDrawingRef.current = true;
+    imageEditorLastPointRef.current = point;
+  };
+
+  const moveImageEditorStroke = (event) => {
+    if (!imageEditorDrawingRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const canvas = imageEditorCanvasRef.current;
+    const lastPoint = imageEditorLastPointRef.current;
+    const nextPoint = imageEditorPointFromEvent(event);
+    if (!canvas || !lastPoint || !nextPoint) return;
+    const ctx = canvas.getContext('2d');
+    ctx.strokeStyle = '#ff2f2f';
+    ctx.lineWidth = Math.max(3, Math.round(canvas.width / 160));
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(lastPoint.x, lastPoint.y);
+    ctx.lineTo(nextPoint.x, nextPoint.y);
+    ctx.stroke();
+    imageEditorLastPointRef.current = nextPoint;
+  };
+
+  const endImageEditorStroke = (event) => {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    imageEditorDrawingRef.current = false;
+    imageEditorLastPointRef.current = null;
+  };
+
+  const undoImageEditorStroke = () => {
+    const canvas = imageEditorCanvasRef.current;
+    const previous = imageEditorHistoryRef.current.pop();
+    if (!canvas || !previous) return;
+    const ctx = canvas.getContext('2d');
+    ctx.putImageData(previous, 0, 0);
+  };
+
+  const appendEditedImageToRow = (rowId, filePath) => {
+    if (!rowId || !filePath) return;
+    const displayUrl = makeLocalFileUrl(filePath);
+    setSegments(prev => prev.map(seg => {
+      if (seg.id !== rowId) return seg;
+      const isVid = seg.type === 'video';
+      const listKey = isVid ? 'materialsVideo' : 'materialsImage';
+      const currentKey = isVid ? 'currentMaterialVideo' : 'currentMaterialImage';
+      const list = seg[listKey] || [];
+      const newMatId = Math.max(0, ...list.map((m) => Number(m.id) || 0)) + 1;
+      const newMat = {
+        id: newMatId,
+        name: `编辑图片-${seg.id}-${newMatId}`,
+        thumbnail: displayUrl,
+        sourceUrl: displayUrl,
+        localPath: filePath,
+        remoteUrl: '',
+        mediaType: 'image',
+        status: 'new',
+        textStatus: '编辑',
+        fps: null,
+        duration: '静态图片',
+      };
+      return {
+        ...seg,
+        [listKey]: [newMat, ...list],
+        [currentKey]: {
+          id: newMatId,
+          name: newMat.name,
+          thumbnail: displayUrl,
+          sourceUrl: displayUrl,
+          localPath: filePath,
+          remoteUrl: '',
+          mediaType: 'image',
+          isPlaying: false,
+          fps: null,
+          duration: '静态图片',
+        },
+      };
+    }));
+  };
+
+  const saveEditedImage = async () => {
+    const canvas = imageEditorCanvasRef.current;
+    if (!canvas || !fullscreenVideo?.rowId) return;
+    if (!window.electronAPI?.saveMergedImage) {
+      alert('当前环境不支持本地保存，请在桌面客户端中使用此功能。');
+      return;
+    }
+    setImageEditorSaving(true);
+    try {
+      const blob = await new Promise((resolve, reject) => {
+        canvas.toBlob((item) => item ? resolve(item) : reject(new Error('图片导出失败')), 'image/png');
+      });
+      const bytes = await blobToUint8Array(blob);
+      const res = await window.electronAPI.saveMergedImage({
+        bytes,
+        ext: 'png',
+        defaultName: `编辑图片_${fullscreenVideo.rowId}_${timestampForFilename()}`,
+        silent: true,
+      });
+      if (!res?.ok) throw new Error(res?.error || '保存失败');
+      appendEditedImageToRow(fullscreenVideo.rowId, res.filePath);
+      setFullscreenVideo((prev) => prev ? { ...prev, src: makeLocalFileUrl(res.filePath), localPath: res.filePath } : prev);
+      setImageEditorEnabled(false);
+      alert('已保存为新的当前图片素材');
+    } catch (e) {
+      console.warn('Save edited image failed:', e);
+      alert(`保存失败：${e.message || e}`);
+    } finally {
+      setImageEditorSaving(false);
+    }
+  };
+
+  const closeFullscreenPreview = () => {
+    setImageEditorEnabled(false);
+    setImageEditorSaving(false);
+    setFullscreenVideo(null);
+  };
+
   const imageDragPrepareRef = useRef(new Map());
 
   const getImageDragPayload = (material = {}) => {
@@ -1814,9 +2056,43 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     }
   }, [globalModel, globalAspectRatio, globalDuration, globalResolution, generateChannel]);
 
+  useEffect(() => {
+    const normalizedAspectRatio = normalizeAspectRatio(globalAspectRatio, {
+      channel: generateChannel,
+      modelName: globalModel,
+      mediaType: getModelMediaType(globalModel),
+    });
+    if (normalizedAspectRatio === globalAspectRatio) return;
+    setGlobalAspectRatio(normalizedAspectRatio);
+    setSegments(prev => prev.map(seg => {
+      const rowMediaType = seg.type || getModelMediaType(seg.model || globalModel);
+      return {
+        ...seg,
+        aspectRatio: normalizeAspectRatio(seg.aspectRatio || normalizedAspectRatio, {
+          channel: generateChannel,
+          modelName: seg.model || globalModel,
+          mediaType: rowMediaType,
+        }),
+      };
+    }));
+  }, [globalModel, globalAspectRatio, generateChannel]);
+
   const updateGlobalAspectRatio = (aspectRatio) => {
-    setGlobalAspectRatio(aspectRatio);
-    setSegments(prev => prev.map(seg => ({ ...seg, aspectRatio })));
+    const normalizedAspectRatio = normalizeAspectRatio(aspectRatio, {
+      channel: generateChannel,
+      modelName: globalModel,
+      mediaType: getModelMediaType(globalModel),
+    });
+    setGlobalAspectRatio(normalizedAspectRatio);
+    setSegments(prev => prev.map(seg => {
+      const rowMediaType = seg.type || getModelMediaType(seg.model || globalModel);
+      const rowAspectRatio = normalizeAspectRatio(normalizedAspectRatio, {
+        channel: generateChannel,
+        modelName: seg.model || globalModel,
+        mediaType: rowMediaType,
+      });
+      return { ...seg, aspectRatio: rowAspectRatio };
+    }));
   };
 
   const updateGlobalDuration = (duration) => {
@@ -1832,14 +2108,20 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   const selectGenerationModel = (modelName, channel) => {
     const nextChannel = channel === 'quickframe' ? 'wizstar' : channel;
     const nextType = getModelMediaType(modelName);
+    const nextAspectRatio = normalizeAspectRatio(globalAspectRatio, {
+      channel: nextChannel,
+      modelName,
+      mediaType: nextType,
+    });
     setGlobalModel(modelName);
     setGenerateChannel(nextChannel);
     setModelPopoverTab(nextType);
+    setGlobalAspectRatio(nextAspectRatio);
     setSegments(prev => prev.map(seg => ({
       ...seg,
       model: modelName,
       type: nextType,
-      aspectRatio: globalAspectRatio,
+      aspectRatio: nextAspectRatio,
       duration: globalDuration,
       quality: globalResolution,
     })));
@@ -2269,8 +2551,12 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
       const prompt = promptText;
       const modelMap = { 'Seedance 2.0': 'seedance2.0', 'Seedance 1.5': 'seedance1.5', 'Kling': 'kling' };
-      const ratioMap = { '16:9': '16:9', '9:16': '9:16', '1:1': '1:1' };
       const durationSec = resolveDurationSeconds(seg?.duration, globalDuration, 5);
+      const videoRatio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
+        channel: 'wizstar',
+        modelName: seg?.model || globalModel,
+        mediaType: 'video',
+      });
 
       const picUrl = await resolveImageUrl(seg, id, account, promptText);
 
@@ -2280,7 +2566,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         task_type: taskType,
         prompt,
         model: modelMap[seg?.model || globalModel] || 'seedance2.0',
-        video_ratio: ratioMap[seg?.aspectRatio || globalAspectRatio] || '16:9',
+        video_ratio: videoRatio,
         video_duration: durationSec,
         video_num: 1,
       };
@@ -2404,9 +2690,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       };
       const selectedModelName = dolaModelMap[seg?.model] ? seg.model : (dolaModelMap[globalModel] ? globalModel : '渠道六 Seedance 2.0');
       const model = dolaModelMap[selectedModelName] || 'seedance-2.0';
-      const ratio = ['16:9', '9:16', '1:1'].includes(seg?.aspectRatio || globalAspectRatio)
-        ? (seg?.aspectRatio || globalAspectRatio)
-        : '16:9';
+      const ratio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
+        channel: 'dola',
+        modelName: selectedModelName,
+        mediaType: 'video',
+      });
       const durationSec = resolveDurationSeconds(globalDuration, seg?.duration, 5);
 
       const localImagePath = getReferenceLocalPath(seg);
@@ -2642,8 +2930,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       const model = pixmaxModelMap[seg?.model || globalModel] || 'pixdance-2-fast';
 
       const durationSec = resolveDurationSeconds(seg?.duration, globalDuration, 5);
-      const aspectRatio = ['16:9', '9:16', '1:1'].includes(seg?.aspectRatio || globalAspectRatio)
-        ? (seg?.aspectRatio || globalAspectRatio) : '16:9';
+      const aspectRatio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
+        channel: 'pixmax',
+        modelName: seg?.model || globalModel,
+        mediaType: 'video',
+      });
 
       const body = {
         prompt: promptText,
@@ -2731,15 +3022,19 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         ? (seg.currentMaterialImage.sourceUrl || seg.currentMaterialImage.remoteUrl || seg.currentMaterialImage.thumbnail || '')
         : '';
       const referenceImageUrl = remoteImageUrl || (/^https?:\/\//i.test(currentImageUrl) ? currentImageUrl : '');
-      const aspectRatio = ['16:9', '9:16', '1:1', '4:3', '3:4'].includes(seg?.aspectRatio || globalAspectRatio)
-        ? (seg?.aspectRatio || globalAspectRatio)
-        : '16:9';
+      const aspectRatio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
+        channel: 'chatgpt2api',
+        modelName: '渠道五 GPT-Image2',
+        mediaType: 'image',
+      });
       const chatgpt2apiSizeMap = {
         '1:1': '1024x1024',
         '16:9': '1536x1024',
         '4:3': '1536x1024',
+        '3:2': '1536x1024',
         '9:16': '1024x1536',
         '3:4': '1024x1536',
+        '2:3': '1024x1536',
       };
       const imageSize = chatgpt2apiSizeMap[aspectRatio] || 'auto';
 
@@ -2838,8 +3133,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       const model = modelMap[selectedModelName] || modelMap[fallbackModelName];
 
       const durationSec = resolveDurationSeconds(seg?.duration, globalDuration, 10);
-      const aspectRatio = ['16:9', '9:16', '1:1'].includes(seg?.aspectRatio || globalAspectRatio)
-        ? (seg?.aspectRatio || globalAspectRatio) : '16:9';
+      const aspectRatio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
+        channel: 'oiioii',
+        modelName: selectedModelName,
+        mediaType: isImageRow ? 'image' : 'video',
+      });
 
       const imageResolution = ['2K', '4K'].includes(seg?.quality || globalResolution)
         ? (seg?.quality || globalResolution)
@@ -3960,7 +4258,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 <div>
                   <p className="text-[10px] text-dark-muted font-bold mb-2 uppercase tracking-wider">宽高比 ①</p>
                   <div className="flex flex-wrap gap-1.5">
-                    {['16:9', '9:16', '1:1', '4:3', '3:4'].map(r => (
+                    {getSupportedAspectRatios({ channel: generateChannel, modelName: globalModel, mediaType: getModelMediaType(globalModel) }).map(r => (
                       <button
                         key={r}
                         type="button"
@@ -3975,6 +4273,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       </button>
                     ))}
                   </div>
+                  {getModelMediaType(globalModel) === 'video' && (
+                    <p className="mt-1.5 text-[9px] text-dark-subtle leading-relaxed">
+                      当前视频通道仅显示可提交比例，避免 4:3 / 3:4 被平台静默改成 16:9。
+                    </p>
+                  )}
                 </div>
 
                 {/* Section 2: 图片分辨率 */}
@@ -4369,9 +4672,16 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         <button 
                           onClick={() => {
                             const nextModel = IMAGE_MODEL_NAMES.has(globalModel) ? '渠道四 Gemini' : globalModel;
+                            const nextChannel = generateChannel === 'pixmax' ? 'pixmax' : (nextModel.startsWith('渠道四') ? 'oiioii' : nextModel.startsWith('渠道六') ? 'dola' : 'wizstar');
+                            const nextAspectRatio = normalizeAspectRatio(globalAspectRatio, {
+                              channel: nextChannel,
+                              modelName: nextModel,
+                              mediaType: 'video',
+                            });
                             setGlobalModel(nextModel);
-                            setGenerateChannel(generateChannel === 'pixmax' ? 'pixmax' : (nextModel.startsWith('渠道四') ? 'oiioii' : nextModel.startsWith('渠道六') ? 'dola' : 'wizstar'));
-                            setSegments(segments.map(s => s.id === row.id ? { ...s, type: 'video', model: nextModel } : s));
+                            setGenerateChannel(nextChannel);
+                            setGlobalAspectRatio(nextAspectRatio);
+                            setSegments(segments.map(s => s.id === row.id ? { ...s, type: 'video', model: nextModel, aspectRatio: nextAspectRatio } : s));
                           }}
                           className={`flex items-center space-x-1 px-2.5 py-1 rounded-md font-bold transition-all ${
                             row.type === 'video' ? 'bg-brand text-black shadow-sm' : 'text-dark-muted hover:text-white'
@@ -4383,9 +4693,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         <button 
                           onClick={() => {
                             const nextModel = IMAGE_MODEL_NAMES.has(globalModel) ? globalModel : '渠道四 GPT-Image2';
+                            const nextAspectRatio = normalizeAspectRatio(globalAspectRatio, {
+                              channel: 'oiioii',
+                              modelName: nextModel,
+                              mediaType: 'image',
+                            });
                             setGlobalModel(nextModel);
                             setGenerateChannel('oiioii');
-                            setSegments(segments.map(s => s.id === row.id ? { ...s, type: 'image', model: nextModel } : s));
+                            setGlobalAspectRatio(nextAspectRatio);
+                            setSegments(segments.map(s => s.id === row.id ? { ...s, type: 'image', model: nextModel, aspectRatio: nextAspectRatio } : s));
                           }}
                           className={`flex items-center space-x-1 px-2.5 py-1 rounded-md font-bold transition-all ${
                             row.type === 'image' ? 'bg-brand text-black shadow-sm' : 'text-dark-muted hover:text-white'
@@ -4794,7 +5110,14 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       const previewSrc = isVid
                         ? playableUrlForMaterial(currentMaterial)
                         : currentMaterial.thumbnail;
-                      setFullscreenVideo({ src: previewSrc, mediaType: currentMaterial.mediaType || (isVideoUrl(previewSrc) ? 'video' : 'image') });
+                      setFullscreenVideo({
+                        src: previewSrc,
+                        fallbackSrc: isVid ? playableFallbackUrlForMaterial(currentMaterial) : '',
+                        mediaType: currentMaterial.mediaType || (isVideoUrl(previewSrc) ? 'video' : 'image'),
+                        rowId: row.id,
+                        materialId: currentMaterial.id,
+                        materialName: currentMaterial.name,
+                      });
                     }
                   }}
                   title={currentMaterial.thumbnail ? '双击放大预览' : undefined}
@@ -4814,8 +5137,9 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         playsInline
                         loop
                         preload="none"
-                        onError={() => {
-                          if (isCurrentPlaying) {
+                        onError={(event) => {
+                          const fallbackUrl = playableFallbackUrlForMaterial(currentMaterial);
+                          if (!switchVideoToFallback(event, fallbackUrl, isCurrentPlaying) && isCurrentPlaying) {
                             console.warn('Video preview failed:', currentMaterial.thumbnail);
                           }
                         }}
@@ -4919,7 +5243,13 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         const previewSrc = isVid
                           ? playableUrlForMaterial(currentMaterial)
                           : (currentMaterial.sourceUrl || currentMaterial.remoteUrl || (currentMaterial.localPath ? makeLocalFileUrl(currentMaterial.localPath) : '') || currentMaterial.thumbnail);
-                        setFullscreenVideo({ src: previewSrc, mediaType: currentMaterial.mediaType || (isVideoUrl(previewSrc) ? 'video' : 'image') });
+                        setFullscreenVideo({
+                          src: previewSrc,
+                          mediaType: currentMaterial.mediaType || (isVideoUrl(previewSrc) ? 'video' : 'image'),
+                          rowId: row.id,
+                          materialId: currentMaterial.id,
+                          materialName: currentMaterial.name,
+                        });
                       }}
                       className="absolute top-2 right-2 p-1.5 rounded-md bg-black/60 hover:bg-black/80 text-white/70 hover:text-white opacity-0 group-hover/viewport:opacity-100 transition-all"
                       title="放大预览"
@@ -5023,7 +5353,13 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         onClick={() => handleSelectCandidateMaterial(row.id, mat)}
                         onDoubleClick={(e) => {
                           e.stopPropagation();
-                          if (matThumb) setFullscreenVideo({ src: matThumb, mediaType: mat.mediaType || (isVideoUrl(matThumb) ? 'video' : 'image') });
+                          if (matThumb) setFullscreenVideo({
+                            src: matThumb,
+                            mediaType: mat.mediaType || (isVideoUrl(matThumb) ? 'video' : 'image'),
+                            rowId: row.id,
+                            materialId: mat.id,
+                            materialName: mat.name,
+                          });
                         }}
                         className={`relative rounded-lg border overflow-hidden h-[74px] cursor-pointer transition-all flex flex-col group/candidate ${
                           isActive 
@@ -5392,23 +5728,60 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       {fullscreenVideo && (
         <div 
           className="fixed inset-0 z-[9999] bg-black/90 flex items-center justify-center backdrop-blur-sm"
-          onClick={() => setFullscreenVideo(null)}
+          onClick={closeFullscreenPreview}
         >
           <button
-            onClick={() => setFullscreenVideo(null)}
+            onClick={closeFullscreenPreview}
             className="absolute top-4 right-4 p-2 rounded-full bg-white/10 hover:bg-white/20 text-white transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
           {!(fullscreenVideo.mediaType === 'video' || isVideoUrl(fullscreenVideo.src)) && (
-            <button
-              onClick={(e) => { e.stopPropagation(); copyImageToClipboard(fullscreenVideo.src); }}
-              className="absolute top-4 right-16 flex items-center space-x-1.5 px-3 py-2 rounded-full bg-brand hover:bg-brand-dark text-black font-bold text-xs transition-colors"
-              title="复制图片到剪贴板"
-            >
-              <Copy className="w-4 h-4" />
-              <span>复制图片</span>
-            </button>
+            <div className="absolute top-4 right-16 flex items-center space-x-2">
+              <button
+                onClick={(e) => { e.stopPropagation(); setImageEditorEnabled((value) => !value); }}
+                className={`flex items-center space-x-1.5 px-3 py-2 rounded-full font-bold text-xs transition-colors ${imageEditorEnabled ? 'bg-red-500 hover:bg-red-400 text-white' : 'bg-white/10 hover:bg-white/20 text-white'}`}
+                title="在当前页面画线标注"
+              >
+                <span>{imageEditorEnabled ? '退出编辑' : '编辑画线'}</span>
+              </button>
+              {!imageEditorEnabled && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); copyImageToClipboard(fullscreenVideo.src); }}
+                  className="flex items-center space-x-1.5 px-3 py-2 rounded-full bg-brand hover:bg-brand-dark text-black font-bold text-xs transition-colors"
+                  title="复制图片到剪贴板"
+                >
+                  <Copy className="w-4 h-4" />
+                  <span>复制图片</span>
+                </button>
+              )}
+              {imageEditorEnabled && (
+                <>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); undoImageEditorStroke(); }}
+                    className="flex items-center space-x-1.5 px-3 py-2 rounded-full bg-white/10 hover:bg-white/20 text-white font-bold text-xs transition-colors"
+                    title="撤销上一笔画线"
+                  >
+                    <span>撤销</span>
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); resetImageEditorCanvas().catch((err) => alert(`重置失败：${err.message || err}`)); }}
+                    className="flex items-center space-x-1.5 px-3 py-2 rounded-full bg-white/10 hover:bg-white/20 text-white font-bold text-xs transition-colors"
+                    title="清空所有画线，恢复原图"
+                  >
+                    <span>清空线条</span>
+                  </button>
+                  <button
+                    onClick={(e) => { e.stopPropagation(); saveEditedImage(); }}
+                    disabled={imageEditorSaving}
+                    className="flex items-center space-x-1.5 px-3 py-2 rounded-full bg-brand hover:bg-brand-dark disabled:opacity-60 disabled:cursor-wait text-black font-bold text-xs transition-colors"
+                    title="保存为新的当前图片素材"
+                  >
+                    <span>{imageEditorSaving ? '保存中...' : '保存编辑'}</span>
+                  </button>
+                </>
+              )}
+            </div>
           )}
           {(fullscreenVideo.mediaType === 'video' || isVideoUrl(fullscreenVideo.src)) && /^https?:\/\//i.test(fullscreenVideo.src) && (
             <button
@@ -5420,6 +5793,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               <span>下载</span>
             </button>
           )}
+          {imageEditorEnabled && !(fullscreenVideo.mediaType === 'video' || isVideoUrl(fullscreenVideo.src)) && (
+            <div className="absolute left-1/2 top-4 -translate-x-1/2 rounded-full border border-red-400/40 bg-red-500/15 px-4 py-2 text-xs font-bold text-red-100">
+              鼠标左键按住拖动即可画红线；保存后会生成一张新的当前图片
+            </div>
+          )}
           <div className="max-w-[90vw] max-h-[90vh] flex items-center justify-center" onClick={(e) => e.stopPropagation()}>
             {fullscreenVideo.mediaType === 'video' || isVideoUrl(fullscreenVideo.src) ? (
               <video
@@ -5429,6 +5807,19 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 controls
                 autoPlay
                 loop
+                onError={(event) => switchVideoToFallback(event, fullscreenVideo.fallbackSrc || '', true)}
+              />
+            ) : imageEditorEnabled ? (
+              <canvas
+                ref={imageEditorCanvasRef}
+                className="max-w-full max-h-[82vh] rounded-lg shadow-2xl object-contain cursor-crosshair touch-none bg-black"
+                onMouseDown={startImageEditorStroke}
+                onMouseMove={moveImageEditorStroke}
+                onMouseUp={endImageEditorStroke}
+                onMouseLeave={endImageEditorStroke}
+                onTouchStart={startImageEditorStroke}
+                onTouchMove={moveImageEditorStroke}
+                onTouchEnd={endImageEditorStroke}
               />
             ) : (
               <img

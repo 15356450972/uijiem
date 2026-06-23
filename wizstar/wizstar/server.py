@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import mimetypes
 import threading
 import time
 import traceback
@@ -1761,7 +1762,7 @@ def dola_list_tasks(limit: int = 100):
 def dola_task_status(task_id: str):
     """查询 Dola 任务状态。"""
     try:
-        detail = dl.get_task_status(task_id)
+        detail = dl.get_task_status(task_id, normalize_failure=False)
         status = detail.get("status", "pending")
         fail_reason = detail.get("fail_reason", "") or detail.get("error", "")
         if status != "failed" and not detail.get("video_url") and not detail.get("local_path"):
@@ -1772,24 +1773,7 @@ def dola_task_status(task_id: str):
             if "以下是为你生成的图片" in compact_text or "返回的是图片，不是视频" in compact_text:
                 fail_reason = "返回的是图片，不是视频：Dola 本次会话返回了图片结果，没有进入视频生成。"
                 status = "failed"
-        if status == "collectable" and detail.get("conversation_id") and not detail.get("video_url") and not detail.get("local_path"):
-            try:
-                last_collect_at = float(detail.get("collect_started_at") or 0)
-            except (TypeError, ValueError):
-                last_collect_at = 0
-            if not last_collect_at or time.time() - last_collect_at > 60:
-                detail = dl.collect_task(task_id=task_id, conversation_id=str(detail.get("conversation_id") or ""))
-                status = detail.get("status", "collecting")
-                fail_reason = detail.get("fail_reason", "") or detail.get("error", "")
         video_url = detail.get("video_url", "") or detail.get("local_path", "") or ""
-        if status == "completed" and video_url:
-            TaskDB.update_status(task_id, "completed", video_url)
-        elif status == "failed":
-            TaskDB.update_status(task_id, "failed")
-        elif status in ("pending", "processing", "collecting"):
-            TaskDB.update_status(task_id, "processing")
-        elif status == "collectable":
-            TaskDB.update_status(task_id, "collectable")
         account_meta = TaskDB.get_dola_task_account(task_id) or {}
         account_id = int(account_meta.get("account_id") or 0)
         account_name = account_meta.get("account_name") or (f"Dola账号 #{account_id}" if account_id else "")
@@ -1809,7 +1793,7 @@ def dola_task_status(task_id: str):
             "send_mode": detail.get("send_mode", "") or dl.get_send_mode(),
             "send_mode_label": detail.get("send_mode_label", "") or next((item["label"] for item in dl.SEND_MODE_OPTIONS if item["id"] == dl.get_send_mode()), dl.get_send_mode()),
             "fail_reason": fail_reason,
-            "collectable": bool(detail.get("conversation_id")) and status not in ("completed", "failed"),
+            "collectable": bool(detail.get("conversation_id")) and status not in ("completed", "failed", "collecting"),
             "account_id": account_id,
             "account_name": account_name,
         }}
@@ -2180,7 +2164,7 @@ def _proxy_remote_video(url: str, range_header: str | None, as_download: bool, f
 
     def _iter():
         try:
-            for chunk in upstream.iter_content(chunk_size=64 * 1024):
+            for chunk in upstream.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     yield chunk
         finally:
@@ -2197,18 +2181,6 @@ def _proxy_remote_video(url: str, range_header: str | None, as_download: bool, f
 def local_video(request: Request, path: str):
     """流式播放本机已下载视频，支持 Range，避免前端直接 file:// 播放失败。"""
     file_path = os.path.abspath(urllib.parse.unquote(path or ""))
-    playable_candidate = ""
-    if os.path.isfile(file_path):
-        root, ext = os.path.splitext(file_path)
-        candidate = f"{root}.playable{ext or '.mp4'}"
-        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-            try:
-                if os.path.getmtime(candidate) >= os.path.getmtime(file_path):
-                    playable_candidate = candidate
-            except OSError:
-                playable_candidate = ""
-    if playable_candidate:
-        file_path = playable_candidate
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="本地视频不存在")
     if not file_path.lower().endswith((".mp4", ".webm", ".mov", ".m4v")):
@@ -2234,15 +2206,14 @@ def local_video(request: Request, path: str):
         except ValueError:
             raise HTTPException(status_code=416, detail="Range 不合法")
 
-    chunk_size = 64 * 1024
+    chunk_size = 1024 * 1024
     content_length = end - start + 1
+    content_type = mimetypes.guess_type(file_path)[0] or "video/mp4"
     headers = {
-        "Content-Type": "video/mp4",
+        "Content-Type": content_type,
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-        "Expires": "0",
+        "Cache-Control": "public, max-age=3600",
     }
     if status_code == 206:
         headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"

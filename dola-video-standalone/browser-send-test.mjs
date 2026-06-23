@@ -8,11 +8,6 @@ const __dir = path.dirname(fileURLToPath(import.meta.url));
 const DOLA_ORIGIN = 'https://www.dola.com';
 const DOLA_CHAT_URL = `${DOLA_ORIGIN}/chat`;
 const DOLA_CREATE_IMAGE_URL = `${DOLA_CHAT_URL}/create-image`;
-const DEFAULT_DOLA_EXTENSION_DIR = path.resolve(
-  __dir,
-  '../doubao2api_github_source(1)/doubao-nomark-main/doubao-nomark-main/extension/edge',
-);
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -211,8 +206,7 @@ function findChrome() {
 }
 
 function defaultExtensionDir() {
-  if (fs.existsSync(DEFAULT_DOLA_EXTENSION_DIR)) return DEFAULT_DOLA_EXTENSION_DIR;
-  return '';
+  return process.env.DOLA_EXTENSION_DIR || '';
 }
 
 function resolveExtensionDir(input) {
