@@ -136,13 +136,55 @@ const mediaUrlFromPayload = (payload = {}, task = {}) => {
   return payload.image_url || payload.video_url || payload.cdn_url || payload.download_url || task.mediaUrl || task.imageUrl || task.videoUrl || '';
 };
 
+const taskPayloadLike = (task = {}) => ({
+  media_type: task.mediaType || '',
+  image_url: task.imageUrl || '',
+  video_url: task.videoUrl || '',
+  cdn_url: task.cdnUrl || '',
+  download_url: task.downloadUrl || '',
+  local_path: task.localPath || '',
+  output_uri: task.outputUri || '',
+});
+
+const inferResultMediaType = (payload = {}, task = {}, fallbackUrl = '') => {
+  const explicitType = String(payload.media_type || task.mediaType || '').toLowerCase();
+  const outputUri = String(payload.output_uri || '').trim();
+  const imageSignals = [
+    payload.image_url,
+    payload.cdn_url,
+    payload.download_url,
+    payload.local_path,
+    task.imageUrl,
+    task.localPath,
+    task.cdnUrl,
+    task.downloadUrl,
+    task.outputUri,
+    task.sourceUrl,
+    outputUri,
+    fallbackUrl,
+  ].some((value) => {
+    const text = String(value || '').trim();
+    if (!text) return false;
+    return /^hogi:\/\/image\//i.test(text) || /\.(png|jpe?g|webp|gif|avif)(\?|$)/i.test(text);
+  });
+  const videoSignals = [payload.video_url, task.videoUrl, task.mediaUrl, task.cdnUrl, task.downloadUrl, fallbackUrl].some((value) => isPlayableVideoUrlValue(String(value || '').trim()));
+
+  if (imageSignals) return 'image';
+  if (explicitType === 'image') return 'image';
+  if (videoSignals) return 'video';
+  if (explicitType === 'video') return 'video';
+  return 'image';
+};
+
 const shouldAutoCollectDolaTask = (task = {}, payload = {}) => {
   const status = payload.status || task.status || '';
   const conversationId = payload.conversation_id || task.conversationId || '';
   const hasResult = !!(payload.local_path || payload.video_url || task.localPath || task.videoUrl || task.mediaUrl);
   if (task.channel !== 'dola' || status !== 'collectable' || !conversationId || hasResult) return false;
   const lastStartedAt = Number(task.autoCollectStartedAt || 0);
-  return !lastStartedAt || Date.now() - lastStartedAt > 60000;
+  const hasKnownApiVisibilityGap = /API 暂未读取到该 Dola 会话的视频消息/.test(String(payload.fail_reason || task.error || ''));
+  const retryWindowMs = hasKnownApiVisibilityGap ? 5 * 60 * 1000 : 90 * 1000;
+  return !lastStartedAt || Date.now() - lastStartedAt > retryWindowMs;
 };
 
 const collectUrlForDolaTask = (task) => `${WIZSTAR_API}/dola/tasks/${encodeURIComponent(task.taskId)}/collect`;
@@ -233,7 +275,7 @@ const startGlobalGenerationPolling = () => {
             mediaUrl: nextMediaUrl,
             videoUrl: payload.video_url || task.videoUrl || '',
             imageUrl: payload.image_url || task.imageUrl || '',
-            mediaType: payload.media_type || task.mediaType || (payload.image_url ? 'image' : undefined),
+            mediaType: inferResultMediaType(payload, task, nextMediaUrl),
             localPath,
             cdnUrl: payload.cdn_url || task.cdnUrl || '',
             downloadUrl: payload.download_url || task.downloadUrl || '',
@@ -273,6 +315,11 @@ const startGlobalGenerationPolling = () => {
 export default function ContentCreation({ activeDraft, onBack, onProjectChanged }) {
   const GLOBAL_GENERATION_SETTINGS_KEY = 'maocanju_global_generation_settings';
   const DOLA_DEFAULT_DURATION_LABEL = '10秒';
+  const OIIOII_DEFAULT_SETTINGS = {
+    model: 'nano-pro',
+    aspectRatio: '1:1',
+    resolution: '1K',
+  };
   const DEFAULT_GLOBAL_GENERATION_SETTINGS = {
     model: 'Seedance 2.0',
     aspectRatio: '16:9',
@@ -290,11 +337,25 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         const channel = (settings.generateChannel || localStorage.getItem('maocanju_generate_channel') || DEFAULT_GLOBAL_GENERATION_SETTINGS.generateChannel);
         if (channel === 'dola' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.duration)) return DOLA_DEFAULT_DURATION_LABEL;
       }
+      if (key === 'model' && (settings.generateChannel || localStorage.getItem('maocanju_generate_channel')) === 'oiioii' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.model)) {
+        return OIIOII_DEFAULT_SETTINGS.model;
+      }
+      if (key === 'aspectRatio' && (settings.generateChannel || localStorage.getItem('maocanju_generate_channel')) === 'oiioii' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.aspectRatio)) {
+        return OIIOII_DEFAULT_SETTINGS.aspectRatio;
+      }
+      if (key === 'resolution' && (settings.generateChannel || localStorage.getItem('maocanju_generate_channel')) === 'oiioii' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.resolution)) {
+        return OIIOII_DEFAULT_SETTINGS.resolution;
+      }
       return normalized;
     } catch {
-      return key === 'duration' && localStorage.getItem('maocanju_generate_channel') === 'dola'
-        ? DOLA_DEFAULT_DURATION_LABEL
-        : DEFAULT_GLOBAL_GENERATION_SETTINGS[key];
+      const channel = localStorage.getItem('maocanju_generate_channel');
+      if (key === 'duration' && channel === 'dola') return DOLA_DEFAULT_DURATION_LABEL;
+      if (channel === 'oiioii') {
+        if (key === 'model') return OIIOII_DEFAULT_SETTINGS.model;
+        if (key === 'aspectRatio') return OIIOII_DEFAULT_SETTINGS.aspectRatio;
+        if (key === 'resolution') return OIIOII_DEFAULT_SETTINGS.resolution;
+      }
+      return DEFAULT_GLOBAL_GENERATION_SETTINGS[key];
     }
   };
 
@@ -365,7 +426,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     if (rowType === 'video' && IMAGE_MODEL_NAMES.has(currentModel)) return generateChannel === 'oiioii' ? '渠道四 Gemini' : generateChannel === 'dola' ? '渠道六 Seedance 2.0' : 'Seedance 2.0';
     return currentModel;
   };
-  const getRowMediaLabel = (row) => row?.type === 'image' ? '图片' : '视频';
+  const getRowMediaLabel = (row) => {
+    const resolvedType = row?.type || row?.currentMaterialImage?.mediaType || row?.currentMaterialVideo?.mediaType || (row?.currentMaterialImage ? 'image' : row?.currentMaterialVideo ? 'video' : getModelMediaType(row?.model || globalModel));
+    return resolvedType === 'image' ? '图片' : '视频';
+  };
   const BASIC_ASPECT_RATIOS = ['16:9', '9:16', '1:1'];
   const EXTENDED_IMAGE_ASPECT_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4'];
   const CHATGPT2API_IMAGE_ASPECT_RATIOS = ['3:2', '2:3', '1:1'];
@@ -659,7 +723,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   };
   const getReferenceDisplayUrl = (seg) => {
     if (seg?.referenceImage && typeof seg.referenceImage === 'object') {
-      return seg.referenceImage.displayUrl || seg.referenceImage.remoteUrl || seg.referenceImage.uploadUrl || '';
+      return seg.referenceImage.displayUrl || seg.referenceImage.dataUrl || seg.referenceImage.remoteUrl || seg.referenceImage.uploadUrl || '';
     }
     return seg?.referenceImage || '';
   };
@@ -668,6 +732,13 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       return seg.referenceImage.localPath || '';
     }
     return seg?.referenceImagePath || '';
+  };
+  const getReferenceDataUrl = (seg) => {
+    if (seg?.referenceImage && typeof seg.referenceImage === 'object') {
+      return seg.referenceImage.dataUrl || '';
+    }
+    const legacyRef = seg?.referenceImage || '';
+    return typeof legacyRef === 'string' && /^data:image\//i.test(legacyRef) ? legacyRef : '';
   };
   const getReferenceRemoteUrl = (seg) => {
     if (seg?.referenceImage && typeof seg.referenceImage === 'object') {
@@ -680,6 +751,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     source: filePath ? 'local' : 'blob',
     displayUrl: filePath ? makeLocalFileUrl(filePath) : fallbackUrl,
     localPath: filePath || '',
+    dataUrl: /^data:image\//i.test(fallbackUrl || '') ? fallbackUrl : '',
+    remoteUrl: '',
+    uploadUrl: '',
+  });
+  const makeDataUrlReferenceImage = (dataUrl) => ({
+    source: 'clipboard',
+    displayUrl: dataUrl,
+    localPath: '',
+    dataUrl,
     remoteUrl: '',
     uploadUrl: '',
   });
@@ -687,6 +767,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     source: 'remote',
     displayUrl: url,
     localPath: '',
+    dataUrl: '',
     remoteUrl: url,
     uploadUrl: url,
   });
@@ -734,6 +815,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     }
     const displayUrl = getReferenceDisplayUrl(seg);
     const localPath = getReferenceLocalPath(seg);
+    const dataUrl = getReferenceDataUrl(seg);
     const remoteUrl = getReferenceRemoteUrl(seg);
     const normalizeMediaList = (items = [], fallbackType = 'image') => asArray(items).map((m) => {
       if (m && typeof m === 'object') {
@@ -759,7 +841,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       )),
       referenceImage: seg.referenceImage && typeof seg.referenceImage === 'object'
         ? seg.referenceImage
-        : (localPath ? makeLocalReferenceImage(localPath) : (remoteUrl ? makeRemoteReferenceImage(remoteUrl) : displayUrl)),
+        : (localPath ? makeLocalReferenceImage(localPath) : (dataUrl ? makeDataUrlReferenceImage(dataUrl) : (remoteUrl ? makeRemoteReferenceImage(remoteUrl) : displayUrl))),
       referenceImagePath: localPath,
       materialsVideo: normalizeMediaList(seg.materialsVideo, 'video'),
       materialsImage: normalizeMediaList(seg.materialsImage, 'image'),
@@ -1237,6 +1319,40 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         setNewCharAvatarPath('');
         setShowCharacterModal(false);
       }
+    }
+  };
+  const fileToDataUrl = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('剪贴板图片读取失败'));
+    reader.readAsDataURL(file);
+  });
+
+  const getClipboardImageFile = (clipboardData) => {
+    const items = Array.from(clipboardData?.items || []);
+    const itemFile = items
+      .find((item) => item.kind === 'file' && /^image\//i.test(item.type || ''))
+      ?.getAsFile();
+    if (itemFile) return itemFile;
+    return Array.from(clipboardData?.files || []).find((file) => /^image\//i.test(file.type || '')) || null;
+  };
+
+  const handlePasteReferenceImage = async (rowId, event) => {
+    const imageFile = getClipboardImageFile(event.clipboardData);
+    if (!imageFile) return;
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      const dataUrl = await fileToDataUrl(imageFile);
+      if (!dataUrl || !/^data:image\//i.test(dataUrl)) throw new Error('剪贴板里没有可用图片');
+      setSegments(prev => prev.map(seg => seg.id === rowId ? {
+        ...seg,
+        referenceImage: makeDataUrlReferenceImage(dataUrl),
+        referenceImagePath: '',
+      } : seg));
+    } catch (e) {
+      console.warn('Paste reference image failed:', e);
+      alert(`粘贴垫图失败：${e.message || e}`);
     }
   };
   
@@ -2224,7 +2340,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               const localPath = completedLocalPath;
               const sourceUrl = task.videoUrl || task.downloadUrl || task.cdnUrl || task.mediaUrl || completedMediaUrl;
               const playableUrl = localPath ? toLocalVideoUrl(localPath) : toPlayableUrl(sourceUrl || completedMediaUrl);
-              const resultMediaType = task.mediaType || (isVideoUrl(playableUrl) ? 'video' : 'image');
+              const resultPayload = taskPayloadLike(task);
+              const resultMediaType = inferResultMediaType(resultPayload, task, playableUrl);
               const isVid = resultMediaType === 'video';
               const list = isVid ? nextSeg.materialsVideo : nextSeg.materialsImage;
               const normalizedMediaUrl = (localPath || sourceUrl || playableUrl).split('?')[0];
@@ -2699,9 +2816,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
       const localImagePath = getReferenceLocalPath(seg);
       const remoteImageUrl = getReferenceRemoteUrl(seg);
+      const dataImageUrl = getReferenceDataUrl(seg);
       const allReferenceImages = [
         localImagePath,
         remoteImageUrl,
+        dataImageUrl,
         ...getSegmentCharacterImageRefs(seg, promptText).map(imageRefToReference),
         ...getSegmentSceneImageRefs(promptText).map(imageRefToReference),
       ].filter(Boolean);
@@ -2913,6 +3032,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
       const localImagePath = getReferenceLocalPath(seg);
       const remoteImageUrl = getReferenceRemoteUrl(seg);
+      const dataImageUrl = getReferenceDataUrl(seg);
       const roleImageRefs = getSegmentCharacterImageRefs(seg, promptText);
       const roleAliases = getSegmentCharacterAliases(seg, promptText);
       const sceneImageRefs = getSegmentSceneImageRefs(promptText);
@@ -2948,6 +3068,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         imageInputs.push({ file_path: localImagePath });
       } else if (remoteImageUrl) {
         imageInputs.push({ url: remoteImageUrl });
+      } else if (dataImageUrl) {
+        imageInputs.push({ data_url: dataImageUrl });
       }
       [...roleImageRefs, ...sceneImageRefs].forEach(ref => {
         const input = imageRefToInput(ref);
@@ -3018,10 +3140,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
       const localImagePath = getReferenceLocalPath(seg);
       const remoteImageUrl = getReferenceRemoteUrl(seg);
+      const dataImageUrl = getReferenceDataUrl(seg);
       const currentImageUrl = seg?.currentMaterialImage && !isVideoUrl(seg.currentMaterialImage.thumbnail)
         ? (seg.currentMaterialImage.sourceUrl || seg.currentMaterialImage.remoteUrl || seg.currentMaterialImage.thumbnail || '')
         : '';
-      const referenceImageUrl = remoteImageUrl || (/^https?:\/\//i.test(currentImageUrl) ? currentImageUrl : '');
+      const referenceImageUrl = remoteImageUrl || dataImageUrl || (/^https?:\/\//i.test(currentImageUrl) ? currentImageUrl : '');
       const aspectRatio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
         channel: 'chatgpt2api',
         modelName: '渠道五 GPT-Image2',
@@ -3107,8 +3230,9 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       const isImageRow = seg?.type === 'image';
       const localImagePath = getReferenceLocalPath(seg);
       const remoteImageUrl = getReferenceRemoteUrl(seg);
+      const dataImageUrl = getReferenceDataUrl(seg);
       const currentImageUrl = '';
-      const referenceImageUrl = remoteImageUrl || (/^https?:\/\//i.test(currentImageUrl) ? currentImageUrl : '');
+      const referenceImageUrl = remoteImageUrl || dataImageUrl || (/^https?:\/\//i.test(currentImageUrl) ? currentImageUrl : '');
 
       const oiiVideoModelMap = {
         '渠道四 Gemini': 'gemini',
@@ -3159,8 +3283,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       if (!isGptImage2OiiImage && localImagePath) {
         body.image_path = localImagePath;
       }
-      if (!isGptImage2OiiImage && referenceImageUrl) {
-        body.image_url = referenceImageUrl;
+      if (!isGptImage2OiiImage && (remoteImageUrl || dataImageUrl)) {
+        body.image_url = remoteImageUrl || dataImageUrl;
       }
 
       const roleImageRefs = getSegmentCharacterImageRefs(seg, promptText);
@@ -4642,6 +4766,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
           const currentMaterial = (isVid ? row.currentMaterialVideo : row.currentMaterialImage) || { id: 0, name: '暂无画面', thumbnail: '', duration: '00:00', fps: 0, isPlaying: false };
           const materials = (isVid ? row.materialsVideo : row.materialsImage) || [];
           const isCurrentPlaying = isVid ? currentMaterial.isPlaying : false;
+          const imageSource = currentMaterial.localPath || currentMaterial.sourceUrl || currentMaterial.thumbnail || '';
+          const previewUrl = isVid
+            ? playableUrlForMaterial(currentMaterial)
+            : (isLocalFilePath(imageSource) ? makeLocalFileUrl(imageSource) : imageSource);
+          const hasPreview = !!previewUrl;
           
           return (
             <div 
@@ -4713,7 +4842,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       </div>
                     </div>
 
-                    <span className="text-[9px] text-dark-subtle font-semibold">支持输入 @ 角色 · $ 场景 · # 物品</span>
+                    <span className="text-[9px] text-dark-subtle font-semibold">支持输入 @ 角色 · $ 场景 · # 物品 · 直接粘贴图片垫图</span>
                   </div>
 
                   {/* Single Big Text Bubble with Embedded Inline Badges matching Screenshot 2 */}
@@ -4729,7 +4858,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       e.stopPropagation();
                       e.currentTarget.classList.remove('ring-2', 'ring-purple-500', 'border-purple-500');
                     }}
-                    onDrop={(e) => {
+                    onDrop={async (e) => {
                       e.preventDefault();
                       e.stopPropagation();
                       e.currentTarget.classList.remove('ring-2', 'ring-purple-500', 'border-purple-500');
@@ -4740,10 +4869,17 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         return;
                       }
                       const filePath = imgFile.path || '';
-                      const displayUrl = filePath ? makeLocalFileUrl(filePath) : URL.createObjectURL(imgFile);
-                      setSegments(prev => prev.map(s => s.id === row.id ? {...s, referenceImage: makeLocalReferenceImage(filePath, displayUrl), referenceImagePath: filePath} : s));
+                      if (filePath) {
+                        setSegments(prev => prev.map(s => s.id === row.id ? {...s, referenceImage: makeLocalReferenceImage(filePath), referenceImagePath: filePath} : s));
+                        return;
+                      }
+                      const dataUrl = await fileToDataUrl(imgFile);
+                      setSegments(prev => prev.map(s => s.id === row.id ? {...s, referenceImage: makeDataUrlReferenceImage(dataUrl), referenceImagePath: ''} : s));
                     }}
-                    className="bg-[#18191c] border border-dark-border/60 hover:border-[#10b981]/30 rounded-xl p-3 flex flex-col justify-start min-h-[112px] transition-all relative"
+                    onPaste={(e) => handlePasteReferenceImage(row.id, e)}
+                    tabIndex={0}
+                    className="bg-[#18191c] border border-dark-border/60 hover:border-[#10b981]/30 focus:border-[#10b981]/50 focus:outline-none focus:ring-1 focus:ring-[#10b981]/30 rounded-xl p-3 flex flex-col justify-start min-h-[112px] transition-all relative"
+                    title="点击后可编辑文本，也可直接粘贴图片作为垫图"
                   >
                     {/* 垫图徽章始终显示在文本区域上方 */}
                     <div className="mb-1.5 flex items-center">
@@ -5106,10 +5242,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 <div
                   className="w-full h-[156px] rounded-xl bg-zinc-950 border border-dark-border overflow-hidden relative flex items-center justify-center group/viewport shrink-0"
                   onDoubleClick={() => {
-                    if (currentMaterial.thumbnail) {
+                    if (hasPreview) {
                       const previewSrc = isVid
                         ? playableUrlForMaterial(currentMaterial)
-                        : currentMaterial.thumbnail;
+                        : previewUrl;
                       setFullscreenVideo({
                         src: previewSrc,
                         fallbackSrc: isVid ? playableFallbackUrlForMaterial(currentMaterial) : '',
@@ -5120,10 +5256,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       });
                     }
                   }}
-                  title={currentMaterial.thumbnail ? '双击放大预览' : undefined}
+                  title={hasPreview ? '双击放大预览' : undefined}
                 >
-                  {currentMaterial.thumbnail ? (
-                    currentMaterial.mediaType === 'video' || isVideoUrl(currentMaterial.thumbnail) ? (
+                  {hasPreview ? (
+                    currentMaterial.mediaType === 'video' || isVideoUrl(previewUrl) ? (
                       <video
                         ref={(el) => {
                           if (!el) return;
@@ -5146,7 +5282,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       />
                     ) : (
                       <img 
-                        src={currentMaterial.thumbnail} 
+                        src={previewUrl} 
                         alt={currentMaterial.name}
                         draggable={!isVid}
                         onMouseEnter={() => prepareExternalImageDrag(currentMaterial)}

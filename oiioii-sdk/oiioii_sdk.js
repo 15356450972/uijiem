@@ -113,6 +113,42 @@ const IMAGE_MODEL_PARAMS = {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function decodeJwtPayload(token) {
+  if (!token || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  try {
+    const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = payload + '='.repeat((4 - (payload.length % 4)) % 4);
+    return JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+function isJwtUsable(token, skewSeconds = 300) {
+  const payload = decodeJwtPayload(token);
+  if (!payload || !payload.exp) return false;
+  return Number(payload.exp) > Math.floor(Date.now() / 1000) + skewSeconds;
+}
+
+function authCodeFromResponse(res) {
+  return res?.json?.code || res?.json?.error?.code || res?.json?.error || '';
+}
+
+function isAuthExpiredResponse(res) {
+  const code = String(authCodeFromResponse(res) || '').toUpperCase();
+  return code === 'USER_NOT_LOGIN' || code === 'INVALID_REQUEST' || code === 'TOKEN_EXPIRED' || code === 'JWT_EXPIRED';
+}
+
+function formatUpstreamError(prefix, res) {
+  const code = authCodeFromResponse(res);
+  if (isAuthExpiredResponse(res)) {
+    return `${prefix}: 渠道四登录态已过期，请刷新积分或重新登录/注册渠道四账号`;
+  }
+  return `${prefix}: ${res?.data ? res.data.substring(0, 150) : code || '未知错误'}`;
+}
+
 class OiiOiiClient {
   constructor(options = {}) {
     this.email = options.email || null;
@@ -261,13 +297,55 @@ class OiiOiiClient {
   // ---------------------------------------------------------------------------
   // 文件下载（跟随重定向）
   // ---------------------------------------------------------------------------
-  _downloadFile(url, destPath, timeout = 120000) {
-    return new Promise((resolve, reject) => {
-      const urlObj = new URL(url);
+  _downloadFile(url, destPath, options = {}) {
+    const cfg = {
+      timeout: 120000,
+      retry: 0,
+      backoffMs: 1000,
+      maxBackoffMs: 15000,
+      timeoutStepMs: 15000,
+      maxTimeoutMs: 300000,
+      maxRedirects: 5,
+      ...options,
+    };
+
+    const retriablePattern = /TLS timeout|Proxy timeout|Download TLS error|Download failed: HTTP 5\d\d|ECONNRESET|socket hang up|ETIMEDOUT|EAI_AGAIN|No HTTP headers in download response/i;
+    const shouldRetry = (msg) => retriablePattern.test(msg);
+
+    const downloadOnce = (currentUrl, remainingRetry, currentTimeout, redirectCount = 0) => new Promise((resolve, reject) => {
+      const urlObj = new URL(currentUrl);
       const targetHost = urlObj.hostname;
       const targetPort = urlObj.port || 443;
+      let settled = false;
 
-      const doDownload = (socket) => {
+      const settleResolve = (value) => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      const settleReject = (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
+
+      const retryOrReject = (err) => {
+        const msg = String(err?.message || err || '');
+        if (remainingRetry > 0 && shouldRetry(msg)) {
+          const nextRetry = remainingRetry - 1;
+          const nextTimeout = Math.min(cfg.maxTimeoutMs, currentTimeout + cfg.timeoutStepMs);
+          const usedRetries = cfg.retry - remainingRetry + 1;
+          const backoff = Math.min(cfg.maxBackoffMs, cfg.backoffMs * Math.max(1, usedRetries));
+          this.log(`[download] 链路抖动，${backoff}ms 后重试（剩余 ${nextRetry} 次，超时 ${nextTimeout}ms）`);
+          setTimeout(() => {
+            downloadOnce(currentUrl, nextRetry, nextTimeout, redirectCount).then(settleResolve).catch(settleReject);
+          }, backoff);
+          return;
+        }
+        settleReject(err);
+      };
+
+      const handleSocket = (socket) => {
         const tlsSocket = tls.connect({ socket, servername: targetHost }, () => {
           const reqPath = urlObj.pathname + urlObj.search;
           const head = [
@@ -283,43 +361,64 @@ class OiiOiiClient {
           const chunks = [];
           tlsSocket.on('data', d => chunks.push(d));
           tlsSocket.on('end', () => {
-            const raw = Buffer.concat(chunks);
-            const rawStr = raw.toString('binary');
-            const headerEnd = rawStr.indexOf('\r\n\r\n');
-            if (headerEnd === -1) { reject(new Error('No HTTP headers in download response')); return; }
-
-            const headerStr = rawStr.substring(0, headerEnd);
-            const status = parseInt((headerStr.match(/HTTP\/\d\.\d (\d+)/) || [])[1] || 0);
-
-            if (status >= 300 && status < 400) {
-              const loc = (headerStr.match(/location:\s*(.+)/i) || [])[1];
-              if (loc) {
-                this._dbg(`重定向: ${loc.trim().substring(0, 80)}`);
-                this._downloadFile(loc.trim(), destPath, timeout).then(resolve).catch(reject);
+            try {
+              const raw = Buffer.concat(chunks);
+              const rawStr = raw.toString('binary');
+              const headerEnd = rawStr.indexOf('\r\n\r\n');
+              if (headerEnd === -1) {
+                retryOrReject(new Error('No HTTP headers in download response'));
                 return;
               }
+
+              const headerStr = rawStr.substring(0, headerEnd);
+              const status = parseInt((headerStr.match(/HTTP\/\d\.\d (\d+)/) || [])[1] || 0);
+
+              if (status >= 300 && status < 400) {
+                const loc = (headerStr.match(/location:\s*(.+)/i) || [])[1];
+                if (loc) {
+                  const nextUrl = new URL(loc.trim(), currentUrl).toString();
+                  this._dbg(`重定向: ${nextUrl.substring(0, 120)}`);
+                  if (redirectCount >= cfg.maxRedirects) {
+                    settleReject(new Error(`Download redirect overflow (${cfg.maxRedirects})`));
+                    return;
+                  }
+                  downloadOnce(nextUrl, remainingRetry, currentTimeout, redirectCount + 1).then(settleResolve).catch(settleReject);
+                  return;
+                }
+              }
+              if (status !== 200) {
+                retryOrReject(new Error(`Download failed: HTTP ${status}`));
+                return;
+              }
+
+              const respHeaders = {};
+              headerStr.split('\r\n').slice(1).forEach(line => {
+                const idx = line.indexOf(':');
+                if (idx > 0) respHeaders[line.substring(0, idx).toLowerCase().trim()] = line.substring(idx + 1).trim();
+              });
+
+              let body = raw.slice(headerEnd + 4);
+              if (respHeaders['transfer-encoding']?.includes('chunked')) body = this._decodeChunked(body);
+
+              fs.mkdirSync(path.dirname(destPath), { recursive: true });
+              fs.writeFileSync(destPath, body);
+              settleResolve({ size: body.length, path: destPath });
+            } catch (err) {
+              retryOrReject(err);
             }
-            if (status !== 200) { reject(new Error(`Download failed: HTTP ${status}`)); return; }
-
-            const respHeaders = {};
-            headerStr.split('\r\n').slice(1).forEach(line => {
-              const idx = line.indexOf(':');
-              if (idx > 0) respHeaders[line.substring(0, idx).toLowerCase().trim()] = line.substring(idx + 1).trim();
-            });
-
-            let body = raw.slice(headerEnd + 4);
-            if (respHeaders['transfer-encoding']?.includes('chunked')) body = this._decodeChunked(body);
-
-            fs.mkdirSync(path.dirname(destPath), { recursive: true });
-            fs.writeFileSync(destPath, body);
-            resolve({ size: body.length, path: destPath });
+          });
+          tlsSocket.setTimeout(currentTimeout, () => {
+            tlsSocket.destroy();
+            retryOrReject(new Error('TLS timeout'));
           });
         });
-        tlsSocket.on('error', e => reject(new Error(`Download TLS error: ${e.message}`)));
+        tlsSocket.on('error', e => retryOrReject(new Error(`Download TLS error: ${e.message}`)));
       };
 
-      this._tunnel(targetHost, targetPort, timeout, doDownload, reject);
+      this._tunnel(targetHost, targetPort, currentTimeout, handleSocket, retryOrReject);
     });
+
+    return downloadOnce(url, cfg.retry, cfg.timeout);
   }
 
   // ===========================================================================
@@ -462,13 +561,21 @@ class OiiOiiClient {
   // 2. 登录
   // ===========================================================================
   async login(options = {}) {
-    if (this.token && !options.force) {
-      this.log('[login] 已有 Token，跳过登录');
+    if (this.token && !options.force && isJwtUsable(this.token)) {
+      this.log('[login] 已有有效 Token，跳过登录');
       return this.token;
+    }
+    if (this.token && !options.force && !isJwtUsable(this.token)) {
+      this.log('[login] Token 已过期，重新登录刷新');
     }
     const email = options.email || this.email;
     const password = options.password || this.password;
-    if (!email || !password) throw new Error('login 需要 email 和 password');
+    if (!email || !password) {
+      if (this.token && !isJwtUsable(this.token)) {
+        throw new Error('渠道四登录态已过期，且账号文件缺少邮箱或密码，无法自动刷新；请重新登录或重新注册渠道四账号');
+      }
+      throw new Error('login 需要 email 和 password');
+    }
 
     this.log('[login] 登录中...');
     const captchaRes = await this._request('/auth/tencent_captcha_config', {
@@ -612,7 +719,7 @@ class OiiOiiClient {
       this.log(`[upload] 成功: ${uploadRes.json.data.uri}`);
       return uploadRes.json.data.uri;
     }
-    throw new Error(`上传失败: ${uploadRes.data.substring(0, 150)}`);
+    throw new Error(formatUpstreamError('上传失败', uploadRes));
   }
 
   _toReadFileUrl(uriOrUrl, host = this.authHost) {
@@ -763,10 +870,34 @@ class OiiOiiClient {
   async _pollTask(taskId, options = {}) {
     const maxWait = options.maxWait || 600000;
     const interval = options.pollInterval || 5000;
+    const requestTimeout = options.pollRequestTimeout || 60000;
+    const maxTransientErrors = options.maxTransientErrors || 6;
     const start = Date.now();
+    let transientErrors = 0;
 
     while (Date.now() - start < maxWait) {
-      const res = await this._request(`/media/canvas_async_tasks/sync?workspaceId=${this.workspaceId}`, { method: 'GET' });
+      let res;
+      try {
+        res = await this._request(`/media/canvas_async_tasks/sync?workspaceId=${this.workspaceId}`, {
+          method: 'GET',
+          timeout: requestTimeout,
+        });
+        transientErrors = 0;
+      } catch (e) {
+        const msg = String(e?.message || e || '');
+        if (/TLS timeout|Proxy timeout|ECONNRESET|socket hang up|ETIMEDOUT|EAI_AGAIN/i.test(msg)) {
+          transientErrors += 1;
+          if (transientErrors > maxTransientErrors) {
+            throw new Error(`轮询任务状态失败：网络超时次数过多（${transientErrors} 次），请稍后重试`);
+          }
+          const backoff = Math.min(15000, interval * Math.max(1, transientErrors));
+          this.log(`[task] 轮询超时，${backoff}ms 后重试（${transientErrors}/${maxTransientErrors}）`);
+          await sleep(backoff);
+          continue;
+        }
+        throw e;
+      }
+
       const task = res.json?.tasks?.find(t => t.task_id === taskId);
       if (task) {
         if (task.status === 'completed' && task.output_uri) {
@@ -814,7 +945,12 @@ class OiiOiiClient {
     if (options.download) {
       const filename = options.filename || task.output_uri.split('/').pop();
       const destPath = path.join(options.outputDir || this.outputDir, filename);
-      const dl = await this.download(task.output_uri, destPath);
+      const dl = await this.download(task.output_uri, destPath, {
+        retry: options.downloadRetry !== undefined ? options.downloadRetry : 2,
+        timeout: options.downloadTimeout !== undefined ? options.downloadTimeout : 120000,
+        backoffMs: options.downloadBackoffMs !== undefined ? options.downloadBackoffMs : 1500,
+        timeoutStepMs: options.downloadTimeoutStepMs !== undefined ? options.downloadTimeoutStepMs : 15000,
+      });
       result.localPath = dl.path;
       result.fileSize = dl.size;
       this.log(`[${kind}] 下载完成: ${destPath} (${(dl.size / 1024 / 1024).toFixed(2)} MB)`);
@@ -826,7 +962,7 @@ class OiiOiiClient {
   // 8. 下载
   // ===========================================================================
   // 支持 hogi:// URI、CDN URL 或完整 URL
-  async download(uriOrUrl, destPath) {
+  async download(uriOrUrl, destPath, options = {}) {
     let url;
     if (uriOrUrl.startsWith('hogi://')) {
       url = `https://${this.apiHost}/res/read_file?uri=${encodeURIComponent(uriOrUrl)}`;
@@ -837,7 +973,16 @@ class OiiOiiClient {
       const filename = uriOrUrl.split('/').pop().split('?')[0];
       destPath = path.join(this.outputDir, filename);
     }
-    return this._downloadFile(url, destPath);
+    const timeout = options.timeout !== undefined ? options.timeout : 120000;
+    const retry = options.retry !== undefined ? options.retry : 0;
+    return this._downloadFile(url, destPath, {
+      timeout,
+      retry,
+      backoffMs: options.backoffMs !== undefined ? options.backoffMs : 1000,
+      maxBackoffMs: options.maxBackoffMs !== undefined ? options.maxBackoffMs : 15000,
+      timeoutStepMs: options.timeoutStepMs !== undefined ? options.timeoutStepMs : 15000,
+      maxTimeoutMs: options.maxTimeoutMs !== undefined ? options.maxTimeoutMs : 300000,
+    });
   }
 
   // 查询文件元数据（不需要鉴权）

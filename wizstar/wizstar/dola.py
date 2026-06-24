@@ -55,6 +55,7 @@ TASK_CACHE_PATH = os.path.join(RUNTIME_DIR, "task_cache.json")
 TASK_PROFILE_DIR = os.path.join(RUNTIME_DIR, "task_profiles")
 _task_cache: dict[str, dict] = {}
 _task_lock = threading.Lock()
+_active_collect_tasks: set[str] = set()
 
 
 class DolaError(RuntimeError):
@@ -453,13 +454,14 @@ def _sync_env_file_for_runner(env_file: str = "") -> None:
 
 def _run_node(args: list[str], timeout: int = 600, env_overrides: dict | None = None) -> subprocess.CompletedProcess[str]:
     runner_dir = get_runner_dir()
-    _sync_env_file_for_runner((env_overrides or {}).get("DOLA_ENV_FILE", ""))
+    env_overrides = env_overrides or {}
+    _sync_env_file_for_runner(env_overrides.get("DOLA_ENV_FILE", ""))
     import datetime
     log_path = os.path.join(runner_dir, f"run_node_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.log")
     log_lines: list[str] = []
     log_lines.append(f"[{datetime.datetime.now().isoformat()}] CMD: {_node_bin()} {' '.join(args)}")
     log_lines.append(f"[{datetime.datetime.now().isoformat()}] CWD: {runner_dir}")
-    log_lines.append(f"[{datetime.datetime.now().isoformat()}] ENV: task_id={env_overrides.get('DOLA_TASK_ID', 'N/A') if env_overrides else 'N/A'}")
+    log_lines.append(f"[{datetime.datetime.now().isoformat()}] ENV: task_id={env_overrides.get('DOLA_TASK_ID', 'N/A')}")
     try:
         proc = subprocess.Popen(
             [_node_bin(), *args],
@@ -491,7 +493,12 @@ def _run_node(args: list[str], timeout: int = 600, env_overrides: dict | None = 
         log_lines.append(stderr)
         with open(log_path, "w", encoding="utf-8") as f:
             f.write("\n".join(log_lines))
-        raise DolaError(f"Dola 执行超时: {e}") from e
+        return subprocess.CompletedProcess(
+            args=[_node_bin(), *args],
+            returncode=124,
+            stdout=stdout,
+            stderr=f"Dola 执行超时: {e}\n{stderr}",
+        )
     except OSError as e:
         log_lines.append(f"[{datetime.datetime.now().isoformat()}] OSError: {e}")
         with open(log_path, "w", encoding="utf-8") as f:
@@ -1326,10 +1333,33 @@ def _repair_internal_state_error(task: dict) -> dict:
     return repaired
 
 
+def _repair_stale_collecting_task(cache_key: str, task: dict) -> dict:
+    if not isinstance(task, dict) or task.get("status") != "collecting":
+        return task
+    if cache_key in _active_collect_tasks:
+        return task
+    try:
+        started_at = float(task.get("collect_started_at") or task.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        started_at = 0
+    if started_at and time.time() - started_at < 90:
+        return task
+    repaired = dict(task)
+    repaired.update({
+        "status": "collectable",
+        "progress": max(90, int(repaired.get("progress") or 0) if str(repaired.get("progress") or "").isdigit() else 90),
+        "error": "",
+        "fail_reason": "上次采集已结束或中断，已恢复为可重新采集状态。",
+        "updated_at": time.time(),
+    })
+    return repaired
+
+
 def _get_task(cache_key: str) -> dict:
     with _task_lock:
         current = _task_cache.get(cache_key, {})
         repaired = _repair_internal_state_error(dict(current))
+        repaired = _repair_stale_collecting_task(cache_key, repaired)
         local_path = _clean_str(repaired.get("local_path"))
         playable_path = _playable_video_path(local_path)
         if playable_path != local_path:
@@ -1714,8 +1744,10 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
         output_path = os.path.join(DOWNLOAD_DIR, f"dola-{conv}.mp4")
         poll_env_overrides = dict(env_overrides or {})
         if manual_collect:
-            poll_env_overrides.setdefault("DOLA_MAX_POLL_TIME_MS", "60000")
-        result = _run_node(["dola-video-poll-flat.mjs", conv, output_path], timeout=90 if manual_collect else 480, env_overrides=poll_env_overrides)
+            poll_env_overrides.setdefault("DOLA_MAX_POLL_TIME_MS", "25000")
+            poll_env_overrides.setdefault("DOLA_POLL_INTERVAL_MS", "3000")
+            poll_env_overrides.setdefault("DOLA_POLL_REQUEST_TIMEOUT_MS", "8000")
+        result = _run_node(["dola-video-poll-flat.mjs", conv, output_path], timeout=40 if manual_collect else 480, env_overrides=poll_env_overrides)
         output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
         parsed = _parse_generation_output(output)
         updates = {
@@ -1727,6 +1759,7 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
             "local_path": parsed.get("local_path", ""),
             "fail_reason": parsed.get("failure_reason", ""),
             "progress": 100 if result.returncode == 0 or parsed.get("failure_reason") else 90,
+            "collect_finished_at": time.time(),
         }
         if parsed.get("video_url") or parsed.get("local_path"):
             _set_task(
@@ -1737,7 +1770,7 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
                 fail_reason="",
             )
             _sync_task_db_status(task_id, "completed", parsed.get("local_path") or parsed.get("video_url") or "")
-        elif parsed.get("failure_reason"):
+        elif parsed.get("failure_reason") and any(marker in parsed.get("failure_reason", "") for marker in ("侵权", "违规", "违法", "违禁", "无法生成", "生成失败", "抱歉")):
             _fail_task(task_id, parsed.get("failure_reason", ""), **updates)
         elif result.returncode == 0:
             _set_task(
@@ -1754,6 +1787,8 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
             retry_evidence = "\n".join([retry_reason, output])
             if "服务端始终未返回视频块" in retry_evidence or "整个轮询期间未成功拉取到任何消息" in retry_evidence:
                 retry_reason = "API 暂未读取到该 Dola 会话的视频消息；如果网页已显示视频，可能是当前账号 API 会话看不到这条页面消息。可稍后重试，或显式打开浏览器调试采集。"
+            elif result.returncode == 124:
+                retry_reason = "本次 API 采集超时，已停止后台采集并保留为可重试状态。"
             _set_task(
                 task_id,
                 **collectable_updates,
@@ -1769,8 +1804,12 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
             progress=90,
             error="",
             fail_reason=f"API 采集异常，可稍后重试: {e}",
+            collect_finished_at=time.time(),
         )
         _sync_task_db_status(task_id, "collectable")
+    finally:
+        with _task_lock:
+            _active_collect_tasks.discard(task_id)
 
 
 def _collect_task_result_browser_context(task_id: str, conversation_id: str) -> bool:
@@ -1942,6 +1981,20 @@ def collect_task(task_id: str = "", conversation_id: str = "", account: dict | N
             account_profile_dir=account_profile_dir,
             created_at=time.time(),
         )
+        task = _get_task(task_id)
+
+    with _task_lock:
+        if task_id in _active_collect_tasks:
+            current = dict(_task_cache.get(task_id, task))
+            current.update({
+                "status": "collecting",
+                "fail_reason": "该任务正在采集中，请等待本轮采集结束。",
+                "updated_at": time.time(),
+            })
+            _task_cache[task_id] = current
+            _persist_task_cache()
+            return dict(current)
+        _active_collect_tasks.add(task_id)
 
     _set_task(
         task_id,

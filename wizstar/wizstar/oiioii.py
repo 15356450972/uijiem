@@ -718,9 +718,9 @@ def generate_image(
     image_url: str = "",
     reference_images: list[str] | None = None,
     image_to_image: bool = False,
-    model: str = "gpt-image2",
+    model: str = "nano-pro",
     aspect_ratio: str = "1:1",
-    resolution: str = "2K",
+    resolution: str = "1K",
 ) -> dict:
     """提交图片生成任务（异步，后台线程轮询）"""
     prompt = _clean_str(prompt)
@@ -728,13 +728,9 @@ def generate_image(
     image_url = _clean_str(image_url)
     reference_images = reference_images or []
     image_to_image = bool(image_to_image or image_path or image_url or reference_images)
-    model = _clean_str(model, "gpt-image2") or "gpt-image2"
-    if model == "gpt-image2":
-        image_path = ""
-        image_url = ""
-        image_to_image = False
+    model = _clean_str(model, "nano-pro") or "nano-pro"
     aspect_ratio = _clean_str(aspect_ratio, "1:1") or "1:1"
-    resolution = _clean_str(resolution, "2K") or "2K"
+    resolution = _clean_str(resolution, "1K") or "1K"
     acc = _pick_account()
     account_file = acc["_file"]
     task_id = f"oiioii-img-{uuid.uuid4().hex[:12]}"
