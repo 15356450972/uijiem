@@ -14,6 +14,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,9 @@ DEFAULT_RATIOS = [
     {"id": "16:9", "name": "横版 16:9"},
     {"id": "9:16", "name": "竖版 9:16"},
     {"id": "1:1", "name": "方形 1:1"},
+    {"id": "4:3", "name": "标准 4:3"},
+    {"id": "3:4", "name": "竖版 3:4"},
+    {"id": "21:9", "name": "超宽 21:9"},
 ]
 
 DEFAULT_SEND_MODE = "browser"
@@ -270,6 +274,55 @@ def _wait_chrome_debug_port(port: int, timeout: float = 12.0) -> bool:
 def _open_url_in_existing_chrome(profile_dir: str, url: str) -> bool:
     port = _find_chrome_debug_port_for_profile(profile_dir)
     return _open_url_in_chrome_port(port, url)
+
+
+def _kill_browser_pid(pid: int) -> bool:
+    try:
+        target_pid = int(pid or 0)
+    except (TypeError, ValueError):
+        target_pid = 0
+    if target_pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(target_pid), "/T", "/F"],
+                capture_output=True,
+                timeout=8,
+            )
+            return True
+        os.kill(target_pid, signal.SIGTERM)
+        for _ in range(20):
+            time.sleep(0.2)
+            try:
+                os.kill(target_pid, 0)
+            except OSError:
+                return True
+        os.kill(target_pid, signal.SIGKILL)
+        return True
+    except (OSError, ProcessLookupError):
+        return True
+    except Exception:
+        return False
+
+
+def _close_task_browser(task_id: str) -> bool:
+    """采集成功后关闭该任务对应的浏览器会话。"""
+    task = _get_task(_clean_str(task_id))
+    if not task:
+        return False
+    try:
+        browser_pid = int(task.get("browser_pid") or 0)
+    except (TypeError, ValueError):
+        browser_pid = 0
+    closed = _kill_browser_pid(browser_pid) if browser_pid else False
+    if browser_pid or task.get("browser_port"):
+        _set_task(
+            _clean_str(task_id),
+            browser_port=0,
+            browser_pid=0,
+        )
+    return closed
 
 
 def env_file_path() -> str:
@@ -681,23 +734,43 @@ def open_account_browser(
     if target_url:
         args.extend(["--url", target_url])
     try:
+        # start_new_session=True 让 Node 进程脱离父进程会话组，
+        # 避免 FastAPI server 收到信号或重启时把 Node 和它启动的 Chrome 一起带走，
+        # 这也是"浏览器打开立马关闭"的主要根因。
+        popen_kwargs = {
+            "cwd": runner_dir,
+            "env": _base_env(),
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+            "close_fds": True,
+            "start_new_session": True,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         process = subprocess.Popen(
             [_node_bin(), *args],
-            cwd=runner_dir,
-            env=_base_env(),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            **popen_kwargs,
         )
     except OSError as e:
         raise DolaError(f"无法打开 Dola 浏览器: {e}") from e
-    time.sleep(0.8)
+    # 给 Node + Chrome 一点初始化时间，再返回 pid 给前端。
+    # 不能在这里 wait Node 进程（Node 会一直挂着等 Chrome），只等端口就绪即可。
+    deadline = time.time() + min(20.0, max(2.0, float(wait_ms or 8000) / 1000.0 + 2.0))
+    ready_port = 0
+    while time.time() < deadline:
+        if _is_chrome_debug_port_ready(launch_port):
+            ready_port = launch_port
+            break
+        time.sleep(0.3)
     return {
         "ok": True,
         "pid": process.pid,
         "env_file": current_env_file,
         "profile_dir": current_profile_dir,
-        "port": launch_port,
+        "port": ready_port or launch_port,
         "url": target_url,
+        "chrome_ready": bool(ready_port),
     }
 
 
@@ -1027,6 +1100,24 @@ def _prepare_task_profile(task_id: str, account: dict | None = None) -> str:
     return target_dir
 
 
+def _write_prompt_to_tempfile(prompt: str) -> str:
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="dola_prompt_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(prompt)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _prompt_file_cleanup_flag() -> str:
+    return "--cleanup-prompt-file"
+
+
 def _browser_submit_args(prompt: str, refs: list[str], ratio: str, duration: int, output_path: str = "", task_profile_dir: str = "") -> list[str]:
     args = [
         "browser-send-test.mjs",
@@ -1035,8 +1126,8 @@ def _browser_submit_args(prompt: str, refs: list[str], ratio: str, duration: int
         "--persistent-profile",
         "--profile",
         _clean_str(task_profile_dir) or _browser_session_profile_dir(),
-        "--prompt",
-        prompt,
+        "--prompt-file",
+        _write_prompt_to_tempfile(prompt),
         "--duration",
         str(duration),
         "--ratio",
@@ -1046,16 +1137,53 @@ def _browser_submit_args(prompt: str, refs: list[str], ratio: str, duration: int
     if output_path:
         args.extend(["--poll-output", output_path])
     if refs:
-        args.extend(["--image-files", ",".join(refs)])
+        refs_file = _write_json_list_to_tempfile(refs, "dola-browser-refs-")
+        args.extend(["--image-files-file", refs_file, "--cleanup-image-files-file"])
+    args.append(_prompt_file_cleanup_flag())
     return args
+
+
+def _write_prompt_to_tempfile(prompt: str) -> str:
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="dola-prompt-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(prompt)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+_PROMPT_TEMPFILES: list[str] = []
+
+
+def _prompt_file_cleanup_flag() -> str:
+    return "--prompt-tempfiles"
+
+
+def _is_data_url(value: str) -> bool:
+    return _clean_str(value).startswith("data:")
 
 
 def _is_http_url(value: str) -> bool:
     return bool(re.match(r"^https?://", _clean_str(value), re.IGNORECASE))
 
 
-def _is_data_url(value: str) -> bool:
-    return _clean_str(value).startswith("data:")
+def _write_json_list_to_tempfile(values: list[str], prefix: str) -> str:
+    fd, path = tempfile.mkstemp(suffix=".json", prefix=prefix)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(values, f, ensure_ascii=False)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return path
 
 
 def _download_reference_source(source: str) -> str:
@@ -1118,14 +1246,17 @@ def _prepare_api_reference_paths(reference_images: list[str] | None) -> list[str
 
 def _api_submit_args(prompt: str, refs: list[str], ratio: str, duration: int, model: str) -> list[str]:
     if refs:
+        refs_file = _write_json_list_to_tempfile(refs, "dola-api-refs-")
         return [
             "dola-video-gen.mjs",
             "image",
-            ",".join(refs),
+            "--refs-file",
+            refs_file,
             prompt,
             ratio,
             str(duration),
             model,
+            "--cleanup-refs-file",
         ]
     return [
         "dola-video-gen.mjs",
@@ -1209,6 +1340,8 @@ def _extract_failure_reason(output: str) -> str:
     failure_patterns = [
         ("内容未通过，无法返回视频", r"生成内容[^。！？\n]{0,60}(?:疑似包含|包含|涉及)[^。！？\n]{0,40}(?:侵权|违规|违法|违禁)[^。！？\n]{0,80}无法返回"),
         ("内容未通过，无法返回视频", r"无法返回该内容[^。！？\n]{0,80}(?:换个主题|重新尝试|再试试)"),
+        ("视频时长超过限制，无法生成视频", r"(?:无法|不能|不支持|暂时无法|目前无法|当前无法)生成[^。！？\n]{0,12}超过\s*\d+\s*秒|超过\s*\d+\s*秒[^。！？\n]{0,20}(?:无法|不能|不支持)生成"),
+        ("视频时长超过限制，无法生成视频", r"videos?\s+longer\s+than\s+\d+\s+seconds?\s+cannot\s+be\s+generated|cannot\s+(?:currently\s+)?generate\s+(?:a\s+)?videos?\s+longer\s+than"),
         ("Dola 浏览器提交没有进入视频能力", r"Dola\s*浏览器提交没有进入视频能力|ability_type\s*=\s*(?!17\b)\d+"),
         ("返回的是图片，不是视频", r"以下是[^。！？\n]{0,80}(?:图片|图像|照片|海报|封面)"),
         ("返回的是图片，不是视频", r"(?:已|已经|为你|帮你)[^。！？\n]{0,50}(?:生成|创作|制作)[^。！？\n]{0,40}(?:图片|图像|照片|海报|封面)"),
@@ -1222,7 +1355,42 @@ def _extract_failure_reason(output: str) -> str:
     return ""
 
 
+# Dola 服务端"额度不足/拒绝生成"类消息的特征词。
+# 这类消息里虽然也含"消耗 N 个视频生成额度"字样，但任务是**被拒绝**的，
+# 服务端并没有真正扣额度，本地不能误扣，否则账号剩余额度会被扣成负数。
+_QUOTA_REJECTION_MARKERS = (
+    "额度不足",
+    "无法生成该视频",
+    "无法生成视频",
+    "无法生成该内容",
+    "剩余",
+    "今日剩余",
+    "请尝试降低配置",
+    "cookie 过期",
+    "内容未通过",
+    "明确拒绝",
+    "无法返回",
+    "cannot be generated",
+    "cannot generate",
+    "longer than",
+    "unable to generate",
+)
+
+
+def _looks_like_quota_rejection(text: str) -> bool:
+    compact = _compact_log_text(text or "")
+    if not compact:
+        return False
+    return any(marker in compact for marker in _QUOTA_REJECTION_MARKERS)
+
+
 def _extract_observed_quota_cost(output: str) -> int:
+    # 先判断这条输出是不是"拒绝/失败"消息。
+    # Dola 在额度不足时会回"本次视频生成需要消耗 2 个视频生成额度，今日剩余 1 个
+    # 视频生成额度，无法生成该视频"——里面也有"消耗 2 个额度"，但任务被拒绝、
+    # 服务端没真扣，本地绝对不能扣，否则账号额度会被扣成负数。
+    if _looks_like_quota_rejection(output):
+        return 0
     cost_text = _extract_last(r"(?:将)?消耗\s*(\d+)\s*个视频生成额度", output or "")
     if not cost_text:
         return 0
@@ -1258,7 +1426,7 @@ def _is_empty_sse_retryable_error(message: str) -> bool:
         text
         and "SSE" in text
         and ("立即关闭" in text or "未返回会话" in text or "未返回会话 ID" in text)
-        and not any(marker in text for marker in ("额度不足", "cookie 过期", "内容未通过", "明确拒绝"))
+        and not any(marker in text for marker in _QUOTA_REJECTION_MARKERS)
     )
 
 
@@ -1434,7 +1602,14 @@ def create_video(
         requested_duration = int(duration or 10)
     except (TypeError, ValueError):
         requested_duration = 10
-    duration = min(15, max(5, ((requested_duration + 4) // 5) * 5))
+    # Dola 服务端已支持 5s/10s/15s（实测 2026-06-25：15s 被 ACK 接受，扣 3 个额度）。
+    # 只做合法档位归一，与 dola-video-gen.mjs:normalizeApiDuration 保持一致。
+    if requested_duration <= 5:
+        duration = 5
+    elif requested_duration <= 10:
+        duration = 10
+    else:
+        duration = 15
 
     refs: list[str] = []
     for item in [image_path, image_url, *(reference_images or [])]:
@@ -1506,7 +1681,8 @@ def create_video(
             account_env_overrides = _account_env_overrides(account_env_file, account_profile_dir)
 
             if send_mode == SEND_MODE_API:
-                args = _api_submit_args(prompt, refs, ratio, duration, model)
+                api_refs = _prepare_api_reference_paths(refs)
+                args = _api_submit_args(prompt, api_refs, ratio, duration, model)
 
                 def _on_api_output(output: str) -> None:
                     parsed = _parse_generation_output(output)
@@ -1744,10 +1920,10 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
         output_path = os.path.join(DOWNLOAD_DIR, f"dola-{conv}.mp4")
         poll_env_overrides = dict(env_overrides or {})
         if manual_collect:
-            poll_env_overrides.setdefault("DOLA_MAX_POLL_TIME_MS", "25000")
+            poll_env_overrides.setdefault("DOLA_MAX_POLL_TIME_MS", "120000")
             poll_env_overrides.setdefault("DOLA_POLL_INTERVAL_MS", "3000")
             poll_env_overrides.setdefault("DOLA_POLL_REQUEST_TIMEOUT_MS", "8000")
-        result = _run_node(["dola-video-poll-flat.mjs", conv, output_path], timeout=40 if manual_collect else 480, env_overrides=poll_env_overrides)
+        result = _run_node(["dola-video-poll-flat.mjs", conv, output_path], timeout=150 if manual_collect else 480, env_overrides=poll_env_overrides)
         output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
         parsed = _parse_generation_output(output)
         updates = {
@@ -1770,8 +1946,12 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
                 fail_reason="",
             )
             _sync_task_db_status(task_id, "completed", parsed.get("local_path") or parsed.get("video_url") or "")
-        elif parsed.get("failure_reason") and any(marker in parsed.get("failure_reason", "") for marker in ("侵权", "违规", "违法", "违禁", "无法生成", "生成失败", "抱歉")):
+            if manual_collect:
+                _close_task_browser(task_id)
+        elif parsed.get("failure_reason") and any(marker in parsed.get("failure_reason", "") for marker in ("侵权", "违规", "违法", "违禁", "无法生成", "生成失败", "抱歉", "时长超过", "cannot be generated", "longer than")):
             _fail_task(task_id, parsed.get("failure_reason", ""), **updates)
+            if manual_collect:
+                _close_task_browser(task_id)
         elif result.returncode == 0:
             _set_task(
                 task_id,
@@ -1781,6 +1961,8 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
                 fail_reason="",
             )
             _sync_task_db_status(task_id, "completed", parsed.get("local_path") or parsed.get("video_url") or "")
+            if manual_collect:
+                _close_task_browser(task_id)
         else:
             collectable_updates = _task_update_payload(updates, "status", "error", "fail_reason")
             retry_reason = parsed.get("failure_reason", "") or "暂未拿到视频，已保留会话，可稍后继续采集。"
@@ -1864,6 +2046,7 @@ def _collect_task_result_browser_context(task_id: str, conversation_id: str) -> 
                 fail_reason="",
             )
             _sync_task_db_status(task_id, "completed", parsed.get("local_path") or parsed.get("video_url") or "")
+            _close_task_browser(task_id)
             return True
         if result.returncode != 0 and "CDP not ready" in output:
             _set_task(
@@ -1875,6 +2058,11 @@ def _collect_task_result_browser_context(task_id: str, conversation_id: str) -> 
             )
             _sync_task_db_status(task_id, "collectable")
             return False
+        failure_reason = parsed.get("failure_reason", "")
+        if failure_reason:
+            _fail_task(task_id, failure_reason, **updates)
+            _close_task_browser(task_id)
+            return True
         _set_task(
             task_id,
             **_task_update_payload(updates, "status", "error", "fail_reason"),
@@ -2007,6 +2195,16 @@ def collect_task(task_id: str = "", conversation_id: str = "", account: dict | N
     _sync_task_db_status(task_id, "processing")
 
     def _run_collect() -> None:
+        # 采集结果只走纯 API 轮询（dola-video-poll-flat.mjs），不再开浏览器。
+        # 浏览器路径（_collect_task_result_browser_context / _reopen_account_browser_and_collect）
+        # 虽然更稳（能用页面真实签名参数），但需要维持/重开 Chrome 会话，
+        # 和"纯 API、不开浏览器"的使用诉求冲突，所以这里直接跳过。
+        # 如果纯 API 轮询长期拿不到结果（Dola 更新签名算法），
+        # 可以临时把下面两行取消注释，恢复浏览器优先的回退链。
+        # if _collect_task_result_browser_context(task_id, conv):
+        #     return
+        # if _reopen_account_browser_and_collect(task_id, conv):
+        #     return
         _poll_task_result(task_id, conv, env_overrides, True)
 
     threading.Thread(target=_run_collect, daemon=True).start()

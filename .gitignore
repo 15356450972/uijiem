@@ -102,3 +102,15 @@ quickframe-sdk-full/storyboard.png
 quickframe-sdk-full/tests/live_*.py
 quickframe-sdk-full/tests/integration_*.py
 quickframe-sdk-full/examples/e2e_*.py
+
+# Local debug session artifacts
+.dbg/
+debug-dola-api-gen-fail.md
+fix_dola_server.py
+fix_server_patch.py
+
+# Local scratch images
+*.顾青.png
+*.白雨雨.png
+1.顾青.png
+2.白雨雨.png

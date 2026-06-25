@@ -96,6 +96,18 @@ class ImageUpload(BaseModel):
     filename: str = "role-reference.png"
 
 
+class FaceCensorRequest(BaseModel):
+    src: str = ""
+    file_path: str = ""
+    data_url: str = ""
+    scale: float | None = None
+    alpha: float | None = None
+    line_width_factor: float | None = None
+    color: str | None = None
+    detect_max_side: int | None = None
+    upper_region_ratio: float | None = None
+
+
 
 
 class PixmaxConfigUpdate(BaseModel):
@@ -686,6 +698,42 @@ def upload_image(body: ImageUpload):
                 os.remove(temp_path)
             except OSError:
                 pass
+
+
+@app.post("/face-censor")
+def face_censor_image(body: FaceCensorRequest):
+    """后端自动识别人脸并叠加打码符号，避免前端主线程长时间卡顿。"""
+    try:
+        from .face_censor import censor_image
+
+        user_opts = {
+            key: value
+            for key, value in {
+                "scale": body.scale,
+                "alpha": body.alpha,
+                "line_width_factor": body.line_width_factor,
+                "color": body.color,
+                "detect_max_side": body.detect_max_side,
+                "upper_region_ratio": body.upper_region_ratio,
+            }.items()
+            if value is not None
+        }
+        return {"data": censor_image(
+            src=body.src,
+            file_path=body.file_path,
+            data_url=body.data_url,
+            user_opts=user_opts,
+        )}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"拉取图片失败: {e}") from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/tasks/create")
@@ -1610,14 +1658,24 @@ def dola_open_browser(body: DolaAccountOpenBrowser | None = None):
             except dl.DolaError:
                 conversation_id = ""
         target_url = f"https://www.dola.com/chat/{conversation_id}" if conversation_id else page_url
+        result = None
         if payload.task_id:
-            result = dl.open_task_browser(payload.task_id, url=target_url, fallback_account=False)
-            if not result.get("ok"):
-                raise HTTPException(status_code=409, detail=result.get("task_session_missing_reason") or "任务浏览器会话不可用")
-        else:
+            try:
+                result = dl.open_task_browser(payload.task_id, url=target_url, fallback_account=False)
+            except dl.DolaError as e:
+                if e.status_code == 404:
+                    raise
+                result = None
+            except Exception:
+                result = None
+        if not result or not result.get("ok"):
             result = dl.open_account_browser(url=target_url)
-        result["conversation_id"] = conversation_id
+            result["task_session"] = False
+            result["task_session_missing_reason"] = (
+                result.get("task_session_missing_reason") or "任务浏览器会话不可用，已回退打开账号浏览器。"
+            )
         if conversation_id:
+            result["conversation_id"] = conversation_id
             dl.remember_browser_session_for_conversation(conversation_id, result)
         return {"data": result}
     except dl.DolaError as e:

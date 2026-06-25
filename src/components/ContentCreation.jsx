@@ -36,6 +36,7 @@ import {
 } from 'lucide-react';
 import { WIZSTAR_API } from '../config';
 import ImageMergeModal from './ImageMergeModal';
+import FaceCensorModal from './FaceCensorModal';
 import { mergeImages, blobToUint8Array, timestampForFilename } from '../utils/imageMerge';
 
 const TASK_REGISTRY_KEY = 'maocanju_generation_task_registry';
@@ -433,8 +434,12 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   const BASIC_ASPECT_RATIOS = ['16:9', '9:16', '1:1'];
   const EXTENDED_IMAGE_ASPECT_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4'];
   const CHATGPT2API_IMAGE_ASPECT_RATIOS = ['3:2', '2:3', '1:1'];
+  // Dola 网页端 Seedance 2.0 实际支持 6 种比例（1:1/3:4/4:3/9:16/16:9/21:9），
+  // 与 Seedance 2.0 官方 API 一致，不存在"4:3 被静默改成 16:9"的情况。
+  const DOLA_VIDEO_ASPECT_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'];
   const getSupportedAspectRatios = ({ channel = generateChannel, modelName = globalModel, mediaType = getModelMediaType(modelName) } = {}) => {
     if (channel === 'chatgpt2api' || modelName === '渠道五 GPT-Image2') return CHATGPT2API_IMAGE_ASPECT_RATIOS;
+    if (channel === 'dola' && mediaType === 'video') return DOLA_VIDEO_ASPECT_RATIOS;
     if (mediaType === 'image') return EXTENDED_IMAGE_ASPECT_RATIOS;
     return BASIC_ASPECT_RATIOS;
   };
@@ -860,6 +865,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   const [newCharRole, setNewCharRole] = useState('');
   const [newCharAvatar, setNewCharAvatar] = useState('');
   const [newCharAvatarPath, setNewCharAvatarPath] = useState('');
+  const [newCharAvatarOriginal, setNewCharAvatarOriginal] = useState('');
+  // 角色一键打码进度：running 进行中，current/total 用于显示 x/y
+  const [censorProgress, setCensorProgress] = useState({ running: false, current: 0, total: 0 });
+  // 手动打码弹窗
+  const [manualCensorOpen, setManualCensorOpen] = useState(false);
 
   const [mergeModalState, setMergeModalState] = useState({ open: false, rowId: null, items: [] });
   const [mergeAllProgress, setMergeAllProgress] = useState({ running: false, current: 0, total: 0 });
@@ -869,6 +879,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     name: newCharName.trim(),
     avatar: newCharAvatar,
     avatarPath: newCharAvatarPath,
+    avatarOriginal: newCharAvatarOriginal,
     role: newCharRole,
   });
 
@@ -1263,12 +1274,107 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     const file = e.target.files[0];
     if (file) {
       setNewCharAvatarPath(file.path || '');
+      setNewCharAvatarOriginal(''); // 换了底图，清掉旧的打码原图备份
       const reader = new FileReader();
       reader.onload = () => {
         setNewCharAvatar(reader.result);
       };
       reader.readAsDataURL(file);
     }
+  };
+
+  // 对当前正在编辑的角色头像做脸部打码（只改表单，需点「保存资产」落库）。
+  const handleCensorCurrentCharacter = async () => {
+    if (censorProgress.running) return;
+    const base = newCharAvatarOriginal || newCharAvatar;
+    if (!base) {
+      alert('请先选择角色图片！');
+      return;
+    }
+    setCensorProgress({ running: true, current: 0, total: 1 });
+    try {
+      const { censorImageSrc } = await import('../utils/faceCensor');
+      const res = await censorImageSrc(base);
+      if (!res.faceCount) {
+        alert('未识别到人脸，未做改动。可换一张更正面的角色图再试。');
+        return;
+      }
+      setNewCharAvatarOriginal((prev) => prev || newCharAvatar);
+      setNewCharAvatar(res.dataUrl);
+      setNewCharAvatarPath('');
+    } catch (err) {
+      alert(`打码失败：${err?.message || err}`);
+    } finally {
+      setCensorProgress({ running: false, current: 0, total: 0 });
+    }
+  };
+
+  // 撤销当前角色的打码，恢复成打码前的原图。
+  const handleUndoCensorCurrentCharacter = () => {
+    if (!newCharAvatarOriginal) return;
+    setNewCharAvatar(newCharAvatarOriginal);
+    setNewCharAvatarPath('');
+    setNewCharAvatarOriginal('');
+  };
+
+  // 手动打码确定后回填到当前编辑表单（需点「保存资产」落库）。
+  const handleApplyManualCensor = (dataUrl) => {
+    if (!dataUrl) return;
+    setNewCharAvatarOriginal((prev) => prev || newCharAvatar);
+    setNewCharAvatar(dataUrl);
+    setNewCharAvatarPath('');
+  };
+
+  // 一键给所有角色资产自动识别人脸并打码（覆盖头像，保留原图可撤销）。
+  const handleCensorAllCharacters = async () => {
+    if (censorProgress.running) return;
+    if (!characterAssets.length) {
+      alert('暂无角色资产。');
+      return;
+    }
+    if (!confirm(`将对全部 ${characterAssets.length} 个角色自动识别人脸并打码（会覆盖头像，可单独撤销）。继续？`)) {
+      return;
+    }
+    let done = 0;
+    let skipped = 0;
+    let failed = 0;
+    setCensorProgress({ running: true, current: 0, total: characterAssets.length });
+    try {
+      const { censorImageSrc } = await import('../utils/faceCensor');
+      const next = characterAssets.map((c) => ({ ...c }));
+      for (let i = 0; i < next.length; i++) {
+        setCensorProgress({ running: true, current: i + 1, total: next.length });
+        const c = next[i];
+        // 已打码过的角色从原图重新生成，避免重复叠加符号。
+        const base = c.avatarOriginal || c.avatar;
+        if (!base) {
+          skipped++;
+          continue;
+        }
+        try {
+          const res = await censorImageSrc(base);
+          if (res.faceCount) {
+            next[i] = { ...c, avatar: res.dataUrl, avatarPath: '', avatarOriginal: c.avatarOriginal || c.avatar };
+            done++;
+          } else {
+            skipped++;
+          }
+        } catch (err) {
+          console.warn('角色打码失败:', c?.name, err);
+          failed++;
+        }
+      }
+      setCharacterAssets(next);
+      const edited = next.find((c) => c.id === editingCharId);
+      if (edited) {
+        setNewCharAvatar(edited.avatar);
+        setNewCharAvatarPath(edited.avatarPath || '');
+        setNewCharAvatarOriginal(edited.avatarOriginal || '');
+      }
+    } finally {
+      setCensorProgress({ running: false, current: 0, total: 0 });
+    }
+    alert(`打码完成：成功 ${done}，未识别到人脸跳过 ${skipped}${failed ? `，失败 ${failed}` : ''}。`);
   };
 
   // Save character asset details (create/update)
@@ -1311,12 +1417,14 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         setNewCharRole(remaining[0].role || '');
         setNewCharAvatar(remaining[0].avatar);
         setNewCharAvatarPath(remaining[0].avatarPath || '');
+        setNewCharAvatarOriginal(remaining[0].avatarOriginal || '');
       } else {
         setEditingCharId(null);
         setNewCharName('');
         setNewCharRole('');
         setNewCharAvatar('');
         setNewCharAvatarPath('');
+        setNewCharAvatarOriginal('');
         setShowCharacterModal(false);
       }
     }
@@ -2362,7 +2470,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               const newMatId = Math.max(...list.map(m => m.id), 0) + 1;
               const matName = `${task.segId}-${newMatId}`;
               if (isVid) {
-                const newMat = { id: newMatId, name: matName, thumbnail: playableUrl, sourceUrl, localPath, remoteUrl: sourceUrl, mediaType: 'video', taskId: task.taskId, requestId: task.requestId || '', conversationId: task.conversationId || '', status: 'new', textStatus: localPath ? '本地' : '新' };
+                const newMat = { id: newMatId, name: matName, thumbnail: playableUrl, sourceUrl, localPath, remoteUrl: sourceUrl, mediaType: 'video', taskId: task.taskId, requestId: task.requestId || '', conversationId: task.conversationId || '', accountId: task.accountId || 0, accountName: task.accountName || '', status: 'new', textStatus: localPath ? '本地' : '新' };
                 nextSeg = {
                   ...nextSeg,
                   type: 'video',
@@ -2375,7 +2483,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 return;
               }
 
-              const newMat = { id: newMatId, name: matName, thumbnail: playableUrl, sourceUrl, localPath, remoteUrl: sourceUrl, mediaType: 'image', taskId: task.taskId, requestId: task.requestId || '', conversationId: task.conversationId || '', status: 'new', textStatus: '图' };
+              const newMat = { id: newMatId, name: matName, thumbnail: playableUrl, sourceUrl, localPath, remoteUrl: sourceUrl, mediaType: 'image', taskId: task.taskId, requestId: task.requestId || '', conversationId: task.conversationId || '', accountId: task.accountId || 0, accountName: task.accountName || '', status: 'new', textStatus: '图' };
               nextSeg = {
                 ...nextSeg,
                 type: 'image',
@@ -2948,9 +3056,6 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         throw new Error(message);
       }
       const payload = data.data || {};
-      if (taskId && payload.task_session === false && !payload.conversation_id && !payload.url) {
-        throw new Error(payload.task_session_missing_reason || '任务浏览器会话不可用');
-      }
     } catch (e) {
       alert(`打开渠道六浏览器失败: ${e.message || e}`);
     }
@@ -4397,9 +4502,9 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       </button>
                     ))}
                   </div>
-                  {getModelMediaType(globalModel) === 'video' && (
+                  {getModelMediaType(globalModel) === 'video' && generateChannel === 'dola' && (
                     <p className="mt-1.5 text-[9px] text-dark-subtle leading-relaxed">
-                      当前视频通道仅显示可提交比例，避免 4:3 / 3:4 被平台静默改成 16:9。
+                      渠道六 Seedance 2.0 支持 1:1 / 3:4 / 4:3 / 9:16 / 16:9 / 21:9 六种比例。
                     </p>
                   )}
                 </div>
@@ -5157,14 +5262,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     <button 
                       type="button"
                       onClick={() => {
-                        if (generateChannel === 'dola' && hasActiveGenerationTask(row)) {
-                          alert('渠道六 Dola 同一账号一次只能跑一个视频任务，请等待当前任务完成后再提交。');
-                          return;
-                        }
                         handleGenerate(row.id);
                       }}
                       className="flex items-center space-x-1 px-3.5 py-1.5 bg-brand hover:bg-brand-dark text-black rounded-lg text-[11px] font-bold transition-all shadow-[0_2px_10px_rgba(16,185,129,0.15)] active:scale-95"
-                      title={generateChannel === 'dola' ? '渠道六 Dola 单账号一次只能运行一个视频任务' : '可连续点击多次，每次都会提交一个新的生成任务'}
+                      title={generateChannel === 'dola' ? '渠道六 Dola 单账号一次只能跑一个视频任务；可连续点击多次，系统会自动换用下一个空闲账号并行生成' : '可连续点击多次，每次都会提交一个新的生成任务'}
                     >
                       <Send className="w-3 h-3" />
                       <span>
@@ -5553,6 +5654,18 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                           <div className="w-full h-full flex items-center justify-center bg-zinc-900 text-dark-subtle text-[8px]">无预览</div>
                         )}
 
+                        {/* Account chip: which Dola account produced this frame */}
+                        {mat.accountName && (
+                          <div className="absolute bottom-1 inset-x-0 z-10 flex justify-center px-6 pointer-events-none group-hover/candidate:opacity-0 transition-opacity">
+                            <span
+                              className="max-w-full truncate rounded bg-black/75 backdrop-blur-sm px-1 py-0.5 text-[7px] font-bold text-brand scale-90"
+                              title={`生成账号：${mat.accountName}`}
+                            >
+                              {mat.accountName}
+                            </span>
+                          </div>
+                        )}
+
                         {/* Label name Overlay on hover */}
                         <div className="absolute inset-x-0 bottom-0 bg-black/75 p-1 text-center scale-y-0 group-hover/candidate:scale-y-100 origin-bottom transition-transform duration-200">
                           <p className="text-[8px] text-white truncate pr-5">{mat.name}</p>
@@ -5702,12 +5815,30 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 <span className="w-2.5 h-2.5 rounded-full bg-brand animate-pulse" />
                 <span className="text-xs font-bold text-dark-text">角色特征资产管理器 (特征垫图与关联中心)</span>
               </div>
-              <button 
-                onClick={() => setShowCharacterModal(false)}
-                className="text-dark-muted hover:text-white text-base hover:bg-white/10 w-6 h-6 rounded flex items-center justify-center transition-colors"
-              >
-                ✕
-              </button>
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={handleCensorAllCharacters}
+                  disabled={censorProgress.running}
+                  title="自动识别所有角色人脸并在脸上叠加打码符号（覆盖头像，可单独撤销）"
+                  className="px-2.5 py-1 rounded-md bg-brand/15 border border-brand/40 text-[11px] font-bold text-brand hover:bg-brand/25 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center space-x-1"
+                >
+                  {censorProgress.running ? (
+                    <>
+                      <RefreshCw className="w-3 h-3 animate-spin" />
+                      <span>打码中 {censorProgress.current}/{censorProgress.total}</span>
+                    </>
+                  ) : (
+                    <span>一键打码全部</span>
+                  )}
+                </button>
+                <button
+                  onClick={() => setShowCharacterModal(false)}
+                  className="text-dark-muted hover:text-white text-base hover:bg-white/10 w-6 h-6 rounded flex items-center justify-center transition-colors"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
 
             {/* Main Content Area */}
@@ -5729,6 +5860,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                             setNewCharRole(char.role || '');
                             setNewCharAvatar(char.avatar);
                             setNewCharAvatarPath(char.avatarPath || '');
+                            setNewCharAvatarOriginal(char.avatarOriginal || '');
                           }}
                           className={`flex items-center space-x-2.5 p-2 rounded-lg cursor-pointer transition-all border ${
                             isActive ? 'bg-[#323338]/30 border-[#10b981]/40 text-brand' : 'hover:bg-[#1c1d22]/40 border-transparent text-dark-text'
@@ -5753,6 +5885,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     setNewCharRole('主角设定');
                     setNewCharAvatar('https://images.unsplash.com/photo-1578632767115-351597cf2477?auto=format&fit=crop&q=80&w=260');
                     setNewCharAvatarPath('');
+                    setNewCharAvatarOriginal('');
                   }}
                   className="w-full py-1.5 rounded-lg bg-dark-card border border-dashed border-dark-border hover:border-brand/40 text-xs font-bold text-dark-muted hover:text-brand transition-colors flex items-center justify-center space-x-1 mt-3 shrink-0"
                 >
@@ -5796,6 +5929,37 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       </div>
                       <div className="text-[8px] text-dark-subtle mt-1 text-center leading-tight">
                         支持 PNG, JPG, WebP 格式<br />点击自动导入本地特征图
+                      </div>
+                      <div className="flex flex-wrap items-center justify-center gap-1.5 mt-1.5">
+                        <button
+                          type="button"
+                          onClick={handleCensorCurrentCharacter}
+                          disabled={censorProgress.running || !newCharAvatar}
+                          title="自动识别人脸并在脸上叠加打码符号"
+                          className="px-2 py-1 rounded-md bg-brand/15 border border-brand/40 text-[10px] font-bold text-brand hover:bg-brand/25 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          {censorProgress.running && censorProgress.total === 1 ? '打码中…' : '自动打码'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setManualCensorOpen(true)}
+                          disabled={censorProgress.running || !newCharAvatar}
+                          title="手动拖动放置打码符号（自动识别不准时用）"
+                          className="px-2 py-1 rounded-md bg-dark-input border border-dark-border text-[10px] font-bold text-dark-text hover:text-white hover:border-brand/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          手动打码
+                        </button>
+                        {newCharAvatarOriginal && (
+                          <button
+                            type="button"
+                            onClick={handleUndoCensorCurrentCharacter}
+                            disabled={censorProgress.running}
+                            title="恢复打码前的原图"
+                            className="px-2 py-1 rounded-md bg-dark-input border border-dark-border text-[10px] font-bold text-dark-muted hover:text-white disabled:opacity-50 transition-colors"
+                          >
+                            撤销
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -5859,6 +6023,14 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
           </div>
         </div>
       )}
+
+      {/* 手动打码弹窗 */}
+      <FaceCensorModal
+        open={manualCensorOpen}
+        src={newCharAvatarOriginal || newCharAvatar}
+        onApply={handleApplyManualCensor}
+        onClose={() => setManualCensorOpen(false)}
+      />
 
       {/* Fullscreen Video/Image Preview Modal */}
       {fullscreenVideo && (

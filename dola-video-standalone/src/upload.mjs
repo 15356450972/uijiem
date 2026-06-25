@@ -8,6 +8,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { signedFetch, headersFor, getPlatformOrigin } from './client.mjs';
 
+const DATA_URL_RE = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/s;
+
 async function fetchWithTimeout(url, init = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -21,6 +23,58 @@ async function fetchWithTimeout(url, init = {}, timeoutMs = 30000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function extFromMime(mime) {
+  const normalized = String(mime || '').trim().toLowerCase();
+  if (normalized === 'image/jpeg') return '.jpg';
+  if (normalized === 'image/png') return '.png';
+  if (normalized === 'image/webp') return '.webp';
+  if (normalized === 'image/gif') return '.gif';
+  if (normalized === 'image/bmp') return '.bmp';
+  const subtype = normalized.startsWith('image/') ? normalized.slice('image/'.length) : '';
+  return subtype ? `.${subtype.replace(/[^a-z0-9.+-]/g, '')}` : '.png';
+}
+
+async function loadImageInput(imagePath) {
+  const raw = String(imagePath || '').trim();
+  if (!raw) throw new Error('imagePath is empty');
+
+  const dataUrlMatch = raw.match(DATA_URL_RE);
+  if (dataUrlMatch) {
+    const mime = dataUrlMatch[1];
+    const imageBytes = Buffer.from(dataUrlMatch[2], 'base64');
+    return {
+      imageBytes,
+      ext: extFromMime(mime),
+      name: `inline${extFromMime(mime)}`,
+    };
+  }
+
+  if (/^https?:\/\//i.test(raw)) {
+    const res = await fetchWithTimeout(raw, {
+      method: 'GET',
+      headers: { 'accept': 'image/*,*/*;q=0.8' },
+    }, 45000);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Download image failed: HTTP ${res.status} ${text.slice(0, 200)}`);
+    }
+    const mime = (res.headers.get('content-type') || '').split(';', 1)[0].trim();
+    const imageBytes = Buffer.from(await res.arrayBuffer());
+    const urlPath = new URL(raw).pathname;
+    const fallbackExt = extFromMime(mime);
+    const baseName = path.basename(urlPath || '') || `remote${fallbackExt}`;
+    const ext = path.extname(baseName) || fallbackExt;
+    const name = path.extname(baseName) ? baseName : `${baseName}${ext}`;
+    return { imageBytes, ext, name };
+  }
+
+  return {
+    imageBytes: fs.readFileSync(raw),
+    ext: path.extname(raw) || '.png',
+    name: path.basename(raw),
+  };
 }
 
 // AWS SigV4 签名实现（用于 ImageX API）
@@ -282,9 +336,7 @@ export async function commitImageUpload({ serviceId, sessionKey, authToken, imag
 
 // 完整的图片上传流程（4 步合一）
 export async function uploadImage({ imagePath, botId, conversationId = '', sectionId = '', sceneId = 4, debug = false }) {
-  const imageBytes = fs.readFileSync(imagePath);
-  const ext = path.extname(imagePath) || '.png';
-  const name = path.basename(imagePath);
+  const { imageBytes, ext, name } = await loadImageInput(imagePath);
 
   if (debug) console.log(`[upload] file: ${name} (${imageBytes.length} bytes)`);
 

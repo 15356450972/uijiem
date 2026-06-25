@@ -174,6 +174,14 @@ async function openWizstarAccountWindow(accountId) {
   const account = result.data;
   if (!account) throw new Error('account not found');
 
+  const existingWin = wizstarAccountWindows.get(String(accountId));
+  if (existingWin && !existingWin.isDestroyed()) {
+    if (existingWin.isMinimized()) existingWin.restore();
+    existingWin.show();
+    existingWin.focus();
+    return { ok: true, reused: true };
+  }
+
   const partition = `persist:wizstar-account-${accountId}`;
   const accountSession = session.fromPartition(partition);
 
@@ -195,6 +203,13 @@ async function openWizstarAccountWindow(accountId) {
     backgroundColor: '#111113',
   });
 
+  wizstarAccountWindows.set(String(accountId), win);
+  win.on('closed', () => {
+    if (wizstarAccountWindows.get(String(accountId)) === win) {
+      wizstarAccountWindows.delete(String(accountId));
+    }
+  });
+
   await win.loadURL('https://wizstar.com/tools/generate_video');
   return { ok: true };
 }
@@ -204,6 +219,7 @@ let pythonProcess = null;
 let pythonServerStarting = false;
 let backendWatchdogTimer = null;
 let appIsQuitting = false;
+const wizstarAccountWindows = new Map();
 
 async function startPythonServer(options = {}) {
   if (pythonServerStarting) return;
@@ -392,7 +408,10 @@ function createWindow() {
   // In development, load from Vite server. In production, load the built index.html.
   const isDev = !app.isPackaged;
   if (isDev) {
-    mainWindow.loadURL('http://localhost:5174').then(revealMainWindow).catch((e) => console.error('[window] failed to load dev URL:', e));
+    const devPort = Number.parseInt(process.env.VITE_PORT || '5174', 10);
+    const devHost = process.env.VITE_HOST || '127.0.0.1';
+    const devUrl = `http://${devHost}:${Number.isNaN(devPort) ? 5174 : devPort}`;
+    mainWindow.loadURL(devUrl).then(revealMainWindow).catch((e) => console.error('[window] failed to load dev URL:', e));
   } else {
     mainWindow.loadFile(path.join(__dirname, '../dist/index.html')).then(revealMainWindow).catch((e) => console.error('[window] failed to load file:', e));
   }

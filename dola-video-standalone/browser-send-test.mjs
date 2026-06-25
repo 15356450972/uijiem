@@ -175,7 +175,7 @@ function copyProfileSnapshot(sourceDir, targetDir) {
   });
 }
 
-function createTemporaryProfileDir(baseDir, sourceDir) {
+function createTemporaryProfileDir(baseDir, sourceDir, copySource = true) {
   const tempRoot = path.resolve(baseDir, '.doubao_browsers', '.tmp_profiles');
   fs.mkdirSync(tempRoot, { recursive: true });
   const tempDir = path.join(
@@ -183,7 +183,7 @@ function createTemporaryProfileDir(baseDir, sourceDir) {
     `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
   );
   fs.mkdirSync(tempDir, { recursive: true });
-  if (sourceDir && fs.existsSync(sourceDir)) {
+  if (copySource && sourceDir && fs.existsSync(sourceDir)) {
     copyProfileSnapshot(sourceDir, tempDir);
   }
   return tempDir;
@@ -217,6 +217,33 @@ function resolveExtensionDir(input) {
     throw new Error(`Extension dir not found: ${absPath}`);
   }
   return absPath;
+}
+
+// 清理 Chrome profile 里的 crash 记录，避免 macOS 的
+// NSPersistentUIRestorer.promptToIgnorePersistentStateWithCrashHistory
+// 在自动化启动时弹出模态对话框，导致 Chrome 触发 brk 0 (EXC_BREAKPOINT) 崩溃。
+// 这是 Chrome 149 + macOS 26 自动化场景下的已知行为，与业务逻辑无关。
+function clearChromeCrashHistory(profileDir) {
+  const profile = path.resolve(String(profileDir || ''));
+  if (!profile || !fs.existsSync(profile)) return;
+  const targets = [
+    path.join(profile, 'Crashpad'),
+    path.join(profile, 'Crashpad', 'reports'),
+    path.join(profile, 'Crashpad', 'metadata'),
+    path.join(profile, 'Crashpad', 'upload-count'),
+    path.join(profile, 'Crashpad', 'database'),
+    path.join(profile, 'Crash Reports'),
+    // 上次崩溃标记，触发"恢复上次会话"提示
+    path.join(profile, 'Default', 'Preferences'),
+  ];
+  // 只删 Crashpad/Crash Reports 这种纯崩溃记录目录，Preferences 不删（会丢登录态）
+  for (const crashDir of [path.join(profile, 'Crashpad'), path.join(profile, 'Crash Reports')]) {
+    try {
+      if (fs.existsSync(crashDir)) {
+        fs.rmSync(crashDir, { recursive: true, force: true });
+      }
+    } catch {}
+  }
 }
 
 function readEnvFile(envFile) {
@@ -374,92 +401,6 @@ async function activeDolaPage(port, preferredUrl = '') {
   if (!page?.webSocketDebuggerUrl) throw new Error('No connectable dola page found');
   await fetch(`http://127.0.0.1:${port}/json/activate/${page.id}`).catch(() => null);
   return page;
-}
-
-async function dismissLoginModal(send) {
-  const closeViaEscape = async () => {
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 }).catch(() => null);
-    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27 }).catch(() => null);
-    await sleep(250);
-  };
-
-  await closeViaEscape();
-
-  const result = await send('Runtime.evaluate', {
-    expression: `(() => {
-      const isVisible = (el) => {
-        if (!el) return false;
-        const style = getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-        return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-      };
-      const textOf = (el) => (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').replace(/\s+/g, ' ').trim();
-      const click = (el) => {
-        if (!el) return false;
-        el.scrollIntoView({ block: 'center', inline: 'center' });
-        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-        el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-        return true;
-      };
-      const loginHints = [
-        /登录以解锁更多功能|请输入手机号|验证码|扫码|微信登录|手机号登录|登录|sign in|login/i,
-        /打开\s*Dola\s*App|下载\s*Dola\s*App|立即登录|继续登录|扫码登录/i,
-        /Cookie 政策|使用 Cookie|同意我们使用自己的 Cookie|必要的服务和安全措施|我知道了|接受 Cookie/i,
-      ];
-      const dismissHints = /关闭|取消|稍后|以后再说|暂不|跳过|我知道了|知道了|继续浏览|关闭弹窗|close|dismiss|not now|skip|x|同意|接受/i;
-      const visibleNodes = [...document.querySelectorAll('dialog, [role="dialog"], [aria-modal="true"], [class*="modal"], [class*="popup"], [class*="dialog"], [class*="login"], [class*="signin"], [class*="auth"], section, aside, div')]
-        .filter(isVisible);
-
-      const candidate = visibleNodes.find((node) => loginHints.some((re) => re.test(textOf(node))));
-      if (!candidate) {
-        return JSON.stringify({ found: false, closed: false });
-      }
-
-      const scoped = [...candidate.querySelectorAll('button, [role="button"], a, svg, [aria-label], [title], [class*="close"], [class*="dismiss"], [class*="cancel"]')]
-        .filter(isVisible)
-        .map((el) => {
-          const rect = el.getBoundingClientRect();
-          const label = [textOf(el), el.getAttribute('aria-label') || '', el.getAttribute('title') || '', el.className || '']
-            .filter(Boolean).join(' ').trim();
-          const explicitDismiss = dismissHints.test(label);
-          const topRight = rect.top < window.innerHeight * 0.45 && rect.left > window.innerWidth * 0.45;
-          const smallIcon = rect.width >= 8 && rect.height >= 8 && rect.width <= 72 && rect.height <= 72;
-          return { el, rect, label, explicitDismiss, topRight, smallIcon };
-        })
-        .filter((item) => item.explicitDismiss || (item.topRight && item.smallIcon))
-        .sort((a, b) => {
-          const score = (item) => (item.explicitDismiss ? 0 : 30) + Math.abs(item.rect.right - window.innerWidth) + item.rect.top;
-          return score(a) - score(b);
-        });
-
-      const global = [...document.querySelectorAll('button, [role="button"], a, svg, [aria-label], [title], [class*="close"], [class*="dismiss"], [class*="cancel"]')]
-        .filter(isVisible)
-        .map((el) => {
-          const rect = el.getBoundingClientRect();
-          const label = [textOf(el), el.getAttribute('aria-label') || '', el.getAttribute('title') || '', el.className || '']
-            .filter(Boolean).join(' ').trim();
-          const explicitDismiss = dismissHints.test(label);
-          const topRight = rect.top < window.innerHeight * 0.45 && rect.left > window.innerWidth * 0.45;
-          const smallIcon = rect.width >= 8 && rect.height >= 8 && rect.width <= 72 && rect.height <= 72;
-          return { el, rect, label, explicitDismiss, topRight, smallIcon };
-        })
-        .filter((item) => item.explicitDismiss || (item.topRight && item.smallIcon))
-        .sort((a, b) => {
-          const score = (item) => (item.explicitDismiss ? 0 : 30) + Math.abs(item.rect.right - window.innerWidth) + item.rect.top;
-          return score(a) - score(b);
-        });
-
-      const target = scoped[0]?.el || global[0]?.el;
-      if (!target) return JSON.stringify({ found: true, closed: false, method: 'escape-only' });
-      click(target);
-      return JSON.stringify({ found: true, closed: true, method: scoped[0] ? 'scoped-click' : 'global-click', label: (scoped[0]?.label || global[0]?.label || '').slice(0, 120) });
-    })()`,
-    returnByValue: true,
-  });
-
-  try { return JSON.parse(result.result?.value || '{}'); }
-  catch { return {}; }
 }
 
 async function dismissBlockingOverlays(send, timeoutMs = 6000) {
@@ -638,6 +579,13 @@ function buildRatioMatchers(target) {
   } else if (normalized === '1:1') {
     aliases.add('方图');
     aliases.add('正方形');
+  } else if (normalized === '4:3') {
+    aliases.add('标准');
+  } else if (normalized === '3:4') {
+    aliases.add('竖版');
+  } else if (normalized === '21:9') {
+    aliases.add('超宽');
+    aliases.add('带鱼屏');
   }
 
   return {
@@ -652,6 +600,9 @@ function buildRatioMatchers(target) {
       if (normalized === '16:9' && /(横屏|宽屏)/.test(text || '')) return true;
       if (normalized === '9:16' && /竖屏/.test(text || '')) return true;
       if (normalized === '1:1' && /(方图|正方形)/.test(text || '')) return true;
+      if (normalized === '4:3' && /标准/.test(text || '')) return true;
+      if (normalized === '3:4' && /竖版/.test(text || '')) return true;
+      if (normalized === '21:9' && /(超宽|带鱼屏)/.test(text || '')) return true;
       return false;
     },
   };
@@ -1448,7 +1399,7 @@ async function pollVideoResultInPage(send, conversationId, outputPath = '', opti
           const code = ext.ai_creation_res_code || '';
           const toolList = ext.ai_creation_tool_list || '';
           const failedTool = /\"status\"\s*:\s*5|\"fail_code\"/i.test(toolList);
-          const textFailure = texts.find((value) => /无法|失败|错误|不支持|保护|换其他参考图|生成失败/.test(value));
+          const textFailure = texts.find((value) => /无法|失败|错误|不支持|保护|换其他参考图|生成失败|侵权|违规|违法|违禁|无法返回|超过[0-9 ]*秒|无法生成超过|cannot be generated|longer than/i.test(value));
           if (code || failedTool || textFailure) {
             failures.push([textFailure, code ? 'ai_creation_res_code=' + code : '', failedTool ? 'tool_status=failed' : ''].filter(Boolean).join('；'));
           }
@@ -1907,12 +1858,25 @@ async function collectExistingBrowserResult(options = {}) {
 async function runBrowserTest(options = {}) {
   if (options.collectOnly) return await collectExistingBrowserResult(options);
 
+  // 清理系统级 Saved Application State 里 Chrome 的崩溃记录，
+  // 避免 macOS NSPersistentUIRestorer 在 Chrome 启动时弹"是否忽略持久化状态"模态框，
+  // 该模态框在自动化场景下会让 Chrome 触发 brk 0 (EXC_BREAKPOINT) 崩溃。
+  try {
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    if (homeDir) {
+      const savedState = path.join(homeDir, 'Library', 'Saved Application State', 'com.google.Chrome.savedState');
+      if (fs.existsSync(savedState)) {
+        fs.rmSync(savedState, { recursive: true, force: true });
+      }
+    }
+  } catch {}
+
   const chromePath = options.chromePath || findChrome();
   if (!chromePath) throw new Error('Chrome not found. Set CHROME_PATH to the Chrome executable.');
 
   const baseProfileDir = path.resolve(options.profile || defaultProfileDir(__dir));
   const useTempProfile = options.tempProfile === true;
-  const profileDir = useTempProfile
+  const primaryProfileDir = useTempProfile
     ? createTemporaryProfileDir(__dir, baseProfileDir)
     : baseProfileDir;
   const port = Number(options.port || randomPort());
@@ -1921,59 +1885,118 @@ async function runBrowserTest(options = {}) {
   const targetUrl = options.url || DOLA_CREATE_IMAGE_URL;
   const extensionDir = options.disableExtension ? '' : resolveExtensionDir(options.extensionDir || defaultExtensionDir());
 
-  fs.mkdirSync(profileDir, { recursive: true });
-
-  const args = [
-    `--remote-debugging-port=${port}`,
-    '--no-first-run',
-    '--no-default-browser-check',
-    `--user-data-dir=${profileDir}`,
+  const launchPlans = [
+    {
+      label: 'primary',
+      profileDir: primaryProfileDir,
+      useTempProfile,
+      disableExtension: !!options.disableExtension,
+      disableGpu: false,
+      copySource: useTempProfile,
+    },
+    {
+      label: 'recovery-clean-profile',
+      profileDir: createTemporaryProfileDir(__dir, baseProfileDir, false),
+      useTempProfile: true,
+      disableExtension: true,
+      disableGpu: true,
+      copySource: false,
+    },
   ];
-  if (useTempProfile) args.push('--incognito');
-  if (!visible) args.push('--headless=new', '--disable-gpu');
-  if (options.proxy) args.push(`--proxy-server=${options.proxy}`);
-  if (extensionDir) {
-    args.push(`--disable-extensions-except=${extensionDir}`);
-    args.push(`--load-extension=${extensionDir}`);
-  }
-  args.push(targetUrl);
 
-  const chrome = spawn(chromePath, args, { detached: true, stdio: 'ignore' });
-  chrome.unref();
+  let lastLaunchError = null;
+  let launchedChrome = null;
+  let launchedPlan = null;
+  let launchedPort = port;
+
+  for (const plan of launchPlans) {
+    fs.mkdirSync(plan.profileDir, { recursive: true });
+    // 清理上次崩溃记录，避免 macOS 触发 "ignore persistent state" 模态对话框导致 Chrome 启动即崩溃
+    clearChromeCrashHistory(plan.profileDir);
+    const args = [
+      `--remote-debugging-port=${launchedPort}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-session-crashed-bubble',
+      '--disable-features=InfiniteSessionRestore,SessionCrashedBubble',
+      `--user-data-dir=${plan.profileDir}`,
+    ];
+    if (plan.useTempProfile) args.push('--incognito');
+    if (!visible) args.push('--headless=new', '--disable-gpu');
+    else if (plan.disableGpu) args.push('--disable-gpu', '--disable-gpu-compositing', '--disable-software-rasterizer');
+    if (options.proxy) args.push(`--proxy-server=${options.proxy}`);
+    if (extensionDir && !plan.disableExtension) {
+      args.push(`--disable-extensions-except=${extensionDir}`);
+      args.push(`--load-extension=${extensionDir}`);
+    }
+    args.push(targetUrl);
+
+    const chrome = spawn(chromePath, args, {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    chrome.unref();
+
+    let stdout = '';
+    let stderr = '';
+    chrome.stdout?.on('data', (chunk) => { stdout += chunk.toString(); });
+    chrome.stderr?.on('data', (chunk) => { stderr += chunk.toString(); });
+
+    const startInfo = {
+      stage: 'browser-session-start',
+      plan: plan.label,
+      port: launchedPort,
+      profileDir: plan.profileDir,
+      useTempProfile: plan.useTempProfile,
+      visible,
+      url: targetUrl,
+      chromePid: chrome.pid,
+    };
+
+    try {
+      await waitForJson(`http://127.0.0.1:${launchedPort}/json/version`, 15000);
+      console.log(JSON.stringify(startInfo));
+      if (options.envFile) {
+        const cookieInjection = await injectDolaCookiesIfAvailable(launchedPort, options.envFile, targetUrl).catch((error) => ({
+          injected: false,
+          count: 0,
+          reason: error.message,
+        }));
+        console.log(JSON.stringify({
+          stage: 'cookie-injection',
+          plan: plan.label,
+          envFile: options.envFile,
+          ...cookieInjection,
+        }));
+      }
+      await sleep(waitMs);
+      launchedChrome = chrome;
+      launchedPlan = plan;
+      break;
+    } catch (error) {
+      lastLaunchError = error;
+      console.warn(`[browser] launch ${plan.label} failed: ${error.message}`);
+      console.warn(`[browser] launch ${plan.label} stderr: ${stderr.trim() || '(empty)'}`);
+      console.warn(`[browser] launch ${plan.label} stdout: ${stdout.trim() || '(empty)'}`);
+      try { process.kill(-chrome.pid); } catch {}
+      try { chrome.kill(); } catch {}
+      await sleep(1200);
+    }
+  }
+
+  if (!launchedChrome || !launchedPlan) {
+    throw new Error(`Chrome launch failed: ${lastLaunchError?.message || 'unknown error'}`);
+  }
 
   let sendSucceeded = false;
   let cookieInjection = null;
   try {
-    await waitForJson(`http://127.0.0.1:${port}/json/version`, 15000);
-    console.log(JSON.stringify({
-      stage: 'browser-session',
-      port,
-      profileDir,
-      baseProfileDir,
-      useTempProfile,
-      chromePid: chrome.pid,
-      visible,
-      url: targetUrl,
-    }));
-    if (options.envFile) {
-      cookieInjection = await injectDolaCookiesIfAvailable(port, options.envFile, targetUrl).catch((error) => ({
-        injected: false,
-        count: 0,
-        reason: error.message,
-      }));
-      console.log(JSON.stringify({
-        stage: 'cookie-injection',
-        envFile: options.envFile,
-        ...cookieInjection,
-      }));
-    }
-    await sleep(waitMs);
     if (options.openOnly) {
       return {
-        port,
-        profileDir,
+        port: launchedPort,
+        profileDir: launchedPlan.profileDir,
         baseProfileDir,
-        useTempProfile,
+        useTempProfile: launchedPlan.useTempProfile,
         visible,
         prompt: '',
         duration: options.duration || '',
@@ -1982,9 +2005,10 @@ async function runBrowserTest(options = {}) {
         extensionDir,
         cookieInjection,
         openOnly: true,
+        launchPlan: launchedPlan.label,
       };
     }
-    const page = await activeDolaPage(port);
+    const page = await activeDolaPage(launchedPort);
     const result = await withPageSocket(page, async (send, events) => {
       await send('Network.enable');
       await send('Page.enable').catch(() => null);
@@ -1997,10 +2021,10 @@ async function runBrowserTest(options = {}) {
     }, 60000);
     sendSucceeded = true;
     return {
-      port,
-      profileDir,
+      port: launchedPort,
+      profileDir: launchedPlan.profileDir,
       baseProfileDir,
-      useTempProfile,
+      useTempProfile: launchedPlan.useTempProfile,
       visible,
       prompt: ensureVideoPrompt(options.prompt),
       duration: options.duration || '',
@@ -2011,11 +2035,12 @@ async function runBrowserTest(options = {}) {
       extensionDir,
       openOnly: false,
       result,
+      launchPlan: launchedPlan.label,
     };
   } finally {
     if (sendSucceeded && !options.keepOpen) {
-      try { process.kill(-chrome.pid); } catch {}
-      try { chrome.kill(); } catch {}
+      try { process.kill(-launchedChrome.pid); } catch {}
+      try { launchedChrome.kill(); } catch {}
     }
   }
 }
@@ -2032,6 +2057,10 @@ function parseArgs(argv) {
     extensionDir: defaultExtensionDir(),
     imageFile: '',
     imageFiles: [],
+    imageFilesFile: '',
+    promptFilePath: '',
+    cleanupPromptFile: false,
+    cleanupImageFilesFile: false,
     pollResult: false,
     pollOutput: '',
     pollTimeoutMs: 720_000,
@@ -2056,7 +2085,12 @@ function parseArgs(argv) {
     } else if (arg === '--temp-profile' || arg === '--incognito-profile') options.tempProfile = true;
     else if (arg === '--persistent-profile' || arg === '--no-temp-profile') options.tempProfile = false;
     else if (arg === '--prompt') options.prompt = next();
-    else if (arg === '--prompt-file') options.prompt = fs.readFileSync(path.resolve(next()), 'utf8');
+    else if (arg === '--prompt-file') {
+      options.promptFilePath = path.resolve(next());
+      options.prompt = fs.readFileSync(options.promptFilePath, 'utf8');
+    } else if (arg === '--prompt-tempfiles' || arg === '--cleanup-prompt-file') {
+      options.cleanupPromptFile = true;
+    }
     else if (arg === '--image-file') {
       const file = next();
       options.imageFile = file;
@@ -2065,6 +2099,16 @@ function parseArgs(argv) {
       const files = next().split(',').map((item) => item.trim()).filter(Boolean);
       options.imageFiles = [...options.imageFiles, ...files];
       if (!options.imageFile && files[0]) options.imageFile = files[0];
+    } else if (arg === '--image-files-file') {
+      const filePath = path.resolve(next());
+      const files = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+        .map((item) => String(item || '').trim())
+        .filter(Boolean);
+      options.imageFiles = [...options.imageFiles, ...files];
+      if (!options.imageFile && files[0]) options.imageFile = files[0];
+      options.imageFilesFile = filePath;
+    } else if (arg === '--cleanup-image-files-file') {
+      options.cleanupImageFilesFile = true;
     } else if (arg === '--image-file2') {
       const file = next();
       options.imageFiles = [...options.imageFiles, file];
@@ -2091,7 +2135,7 @@ function parseArgs(argv) {
 }
 
 function usage() {
-  return `Usage:\n  node browser-send-test.mjs [--visible|--headless] [--keep-open] [--open-only] [--create-image] [--persistent-profile|--temp-profile] [--prompt TEXT|--prompt-file FILE] [--image-file FILE] [--image-file2 FILE | --image-files FILE1,FILE2] [--duration 10] [--profile DIR]\n\nOptions:\n  --visible            Open Chrome window and use the chosen profile.\n  --headless           Run without UI, suitable for an already logged-in profile.\n  --keep-open          Keep Chrome open after the test. Failures always stay open.\n  --open-only          Only open the page, do not auto-send prompt.\n  --create-image       Open https://www.dola.com/chat/create-image\n  --persistent-profile Reuse the profile directly so Dola keeps visible query history. Default: on.\n  --temp-profile       Copy the current session into a temporary incognito browser dir before sending.\n  --prompt TEXT        Prompt to submit. Default: 一个小男孩在跳舞\n  --prompt-file        Read prompt from a file.\n  --image-file FILE    Upload the first local reference image before sending.\n  --image-file2 FILE   Upload a second local reference image before sending.\n  --image-files LIST   Upload multiple local reference images, comma-separated.\n  --duration N         Try selecting target duration, default 10.\n  --ratio RATIO        Try selecting target ratio, default 16:9.\n  --profile DIR        Browser profile dir. Default: .doubao_browsers/dola-send-profile\n  --proxy URL          Chrome proxy server.\n  --url URL            Custom page URL. Default: https://www.dola.com/chat/create-image\n  --chrome FILE        Chrome executable path.\n  --extension-dir DIR  Load unpacked extension from this dir.\n  --no-extension       Disable loading local extension.\n  --wait-ms N          Wait after page load before sending. Default: 8000\n  --port N             Remote debugging port.\n`;
+  return `Usage:\n  node browser-send-test.mjs [--visible|--headless] [--keep-open] [--open-only] [--create-image] [--persistent-profile|--temp-profile] [--prompt TEXT|--prompt-file FILE] [--image-file FILE] [--image-file2 FILE | --image-files FILE1,FILE2 | --image-files-file FILE] [--duration 10] [--profile DIR]\n\nOptions:\n  --visible            Open Chrome window and use the chosen profile.\n  --headless           Run without UI, suitable for an already logged-in profile.\n  --keep-open          Keep Chrome open after the test. Failures always stay open.\n  --open-only          Only open the page, do not auto-send prompt.\n  --create-image       Open https://www.dola.com/chat/create-image\n  --persistent-profile Reuse the profile directly so Dola keeps visible query history. Default: on.\n  --temp-profile       Copy the current session into a temporary incognito browser dir before sending.\n  --prompt TEXT        Prompt to submit. Default: 一个小男孩在跳舞\n  --prompt-file        Read prompt from a file.\n  --image-file FILE    Upload the first local reference image before sending.\n  --image-file2 FILE   Upload a second local reference image before sending.\n  --image-files LIST   Upload multiple local reference images, comma-separated.\n  --image-files-file FILE  从 JSON 文件读取多张参考图路径，避免命令行参数过长。\n  --duration N         Try selecting target duration, default 10.\n  --ratio RATIO        Try selecting target ratio, default 16:9.\n  --profile DIR        Browser profile dir. Default: .doubao_browsers/dola-send-profile\n  --proxy URL          Chrome proxy server.\n  --url URL            Custom page URL. Default: https://www.dola.com/chat/create-image\n  --chrome FILE        Chrome executable path.\n  --extension-dir DIR  Load unpacked extension from this dir.\n  --no-extension       Disable loading local extension.\n  --wait-ms N          Wait after page load before sending. Default: 8000\n  --port N             Remote debugging port.\n`;
 }
 
 try {
@@ -2110,4 +2154,28 @@ try {
   console.error(`[browser-send-test] failed: ${error.message}`);
   console.error('发送失败时浏览器会保留打开，方便检查当前 cookie 和页面状态；成功发送后会自动关闭。');
   process.exit(1);
+} finally {
+  const argv = process.argv.slice(2);
+  const promptIndex = argv.indexOf('--prompt-file');
+  if (promptIndex >= 0 && (argv.includes('--prompt-tempfiles') || argv.includes('--cleanup-prompt-file'))) {
+    const filePath = argv[promptIndex + 1];
+    if (filePath) {
+      try {
+        fs.unlinkSync(path.resolve(filePath));
+      } catch (_) {
+        // ignore cleanup errors
+      }
+    }
+  }
+  const index = argv.indexOf('--image-files-file');
+  if (index >= 0 && argv.includes('--cleanup-image-files-file')) {
+    const filePath = argv[index + 1];
+    if (filePath) {
+      try {
+        fs.unlinkSync(path.resolve(filePath));
+      } catch (_) {
+        // ignore cleanup errors
+      }
+    }
+  }
 }

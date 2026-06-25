@@ -65,6 +65,32 @@ const DOLA_BROWSER_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36';
 const DOLA_BROWSER_PC_VERSION = '3.23.5';
+const DEBUG_ENV_PATH = path.join(process.cwd(), '.dbg', 'dola-api-gen-fail.env');
+
+function debugReport(hypothesisId, location, msg, data = {}) {
+  let url = 'http://127.0.0.1:7777/event';
+  let sessionId = 'dola-api-gen-fail';
+  try {
+    const envText = fs.readFileSync(DEBUG_ENV_PATH, 'utf8');
+    for (const line of envText.split('\n')) {
+      if (line.startsWith('DEBUG_SERVER_URL=')) url = line.slice('DEBUG_SERVER_URL='.length).trim() || url;
+      if (line.startsWith('DEBUG_SESSION_ID=')) sessionId = line.slice('DEBUG_SESSION_ID='.length).trim() || sessionId;
+    }
+  } catch {}
+  return fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      sessionId,
+      runId: process.env.DEBUG_RUN_ID || 'pre-fix',
+      hypothesisId,
+      location,
+      msg: `[DEBUG] ${msg}`,
+      data,
+      ts: Date.now(),
+    }),
+  }).catch(() => {});
+}
 
 function compareVersionParts(a, b) {
   const left = String(a || '').split('.').map(part => Number(part) || 0);
@@ -160,6 +186,10 @@ class VideoGenerationFailedError extends Error {
 const VIDEO_FAILURE_TEXT_RULES = [
   { reason: '内容未通过，无法返回视频', pattern: /生成内容[^。！？\n]{0,60}(?:疑似包含|包含|涉及)[^。！？\n]{0,40}(?:侵权|违规|违法|违禁)[^。！？\n]{0,80}无法返回/ },
   { reason: '内容未通过，无法返回视频', pattern: /无法返回该内容[^。！？\n]{0,80}(?:换个主题|重新尝试|再试试)/ },
+  { reason: '视频时长超过限制，无法生成视频', pattern: /(?:无法|不能|不支持|暂时无法|目前无法|当前无法)生成[^。！？\n]{0,12}超过\s*\d+\s*秒/ },
+  { reason: '视频时长超过限制，无法生成视频', pattern: /超过\s*\d+\s*秒[^。！？\n]{0,20}(?:无法|不能|不支持)生成/ },
+  { reason: '视频时长超过限制，无法生成视频', pattern: /videos?\s+longer\s+than\s+\d+\s+seconds?\s+cannot\s+be\s+generated/i },
+  { reason: '视频时长超过限制，无法生成视频', pattern: /cannot\s+(?:currently\s+)?generate\s+(?:a\s+)?videos?\s+longer\s+than\s+\d+\s+seconds?/i },
   { reason: '返回的是图片，不是视频', pattern: /以下是[^。！？\n]{0,40}(?:生成|创作|制作)(?:了|的)?[^。！？\n]{0,16}(?:图片|图像|照片|海报|封面)/ },
   { reason: '返回的是图片，不是视频', pattern: /(?:已|已经)[^。！？\n]{0,12}(?:生成|创作|制作)(?:了|出|好)?[^。！？\n]{0,16}(?:图片|图像|照片|海报|封面)/ },
   { reason: '返回的是图片，不是视频', pattern: /(?:为你|帮你)[^。！？\n]{0,10}(?:生成|创作|制作)(?:了|出|好)?[^。！？\n]{0,16}(?:图片|图像|照片|海报|封面)/ },
@@ -279,6 +309,16 @@ function createMessageIds() {
   };
 }
 
+// Dola 服务端已支持 5s/10s/15s（实测 2026-06-25：15s 被 ACK 接受，扣 3 个额度）。
+// 只做合法档位归一：<=5 取 5s，<=10 取 10s，其余取 15s。非法值兜底 10s。
+function normalizeApiDuration(duration) {
+  const parsed = Number(duration) || 10;
+  if (!Number.isFinite(parsed) || parsed <= 0) return 10;
+  if (parsed <= 5) return 5;
+  if (parsed <= 10) return 10;
+  return 15;
+}
+
 function parseExistingConversationEnv() {
   const conversationId = String(process.env.DOLA_CONVERSATION_ID || '').trim();
   if (!conversationId) return null;
@@ -319,9 +359,10 @@ async function preHandleUploadedImages(refImages, messageIds) {
   return results;
 }
 
-function buildSamanthaVideoBody({ prompt, duration, model, refImages, conversation, messageIds }) {
+function buildSamanthaVideoBody({ prompt, ratio, duration, model, refImages, conversation, messageIds }) {
   prompt = ensureVideoIntent(prompt);
-  const durationSec = Number(duration) || 5;
+  const durationSec = normalizeApiDuration(duration);
+  const normalizedRatio = String(ratio || '16:9').trim() || '16:9';
   const modelMap = {
     'seedance-2.0': 'seedance_v2.0',
     'seedance-1.5': 'seedance_v1.5',
@@ -347,6 +388,7 @@ function buildSamanthaVideoBody({ prompt, duration, model, refImages, conversati
             attachments: images.map((img) => ({
               type: 1,
               identifier: img.identifier || uuidV1(),
+              ...(img.preGenerateId ? { pre_generate_id: img.preGenerateId } : {}),
               image: {
                 name: img.name || 'image.png',
                 uri: img.uri,
@@ -392,7 +434,13 @@ function buildSamanthaVideoBody({ prompt, duration, model, refImages, conversati
     message_status: 0,
   });
 
-  return {
+  const abilityParam = JSON.stringify({
+    model: modelName,
+    duration: durationSec,
+    ratio: normalizedRatio,
+  });
+
+  const body = {
     client_meta: {
       local_conversation_id: localConversationId,
       conversation_id: existingConversationId,
@@ -441,9 +489,11 @@ function buildSamanthaVideoBody({ prompt, duration, model, refImages, conversati
       message_storage_type: 0,
     },
     user_context: [],
+    ability_type: 17,
+    ability_param: abilityParam,
     chat_ability: {
       ability_type: 17,
-      ability_param: JSON.stringify({ model: modelName, duration: durationSec }),
+      ability_param: abilityParam,
     },
     ext: {
       answer_with_suggest: '0',
@@ -454,6 +504,20 @@ function buildSamanthaVideoBody({ prompt, duration, model, refImages, conversati
       commerce_credit_config_enable: '0',
     },
   };
+  // #region debug-point A:body-shape
+  void debugReport('A', 'dola-video-gen.mjs:buildSamanthaVideoBody', 'body-shape', {
+    refImageCount: images.length,
+    inputHasPreGenerateId: images.some((img) => Boolean(img?.preGenerateId)),
+    bodyTopLevelKeys: Object.keys(body),
+    hasTopLevelAbilityType: Object.prototype.hasOwnProperty.call(body, 'ability_type'),
+    hasTopLevelAbilityParam: Object.prototype.hasOwnProperty.call(body, 'ability_param'),
+    chatAbilityType: body.chat_ability?.ability_type ?? null,
+    chatAbilityParam: body.chat_ability?.ability_param ?? '',
+    firstAttachmentKeys: images.length > 0 ? Object.keys(body.messages?.[0]?.content_block?.[0]?.content?.attachment_block?.attachments?.[0] || {}) : [],
+    firstAttachmentHasPreGenerateId: Boolean(body.messages?.[0]?.content_block?.[0]?.content?.attachment_block?.attachments?.[0]?.pre_generate_id),
+  });
+  // #endregion
+  return body;
 }
 
 // ─── 发送视频生成请求并流式等待 SSE 结果 ───
@@ -503,6 +567,22 @@ async function sendVideoRequest(body) {
       'sec-ch-ua-platform': '"macOS"',
     },
   });
+  // #region debug-point A:request-summary
+  void debugReport('A', 'dola-video-gen.mjs:sendVideoRequest:before-fetch', 'request-summary', {
+    referer: refererChatId ? `${getPlatformOrigin()}/chat/${refererChatId}` : `${getPlatformOrigin()}/chat/create-image`,
+    hasConversationId: Boolean(body?.client_meta?.conversation_id),
+    hasLocalConversationId: Boolean(body?.client_meta?.local_conversation_id),
+    messageCount: Array.isArray(body?.messages) ? body.messages.length : 0,
+    attachmentCount: Array.isArray(body?.messages?.[0]?.content_block?.[0]?.content?.attachment_block?.attachments)
+      ? body.messages[0].content_block[0].content.attachment_block.attachments.length
+      : 0,
+    hasChatAbility: Boolean(body?.chat_ability),
+    topLevelAbilityType: body?.ability_type ?? null,
+    chatAbilityType: body?.chat_ability?.ability_type ?? null,
+    chatAbilityParam: body?.chat_ability?.ability_param ?? '',
+    urlPrefix: url.slice(0, 120),
+  });
+  // #endregion
 
   const res = await fetchWithTimeout(url, {
     method: 'POST',
@@ -512,9 +592,21 @@ async function sendVideoRequest(body) {
 
   console.log(`  [debug] HTTP status: ${res.status}`);
   console.log(`  [debug] Content-Type: ${res.headers.get('content-type')}`);
+  // #region debug-point B:http-response
+  void debugReport('B', 'dola-video-gen.mjs:sendVideoRequest:http-response', 'http-response', {
+    status: res.status,
+    contentType: res.headers.get('content-type') || '',
+  });
+  // #endregion
 
   if (!res.ok) {
     const text = await res.text();
+    // #region debug-point B:http-error
+    void debugReport('B', 'dola-video-gen.mjs:sendVideoRequest:http-error', 'http-error', {
+      status: res.status,
+      bodyPreview: text.slice(0, 500),
+    });
+    // #endregion
     throw new Error(`HTTP ${res.status}: ${text.slice(0, 500)}`);
   }
 
@@ -529,6 +621,7 @@ async function sendVideoRequest(body) {
   let buffer = '';
   const startTime = Date.now();
   const SSE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes max wait
+  const seenEventNames = new Set();
 
   console.log(`  [stream] 开始流式读取 SSE（最长等待 ${SSE_TIMEOUT_MS / 1000}s）...`);
 
@@ -568,6 +661,7 @@ async function sendVideoRequest(body) {
       }
       if (!evtName || !dataStr) continue;
       dataStr = dataStr.trim();
+      seenEventNames.add(evtName);
 
       if (evtName === 'SSE_ACK') {
         try {
@@ -575,6 +669,13 @@ async function sendVideoRequest(body) {
           conversationId = d.ack_client_meta?.conversation_id || conversationId;
           sectionId = d.ack_client_meta?.section_id || sectionId;
           console.log(`  [stream] ACK: conv=${conversationId}`);
+          // #region debug-point B:sse-ack
+          void debugReport('B', 'dola-video-gen.mjs:sendVideoRequest:SSE_ACK', 'sse-ack', {
+            conversationId,
+            sectionId,
+            eventNames: Array.from(seenEventNames),
+          });
+          // #endregion
         } catch {}
       }
 
@@ -585,6 +686,13 @@ async function sendVideoRequest(body) {
           reason = d.error_msg || d.message || reason;
           if (d.error_code) reason = `${reason} (code=${d.error_code})`;
         } catch {}
+        // #region debug-point B:stream-error
+        void debugReport('B', 'dola-video-gen.mjs:sendVideoRequest:STREAM_ERROR', 'stream-error', {
+          reason,
+          eventNames: Array.from(seenEventNames),
+          dataPreview: dataStr.slice(0, 500),
+        });
+        // #endregion
         throw new VideoGenerationFailedError(reason, dataStr);
       }
 
@@ -677,6 +785,16 @@ async function sendVideoRequest(body) {
   console.log(`  [debug] conversationId: ${conversationId}`);
   console.log(`  [debug] videoUrl: ${videoUrl || '(none)'}`);
   console.log(`  [debug] fullText: ${fullText.slice(0, 200)}`);
+  // #region debug-point B:sse-summary
+  void debugReport('B', 'dola-video-gen.mjs:sendVideoRequest:summary', 'sse-summary', {
+    conversationId,
+    sectionId,
+    hasVideoUrl: Boolean(videoUrl),
+    videoUrlPreview: videoUrl ? videoUrl.slice(0, 120) : '',
+    fullTextPreview: fullText.slice(0, 200),
+    eventNames: Array.from(seenEventNames),
+  });
+  // #endregion
 
   if (!videoUrl) throwIfVideoFailure(detectVideoFailureText(fullText));
 
@@ -972,6 +1090,22 @@ function findEnvDola() {
 
 async function runVideoGeneration({ mode, prompt, ratio, duration, model, imagePaths }) {
   await ensureSignerReady();
+  const effectiveDuration = normalizeApiDuration(duration);
+  if (Number(duration) !== effectiveDuration) {
+    console.log(`  [compat] Dola API 当前只稳定支持 5s/10s，已将 ${duration}s 自动调整为 ${effectiveDuration}s`);
+  }
+  // #region debug-point C:run-start
+  void debugReport('C', 'dola-video-gen.mjs:runVideoGeneration:start', 'run-start', {
+    mode,
+    ratio,
+    duration: effectiveDuration,
+    model,
+    imagePathCount: Array.isArray(imagePaths) ? imagePaths.filter(Boolean).length : (imagePaths ? 1 : 0),
+    hasMsTokenEnv: Boolean(process.env.DOLA_MS_TOKEN || process.env.DOUBAO_MS_TOKEN),
+    pcVersion: env.PC_VERSION(),
+    userAgentHeadless: /HeadlessChrome/i.test(String(process.env.DOLA_USER_AGENT || '')),
+  });
+  // #endregion
 
   // Step 1: 如果是图片模式，先通过 ImageX 上传每张图获取 uri 作为 key
   let refImages = [];
@@ -999,6 +1133,17 @@ async function runVideoGeneration({ mode, prompt, ratio, duration, model, imageP
       });
       console.log(`    成功: key=${imgResult.uri} (${imgResult.width}x${imgResult.height})`);
     }
+    // #region debug-point C:image-uploaded
+    void debugReport('C', 'dola-video-gen.mjs:runVideoGeneration:image-uploaded', 'image-uploaded', {
+      uploadedCount: refImages.length,
+      imageKeys: refImages.map((img) => ({
+        uri: img.uri,
+        width: img.width,
+        height: img.height,
+        identifier: img.identifier,
+      })),
+    });
+    // #endregion
   }
 
   // Step 2: 图片模式先调用预处理，和 Dola 网页端上传后发送链路一致
@@ -1012,8 +1157,25 @@ async function runVideoGeneration({ mode, prompt, ratio, duration, model, imageP
         return hit ? { ...img, identifier: hit.identifier, preGenerateId: hit.preGenerateId } : img;
       });
       console.log(`  [pre_handle] 完成: ${preHandled.map(item => item.preGenerateId || '(none)').join(', ')}`);
+      // #region debug-point C:pre-handle
+      void debugReport('C', 'dola-video-gen.mjs:runVideoGeneration:pre-handle', 'pre-handle', {
+        preHandledCount: preHandled.length,
+        preGenerateIds: preHandled.map((item) => item.preGenerateId || ''),
+        refImageState: refImages.map((img) => ({
+          uri: img.uri,
+          identifier: img.identifier,
+          hasPreGenerateId: Boolean(img.preGenerateId),
+        })),
+      });
+      // #endregion
     } catch (e) {
       console.warn(`  [pre_handle] 失败，继续发送视频: ${e.message}`);
+      // #region debug-point C:pre-handle-error
+      void debugReport('C', 'dola-video-gen.mjs:runVideoGeneration:pre-handle-error', 'pre-handle-error', {
+        error: e?.message || String(e),
+        refImageCount: refImages.length,
+      });
+      // #endregion
     }
   }
 
@@ -1025,7 +1187,7 @@ async function runVideoGeneration({ mode, prompt, ratio, duration, model, imageP
     console.log(`  [debug] last_section_id=${existingConversation.sectionId || '(none)'} last_message_index=${Number.isFinite(existingConversation.lastMessageIndex) ? existingConversation.lastMessageIndex : '(none)'}`);
   }
   console.log(`  [debug] pc_version=${env.PC_VERSION()} aid=${env.AID()}`);
-  const body = buildSamanthaVideoBody({ prompt, ratio, duration, model, refImages, conversation: existingConversation, messageIds });
+  const body = buildSamanthaVideoBody({ prompt, ratio, duration: effectiveDuration, model, refImages, conversation: existingConversation, messageIds });
   let result;
   try {
     result = await sendVideoRequest(body);
@@ -1148,17 +1310,34 @@ async function main() {
   }
 
   if (mode === 'image') {
-    const rawPaths = process.argv[3];
+    let rawPaths = process.argv[3];
+    let directPaths = null;
+    let promptOffset = 4;
+    if (rawPaths === '--refs-file') {
+      const refsFile = process.argv[4];
+      if (!refsFile) {
+        console.error('用法: node dola-video-gen.mjs image --refs-file <json-file> [prompt] [ratio] [duration] [model]');
+        process.exit(1);
+      }
+      const refs = JSON.parse(fs.readFileSync(path.resolve(refsFile), 'utf8'));
+      directPaths = Array.isArray(refs) ? refs.map((item) => String(item || '').trim()).filter(Boolean) : [];
+      rawPaths = directPaths.join(', ');
+      promptOffset = 5;
+      if (process.argv[promptOffset] === '--cleanup-refs-file') {
+        promptOffset += 1;
+      }
+    }
     if (!rawPaths) {
       console.error('用法: node dola-video-gen.mjs image <image-path[,image-path2,...]> [prompt] [ratio] [duration] [model]');
       process.exit(1);
     }
-    // 支持逗号分隔的多张参考图
-    imagePaths = rawPaths.split(',').map(s => s.trim()).filter(Boolean);
-    prompt = process.argv[4] || '根据图片生成视频';
-    ratio = process.argv[5] || '16:9';
-    duration = Number(process.argv[6] || 10) || 10;
-    model = process.argv[7] || 'seedance-2.0';
+    imagePaths = directPaths && directPaths.length > 0
+      ? directPaths
+      : rawPaths.split(',').map(s => s.trim()).filter(Boolean);
+    prompt = process.argv[promptOffset] || '根据图片生成视频';
+    ratio = process.argv[promptOffset + 1] || '16:9';
+    duration = Number(process.argv[promptOffset + 2] || 10) || 10;
+    model = process.argv[promptOffset + 3] || 'seedance-2.0';
   } else {
     prompt = process.argv[3] || '生成一个小猫在玩球的视频';
     ratio = process.argv[4] || '16:9';
@@ -1212,4 +1391,13 @@ async function main() {
 main().catch(e => {
   console.error('\n[错误]', e.message);
   process.exit(1);
+}).finally(() => {
+  if (process.argv[2] !== 'image' || process.argv[3] !== '--refs-file') return;
+  const refsFile = process.argv[4];
+  if (!refsFile || !process.argv.includes('--cleanup-refs-file')) return;
+  try {
+    fs.unlinkSync(path.resolve(refsFile));
+  } catch (_) {
+    // ignore cleanup errors
+  }
 });

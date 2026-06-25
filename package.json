@@ -7,10 +7,10 @@
   "author": "Cascade",
   "private": true,
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 5174 --strictPort",
+    "dev": "vite --host 127.0.0.1 --port ${VITE_PORT:-5174} --strictPort",
     "build": "vite build",
     "preview": "vite preview",
-    "electron:dev": "concurrently \"npm run dev\" \"wait-on http://localhost:5174 && electron .\"",
+    "electron:dev": "sh -lc 'PORT=${VITE_PORT:-5174}; if lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then PORT=$((PORT+1)); fi; VITE_PORT=$PORT concurrently \"npm run dev\" \"wait-on http://localhost:$PORT && electron .\"'",
     "electron:build": "npm run build && npm --prefix dola-video-standalone ci && electron-builder"
   },
   "build": {
@@ -72,6 +72,7 @@
   },
   "dependencies": {
     "lucide-react": "^0.344.0",
+    "opencv.js": "^1.2.1",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },

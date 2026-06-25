@@ -19,6 +19,8 @@ hiddenimports = []
 # 内层 wizstar 包（含 __init__.py，使用相对导入）。放到 dist 的 wizstar/wizstar 下，
 # 由 backend_entry 将 <base>/wizstar 加入 sys.path 后以顶层名 `wizstar` 导入。
 datas += [('wizstar/wizstar', 'wizstar/wizstar')]
+# 自动打码后端要用到的人脸级联文件。
+datas += [('src/assets/cascades', 'wizstar/wizstar/assets/cascades')]
 # QuickFrame SDK：被 quickframe_bridge 动态导入，且有 isdir 物理校验。
 datas += [('quickframe-sdk-full', 'quickframe-sdk-full')]
 
@@ -41,6 +43,9 @@ for pkg in (
     'sniffio',
     'Crypto',          # pycryptodome
     'aiosqlite',
+    'cv2',
+    'numpy',
+    'PIL',
 ):
     try:
         d, b, h = collect_all(pkg)
@@ -68,7 +73,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'matplotlib', 'numpy', 'PIL', 'pandas'],
+    excludes=['tkinter', 'matplotlib', 'pandas'],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
