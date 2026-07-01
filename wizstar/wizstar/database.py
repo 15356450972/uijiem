@@ -142,6 +142,18 @@ def init_db():
         conn.execute("ALTER TABLE dola_accounts ADD COLUMN daily_video_used INTEGER DEFAULT 0")
     if "daily_video_date" not in existing_dola_cols:
         conn.execute("ALTER TABLE dola_accounts ADD COLUMN daily_video_date TEXT DEFAULT ''")
+    # Auto-reset daily_limit status on Wizstar accounts when the date changes
+    existing_account_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
+    }
+    if "daily_limit_date" not in existing_account_cols:
+        conn.execute("ALTER TABLE accounts ADD COLUMN daily_limit_date TEXT DEFAULT ''")
+    # Auto-reset: if an account has status='daily_limit' but the date is not today, reset to 'active'
+    today = time.strftime("%Y-%m-%d")
+    conn.execute(
+        "UPDATE accounts SET status = 'active', daily_limit_date = '' WHERE status = 'daily_limit' AND daily_limit_date != ?",
+        (today,),
+    )
     conn.commit()
     conn.close()
 
@@ -236,6 +248,19 @@ class AccountDB:
     def update_status(account_id: int, status: str):
         conn = get_connection()
         conn.execute("UPDATE accounts SET status = ? WHERE id = ?", (status, account_id))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def mark_daily_limit(account_id: int) -> None:
+        """Mark a Wizstar account as daily-limited for today.
+        Auto-resets to 'active' the next day via init_db migration check."""
+        today = time.strftime("%Y-%m-%d")
+        conn = get_connection()
+        conn.execute(
+            "UPDATE accounts SET status = 'daily_limit', daily_limit_date = ? WHERE id = ?",
+            (today, account_id),
+        )
         conn.commit()
         conn.close()
 
@@ -530,6 +555,33 @@ class DolaAccountDB:
         conn.execute("DELETE FROM dola_accounts WHERE id = ?", (account_id,))
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def mark_daily_limit_reached(account_id: int) -> None:
+        """Mark a Dola account as having hit its daily generation limit.
+        Sets daily_video_used = daily_video_quota for today so remaining = 0.
+        _normalize_quota will auto-reset used=0 when the date changes."""
+        today = time.strftime("%Y-%m-%d")
+        conn = get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT daily_video_quota FROM dola_accounts WHERE id = ?", (account_id,)).fetchone()
+            if not row:
+                conn.commit()
+                return
+            quota = max(0, int(dict(row).get("daily_video_quota") or 6))
+            conn.execute(
+                """UPDATE dola_accounts
+                   SET daily_video_used = ?, daily_video_date = ?, updated_at = strftime('%s','now')
+                   WHERE id = ?""",
+                (quota, today, account_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     @staticmethod
     def delete_all() -> int:

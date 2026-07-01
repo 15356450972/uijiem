@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -270,6 +270,7 @@ class DolaTaskCreate(BaseModel):
     model: str = "seedance-2.0"
     ratio: str = "16:9"
     duration: int = 15
+    exclude_account_ids: list[int] = []
 
 
 class DolaTaskCollect(BaseModel):
@@ -788,6 +789,8 @@ def create_task(body: TaskCreate):
         err_msg = str(e)
         if "user forbidden" in err_msg.lower():
             AccountDB.update_status(body.account_id, "forbidden")
+        if any(marker in err_msg for marker in ("达到上限", "已达上限", "生成次数", "明天再来")):
+            AccountDB.mark_daily_limit(body.account_id)
         raise HTTPException(status_code=500, detail=err_msg)
 
 
@@ -829,6 +832,9 @@ def get_task_status(task_id: str):
             TaskDB.update_status(task_id, "completed", video_url)
         elif vr.get("status") == 4:
             TaskDB.update_status(task_id, "failed")
+            fail_reason = vr.get("fail_reason", "")
+            if fail_reason and any(marker in fail_reason for marker in ("达到上限", "已达上限", "生成次数", "明天再来")):
+                AccountDB.mark_daily_limit(db_task["account_id"])
 
         return {"data": {
             "status": status,
@@ -1541,7 +1547,14 @@ def _dola_pick_account(
 
     quota_ready_accounts = [a for a in candidate_accounts if has_quota(a)]
     if quota_cost > 0 and not quota_ready_accounts:
-        raise HTTPException(status_code=400, detail=f"渠道六账号今日额度不足：本次需要 {quota_cost}")
+        remaining_info = "、".join(
+            f"{a.get('name') or 'Dola账号 #' + str(a.get('id') or 0)}剩余{int(a.get('daily_video_remaining') or 0)}"
+            for a in candidate_accounts[:5]
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"渠道六账号今日额度不足：本次需要 {quota_cost} 个额度，当前账号剩余：{remaining_info}",
+        )
 
     idle_accounts = [a for a in quota_ready_accounts if not is_busy(a)]
     if not idle_accounts:
@@ -1558,12 +1571,40 @@ def _dola_pick_account(
     if quota_cost > 0:
         for account in idle_accounts:
             try:
-                return DolaAccountDB.reserve_daily_video_quota(int(account.get("id") or 0), quota_cost)
+                reserved = DolaAccountDB.reserve_daily_video_quota(int(account.get("id") or 0), quota_cost)
+                _dola_touch_account(int(account.get("id") or 0))
+                return reserved
             except ValueError:
                 continue
-        raise HTTPException(status_code=400, detail=f"渠道六账号今日额度不足：本次需要 {quota_cost}")
+        remaining_info = "、".join(
+            f"{a.get('name') or 'Dola账号 #' + str(a.get('id') or 0)}剩余{int(a.get('daily_video_remaining') or 0)}"
+            for a in idle_accounts[:5]
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"渠道六账号今日额度不足：本次需要 {quota_cost} 个额度，当前账号剩余：{remaining_info}",
+        )
 
-    return idle_accounts[0]
+    picked = idle_accounts[0]
+    _dola_touch_account(int(picked.get("id") or 0))
+    return picked
+
+
+def _dola_touch_account(account_id: int) -> None:
+    """Refresh an account's updated_at so the picker rotates to the next account next time (round-robin)."""
+    if not account_id:
+        return
+    try:
+        from .database import get_connection
+        conn = get_connection()
+        conn.execute(
+            "UPDATE dola_accounts SET updated_at = strftime('%s','now') WHERE id = ?",
+            (account_id,),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
 
 @app.get("/dola/config")
@@ -1766,9 +1807,10 @@ def dola_create_task(body: DolaTaskCreate):
     """通过浏览器会话提交 Dola 视频生成任务。"""
     try:
         normalized_duration = _dola_normalized_video_duration(body.duration)
+        quota_cost = _dola_video_quota_cost(normalized_duration)
         task_id = f"dola-{uuid.uuid4().hex[:12]}"
         with _dola_task_create_lock:
-            account = _dola_pick_account(body.account_id, quota_cost=0)
+            account = _dola_pick_account(body.account_id, quota_cost=quota_cost, exclude_account_ids=body.exclude_account_ids)
             TaskDB.add(
                 task_id=task_id,
                 account_id=int(account.get("id") or 0) if account else 0,
@@ -1789,7 +1831,7 @@ def dola_create_task(body: DolaTaskCreate):
                     duration=normalized_duration,
                     account=account,
                     task_id=task_id,
-                    quota_cost=0,
+                    quota_cost=quota_cost,
                     retry_account_picker=None,
                     max_empty_sse_retries=0,
                 )
@@ -1798,7 +1840,7 @@ def dola_create_task(body: DolaTaskCreate):
                 raise
         result["account_id"] = int(account.get("id") or 0) if account else 0
         result["account_name"] = account.get("name", "") if account else "浏览器会话"
-        result["quota_cost"] = 0
+        result["quota_cost"] = quota_cost
         result["send_mode"] = dl.get_send_mode()
         result["send_mode_label"] = next((item["label"] for item in dl.SEND_MODE_OPTIONS if item["id"] == result["send_mode"]), result["send_mode"])
         result["browser_session"] = result["send_mode"] == dl.SEND_MODE_BROWSER
@@ -1965,6 +2007,16 @@ def oiioii_delete_account(email: str):
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error", "删除失败"))
     return {"message": "deleted"}
+
+
+@app.post("/oiioii/accounts/cleanup-zero")
+def oiioii_cleanup_zero_accounts():
+    """删除所有积分为 0 的渠道四账号"""
+    try:
+        result = oi.cleanup_zero_point_accounts()
+        return {"data": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/oiioii/accounts/{email}/points")
@@ -2236,8 +2288,9 @@ def _proxy_remote_video(url: str, range_header: str | None, as_download: bool, f
 
 
 @app.get("/local/video")
-def local_video(request: Request, path: str):
-    """流式播放本机已下载视频，支持 Range，避免前端直接 file:// 播放失败。"""
+def local_video(request: Request, path: str, download: int = 0, filename: str = ""):
+    """流式播放本机已下载视频，支持 Range，避免前端直接 file:// 播放失败。
+    当 download=1 时以附件形式返回（下载）。"""
     file_path = os.path.abspath(urllib.parse.unquote(path or ""))
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="本地视频不存在")
@@ -2275,6 +2328,11 @@ def local_video(request: Request, path: str):
     }
     if status_code == 206:
         headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    if download:
+        safe_name = filename or os.path.basename(file_path) or "video.mp4"
+        if not safe_name.lower().endswith((".mp4", ".webm", ".mov", ".m4v")):
+            safe_name += ".mp4"
+        headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
 
     def _iter():
         with open(file_path, "rb") as f:
@@ -2288,6 +2346,24 @@ def local_video(request: Request, path: str):
                 yield data
 
     return StreamingResponse(_iter(), status_code=status_code, headers=headers)
+
+
+@app.get("/local/image")
+def local_image(path: str, download: int = 0, filename: str = ""):
+    """返回本机图片文件，避免前端 file:// 加载失败。
+    当 download=1 时以附件形式返回（下载）。"""
+    file_path = os.path.abspath(urllib.parse.unquote(path or ""))
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="本地图片不存在")
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg", ".heic", ".heif", ".tiff", ".ico"):
+        raise HTTPException(status_code=400, detail="不支持的图片格式")
+    content_type = mimetypes.guess_type(file_path)[0] or "image/jpeg"
+    extra_headers = {"Cache-Control": "public, max-age=3600"}
+    if download:
+        safe_name = filename or os.path.basename(file_path) or "image.png"
+        extra_headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    return FileResponse(file_path, media_type=content_type, headers=extra_headers)
 
 
 @app.get("/proxy/video")

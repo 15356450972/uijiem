@@ -60,6 +60,15 @@ TASK_PROFILE_DIR = os.path.join(RUNTIME_DIR, "task_profiles")
 _task_cache: dict[str, dict] = {}
 _task_lock = threading.Lock()
 _active_collect_tasks: set[str] = set()
+_account_collect_locks: dict[int, threading.Lock] = {}
+_account_collect_locks_guard = threading.Lock()
+
+
+def _get_account_collect_lock(account_id: int) -> threading.Lock:
+    with _account_collect_locks_guard:
+        if account_id not in _account_collect_locks:
+            _account_collect_locks[account_id] = threading.Lock()
+        return _account_collect_locks[account_id]
 
 
 class DolaError(RuntimeError):
@@ -291,14 +300,36 @@ def _kill_browser_pid(pid: int) -> bool:
                 timeout=8,
             )
             return True
+        # Collect child PIDs before killing the parent
+        child_pids: list[int] = []
+        try:
+            ps_out = subprocess.run(
+                ["pgrep", "-P", str(target_pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            child_pids = [int(x) for x in ps_out.stdout.split() if x.strip().isdigit()]
+        except Exception:
+            pass
         os.kill(target_pid, signal.SIGTERM)
         for _ in range(20):
             time.sleep(0.2)
             try:
                 os.kill(target_pid, 0)
             except OSError:
-                return True
-        os.kill(target_pid, signal.SIGKILL)
+                break
+        else:
+            try:
+                os.kill(target_pid, signal.SIGKILL)
+            except OSError:
+                pass
+        # Kill any surviving child processes
+        for cpid in child_pids:
+            try:
+                os.kill(cpid, signal.SIGTERM)
+            except OSError:
+                pass
         return True
     except (OSError, ProcessLookupError):
         return True
@@ -1268,6 +1299,38 @@ def _api_submit_args(prompt: str, refs: list[str], ratio: str, duration: int, mo
     ]
 
 
+def _download_video_to_local(video_url: str, task_id: str = "", conversation_id: str = "") -> str:
+    """Download a remote video URL to DOWNLOAD_DIR as a fallback when JS scripts
+    obtained the URL but failed to save the file locally.
+
+    Returns the local file path on success, or "" on failure.
+    """
+    url = _clean_str(video_url)
+    if not url or not url.startswith("http"):
+        return ""
+    try:
+        Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
+        suffix = conversation_id or task_id or uuid.uuid4().hex[:8]
+        local_path = os.path.join(DOWNLOAD_DIR, f"dola-fallback-{suffix}.mp4")
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "video/mp4,video/*,*/*;q=0.8",
+        })
+        with urllib.request.urlopen(req, timeout=120) as resp, open(local_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+        if os.path.getsize(local_path) > 0:
+            return local_path
+        os.remove(local_path)
+        return ""
+    except Exception:
+        try:
+            if local_path and os.path.isfile(local_path):
+                os.remove(local_path)
+        except OSError:
+            pass
+        return ""
+
+
 def _parse_generation_output(output: str) -> dict:
     conversation_id = (
         _extract_first(r"ACK:\s*conv=([A-Za-z0-9_\-]+)", output)
@@ -1305,6 +1368,12 @@ def _parse_generation_output(output: str) -> dict:
                 failure_reason = ""
             elif not _extract_failure_reason(f"[失败] {failure_reason}"):
                 failure_reason = ""
+    elif video_url and not saved_path:
+        download_failure = _extract_first(r"\[失败\]\s*([^\n]+)", output)
+        if not download_failure:
+            download_failure = _extract_first(r"\[错误\]\s*([^\n]+)", output)
+        if download_failure:
+            failure_reason = _compact_log_text(download_failure)
     return {
         "conversation_id": conversation_id,
         "video_url": video_url,
@@ -1348,6 +1417,10 @@ def _extract_failure_reason(output: str) -> str:
         ("视频生成失败", r"视频[^。！？\n]{0,40}(?:生成|制作|创建|处理)[^。！？\n]{0,20}(?:失败|不成功|无法完成|未能完成)"),
         ("内容未通过，无法生成视频", r"(?:内容|请求|提示词)[^。！？\n]{0,50}(?:不符合|违规|违反|无法通过|未通过|不适合)[^。！？\n]{0,50}(?:视频|生成)"),
         ("任务明确拒绝生成视频", r"(?:unable|cannot|can't)[^.\n]{0,80}(?:generate|create|make)[^.\n]{0,40}video"),
+        ("Dola 拒绝生成该内容", r"(?:暂时|目前|当前)?无法生成[^。！？\n]{0,20}(?:该|您要求|您需要|这个)?(?:内容|视频)[^。！？\n]{0,30}(?:请尝试|我会尽力|请输入)"),
+        ("Dola 拒绝生成该内容", r"(?:暂时|目前)?无法生成您?要求的内容"),
+        ("今日生成次数已达上限", r"今天[^。！？\n]{0,20}(?:生成|使用|创作)[^。！？\n]{0,20}(?:次数|额度)[^。！？\n]{0,20}(?:达到|已达)[^。！？\n]{0,20}上限"),
+        ("今日生成次数已达上限", r"(?:生成|使用|创作)[^。！？\n]{0,20}(?:次数|额度)[^。！？\n]{0,20}(?:达到|已达)[^。！？\n]{0,20}上限[^。！？\n]{0,20}明天"),
     ]
     for label, pattern in failure_patterns:
         if re.search(pattern, compact, re.IGNORECASE):
@@ -1363,8 +1436,6 @@ _QUOTA_REJECTION_MARKERS = (
     "无法生成该视频",
     "无法生成视频",
     "无法生成该内容",
-    "剩余",
-    "今日剩余",
     "请尝试降低配置",
     "cookie 过期",
     "内容未通过",
@@ -1374,6 +1445,8 @@ _QUOTA_REJECTION_MARKERS = (
     "cannot generate",
     "longer than",
     "unable to generate",
+    "达到上限",
+    "已达上限",
 )
 
 
@@ -1579,6 +1652,25 @@ def _fail_task(task_id: str, error: str, progress: int = 100, **updates) -> None
     _set_task(task_id, **payload)
     _sync_task_db_status(task_id, "failed")
     _release_reserved_quota_once(task_id, message)
+    _check_daily_limit_and_disable(task_id, message)
+
+
+def _check_daily_limit_and_disable(task_id: str, message: str) -> None:
+    """When the Dola server says daily limit is reached, disable the account
+    for the rest of today by maxing out its daily_video_used."""
+    if not message:
+        return
+    markers = ("今日生成次数已达上限", "达到上限", "已达上限", "明天再来")
+    if not any(marker in message for marker in markers):
+        return
+    task = _get_task(task_id)
+    account_id = int(task.get("quota_account_id") or task.get("account_id") or 0)
+    if not account_id:
+        return
+    try:
+        DolaAccountDB.mark_daily_limit_reached(account_id)
+    except Exception as e:
+        _set_task(task_id, daily_limit_disable_error=str(e))
 
 
 def create_video(
@@ -1731,7 +1823,7 @@ def create_video(
                     "progress": 100,
                 }
                 _reserve_observed_quota_once(task_id, output)
-                if result.returncode != 0 and conversation_id and not video_url and not local_path:
+                if result.returncode != 0 and conversation_id and not video_url and not local_path and not parsed.get("failure_reason"):
                     _set_task(
                         task_id,
                         **_task_update_payload(updates, "status", "progress", "error", "fail_reason"),
@@ -1743,9 +1835,19 @@ def create_video(
                     _sync_task_db_status(task_id, "collectable")
                     return
                 if result.returncode != 0:
-                    message = parsed.get("failure_reason", "") or _extract_failure_reason(output) or "Dola API 生成失败"
-                    _fail_task(task_id, message, **updates)
-                    return
+                    if video_url and not local_path:
+                        downloaded = _download_video_to_local(video_url, task_id=task_id, conversation_id=conversation_id)
+                        if downloaded:
+                            local_path = downloaded
+                            updates["local_path"] = local_path
+                    if video_url and not local_path:
+                        message = parsed.get("failure_reason", "") or _extract_failure_reason(output) or f"Dola API 生成失败：视频地址已获取但下载失败。远程地址: {video_url[:200]}"
+                        _fail_task(task_id, message, **updates)
+                        return
+                    if not video_url and not local_path:
+                        message = parsed.get("failure_reason", "") or _extract_failure_reason(output) or "Dola API 生成失败"
+                        _fail_task(task_id, message, **updates)
+                        return
                 failure_reason = parsed.get("failure_reason", "")
                 if failure_reason:
                     _fail_task(task_id, failure_reason, **updates)
@@ -1754,6 +1856,11 @@ def create_video(
                     message = "Dola API 已结束，但没有拿到视频地址或会话信息。"
                     _fail_task(task_id, message, **updates)
                     return
+                if video_url and not local_path:
+                    downloaded = _download_video_to_local(video_url, task_id=task_id, conversation_id=conversation_id)
+                    if downloaded:
+                        local_path = downloaded
+                        updates["local_path"] = local_path
                 if video_url or local_path:
                     _set_task(
                         task_id,
@@ -1840,12 +1947,32 @@ def create_video(
                 "progress": 100,
             }
             if result.returncode != 0:
+                video_url = _clean_str(parsed.get("video_url", ""))
+                local_path = _clean_str(parsed.get("local_path", ""))
+                if video_url and not local_path:
+                    downloaded = _download_video_to_local(video_url, task_id=task_id, conversation_id=parsed.get("conversation_id", ""))
+                    if downloaded:
+                        updates["local_path"] = downloaded
+                        _set_task(
+                            task_id,
+                            **_task_update_payload(updates, "status", "error", "fail_reason"),
+                            status="completed",
+                            error="",
+                            fail_reason="",
+                        )
+                        _sync_task_db_status(task_id, "completed", downloaded)
+                        return
                 message = parsed.get("failure_reason", "") or _extract_failure_reason(output) or "Dola 浏览器提交失败"
                 _fail_task(task_id, message, **updates)
                 return
 
             video_url = parsed.get("video_url", "")
             local_path = parsed.get("local_path", "")
+            if video_url and not local_path:
+                downloaded = _download_video_to_local(video_url, task_id=task_id, conversation_id=parsed.get("conversation_id", ""))
+                if downloaded:
+                    local_path = downloaded
+                    updates["local_path"] = local_path
             if video_url or local_path:
                 _set_task(
                     task_id,
@@ -1938,18 +2065,40 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
             "collect_finished_at": time.time(),
         }
         if parsed.get("video_url") or parsed.get("local_path"):
+            local_path = _clean_str(parsed.get("local_path", ""))
+            video_url = _clean_str(parsed.get("video_url", ""))
+            if video_url and not local_path:
+                downloaded = _download_video_to_local(video_url, task_id=task_id, conversation_id=conv)
+                if downloaded:
+                    local_path = downloaded
+                    updates["local_path"] = local_path
+                else:
+                    _fail_task(
+                        task_id,
+                        f"视频已生成但下载到本地失败，远程链接可能已过期。可尝试重新采集或打开浏览器查看。远程地址: {video_url[:200]}",
+                        **updates,
+                    )
+                    if manual_collect:
+                        _close_task_browser(task_id)
+                    return
             _set_task(
                 task_id,
                 **_task_update_payload(updates, "status", "error", "fail_reason"),
                 status="completed",
                 error="",
                 fail_reason="",
+                collect_fail_count=0,
             )
-            _sync_task_db_status(task_id, "completed", parsed.get("local_path") or parsed.get("video_url") or "")
+            _sync_task_db_status(task_id, "completed", local_path or video_url or "")
             if manual_collect:
                 _close_task_browser(task_id)
-        elif parsed.get("failure_reason") and any(marker in parsed.get("failure_reason", "") for marker in ("侵权", "违规", "违法", "违禁", "无法生成", "生成失败", "抱歉", "时长超过", "cannot be generated", "longer than")):
+        elif parsed.get("failure_reason") and any(marker in parsed.get("failure_reason", "") for marker in ("侵权", "违规", "违法", "违禁", "无法生成", "无法返回", "生成失败", "内容未通过", "抱歉", "时长超过", "拒绝生成", "达到上限", "已达上限", "cannot be generated", "longer than")):
             _fail_task(task_id, parsed.get("failure_reason", ""), **updates)
+            if manual_collect:
+                _close_task_browser(task_id)
+        elif _looks_like_quota_rejection(output):
+            quota_reason = _compact_log_text(output)[:500]
+            _fail_task(task_id, f"额度不足或被拒绝生成: {quota_reason}", **updates)
             if manual_collect:
                 _close_task_browser(task_id)
         elif result.returncode == 0:
@@ -1971,14 +2120,30 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
                 retry_reason = "API 暂未读取到该 Dola 会话的视频消息；如果网页已显示视频，可能是当前账号 API 会话看不到这条页面消息。可稍后重试，或显式打开浏览器调试采集。"
             elif result.returncode == 124:
                 retry_reason = "本次 API 采集超时，已停止后台采集并保留为可重试状态。"
-            _set_task(
-                task_id,
-                **collectable_updates,
-                status="collectable",
-                error="",
-                fail_reason=retry_reason,
-            )
-            _sync_task_db_status(task_id, "collectable")
+            # 采集失败计数：连续拿不到视频达阈值则判定生成失败（覆盖"网页已违规但 API 看不到"的情况）
+            try:
+                prev_fail_count = int(current_task.get("collect_fail_count") or 0)
+            except (TypeError, ValueError):
+                prev_fail_count = 0
+            next_fail_count = prev_fail_count + 1
+            COLLECT_FAIL_THRESHOLD = 3
+            if next_fail_count >= COLLECT_FAIL_THRESHOLD:
+                _fail_task(
+                    task_id,
+                    f"连续 {next_fail_count} 次采集均未拿到视频，判定为生成失败（可能是内容违规被 Dola 拒绝、或账号 API 会话无法读取该消息）。最后原因：{retry_reason}",
+                    progress=100,
+                    collect_fail_count=next_fail_count,
+                )
+            else:
+                _set_task(
+                    task_id,
+                    **collectable_updates,
+                    status="collectable",
+                    error="",
+                    fail_reason=retry_reason,
+                    collect_fail_count=next_fail_count,
+                )
+                _sync_task_db_status(task_id, "collectable")
     except Exception as e:  # noqa: BLE001
         _set_task(
             task_id,
@@ -2038,6 +2203,23 @@ def _collect_task_result_browser_context(task_id: str, conversation_id: str) -> 
             "progress": 100 if result.returncode == 0 and (parsed.get("video_url") or parsed.get("local_path")) else 90,
         }
         if parsed.get("video_url") or parsed.get("local_path"):
+            local_path = _clean_str(parsed.get("local_path", ""))
+            video_url = _clean_str(parsed.get("video_url", ""))
+            if video_url and not local_path:
+                downloaded = _download_video_to_local(video_url, task_id=task_id, conversation_id=conv)
+                if downloaded:
+                    local_path = downloaded
+                    updates["local_path"] = local_path
+            if not local_path:
+                _set_task(
+                    task_id,
+                    **_task_update_payload(updates, "status", "error", "fail_reason"),
+                    status="collectable",
+                    error="",
+                    fail_reason=f"视频地址已获取但下载到本地失败，可稍后重试。远程地址: {video_url[:200]}",
+                )
+                _sync_task_db_status(task_id, "collectable")
+                return False
             _set_task(
                 task_id,
                 **_task_update_payload(updates, "status", "error", "fail_reason"),
@@ -2045,7 +2227,7 @@ def _collect_task_result_browser_context(task_id: str, conversation_id: str) -> 
                 error="",
                 fail_reason="",
             )
-            _sync_task_db_status(task_id, "completed", parsed.get("local_path") or parsed.get("video_url") or "")
+            _sync_task_db_status(task_id, "completed", local_path)
             _close_task_browser(task_id)
             return True
         if result.returncode != 0 and "CDP not ready" in output:
@@ -2058,6 +2240,11 @@ def _collect_task_result_browser_context(task_id: str, conversation_id: str) -> 
             )
             _sync_task_db_status(task_id, "collectable")
             return False
+        if _looks_like_quota_rejection(output):
+            quota_reason = _compact_log_text(output)[:500]
+            _fail_task(task_id, f"额度不足或被拒绝生成: {quota_reason}", **updates)
+            _close_task_browser(task_id)
+            return True
         failure_reason = parsed.get("failure_reason", "")
         if failure_reason:
             _fail_task(task_id, failure_reason, **updates)
@@ -2189,23 +2376,33 @@ def collect_task(task_id: str = "", conversation_id: str = "", account: dict | N
         status="collecting",
         progress=max(20, int(task.get("progress") or 0) if str(task.get("progress") or "").isdigit() else 20),
         error="",
-        fail_reason="正在通过 API 采集 Dola 视频结果...",
+        fail_reason="正在采集 Dola 视频结果...",
         collect_started_at=time.time(),
     )
     _sync_task_db_status(task_id, "processing")
 
     def _run_collect() -> None:
-        # 采集结果只走纯 API 轮询（dola-video-poll-flat.mjs），不再开浏览器。
-        # 浏览器路径（_collect_task_result_browser_context / _reopen_account_browser_and_collect）
-        # 虽然更稳（能用页面真实签名参数），但需要维持/重开 Chrome 会话，
-        # 和"纯 API、不开浏览器"的使用诉求冲突，所以这里直接跳过。
-        # 如果纯 API 轮询长期拿不到结果（Dola 更新签名算法），
-        # 可以临时把下面两行取消注释，恢复浏览器优先的回退链。
-        # if _collect_task_result_browser_context(task_id, conv):
-        #     return
-        # if _reopen_account_browser_and_collect(task_id, conv):
-        #     return
-        _poll_task_result(task_id, conv, env_overrides, True)
+        # 同一账号的采集任务串行执行，避免多个浏览器实例争抢同一个 Chrome profile。
+        account_id_for_lock = int(account.get("id") or 0) if account else 0
+        account_lock = _get_account_collect_lock(account_id_for_lock) if account_id_for_lock else None
+        if account_lock:
+            with account_lock:
+                _do_collect(task_id, conv, env_overrides)
+        else:
+            _do_collect(task_id, conv, env_overrides)
+
+    def _do_collect(task_id: str, conv: str, env_overrides: dict) -> None:
+        # 采集结果优先走浏览器路径（能用页面真实签名参数，更稳定），
+        # 浏览器路径都失败时再回退到纯 API 轮询。
+        try:
+            if _collect_task_result_browser_context(task_id, conv):
+                return
+            if _reopen_account_browser_and_collect(task_id, conv):
+                return
+            _poll_task_result(task_id, conv, env_overrides, True)
+        finally:
+            # 采集结束后统一关闭浏览器，无论成功还是失败
+            _close_task_browser(task_id)
 
     threading.Thread(target=_run_collect, daemon=True).start()
     return _get_task(task_id)

@@ -202,6 +202,10 @@ const VIDEO_FAILURE_TEXT_RULES = [
   { reason: '任务明确拒绝生成视频', pattern: /sorry[^.\n]{0,80}(?:can't|cannot|unable)[^.\n]{0,30}video/i },
   { reason: '任务明确拒绝生成视频', pattern: /(?:unable|cannot|can't)[^.\n]{0,40}(?:generate|create|make)[^.\n]{0,30}video/i },
   { reason: '视频生成失败', pattern: /video[^.\n]{0,40}(?:generation|creation)[^.\n]{0,30}(?:failed|not supported|unavailable)/i },
+  { reason: '今日生成次数已达上限', pattern: /今天[^。！？\n]{0,20}(?:生成|使用|创作)[^。！？\n]{0,20}(?:次数|额度)[^。！？\n]{0,20}(?:达到|已达)[^。！？\n]{0,20}上限/ },
+  { reason: '今日生成次数已达上限', pattern: /(?:生成|使用|创作)[^。！？\n]{0,20}(?:次数|额度)[^。！？\n]{0,20}(?:达到|已达)[^。！？\n]{0,20}上限[^。！？\n]{0,20}明天/ },
+  { reason: '额度不足，无法生成该视频', pattern: /(?:需要|将)?消耗[^。！？\n]{0,20}\d+[^。！？\n]{0,20}(?:视频生成)?额度[^。！？\n]{0,30}剩余[^。！？\n]{0,20}\d+[^。！？\n]{0,30}无法生成/ },
+  { reason: '额度不足，无法生成该视频', pattern: /无法生成[^。！？\n]{0,12}视频[^。！？\n]{0,30}请尝试[^。！？\n]{0,12}降低配置/ },
 ];
 
 function normalizeTaskText(text) {

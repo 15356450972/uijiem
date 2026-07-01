@@ -805,6 +805,246 @@ ipcMain.handle('open-wizstar-browser', async (event, accountId) => {
   }
 });
 
+// Dola Google OAuth login — spawns the dola-google-login module as a child process
+// and streams progress events back to the renderer via 'dola-login-progress'.
+ipcMain.handle('dola-google-login', async (event, payload = {}) => {
+  const { email, password, profileDir, proxy, visible = true, keepOpen = false } = payload || {};
+  if (!email || !password) return { ok: false, error: 'Email and password are required' };
+
+  const sender = event.sender;
+  try {
+    const loginDir = app.isPackaged
+      ? path.join(process.resourcesPath, 'dola-google-login')
+      : path.join(__dirname, '..', 'dola-google-login');
+    const nodeBin = app.isPackaged ? process.execPath : process.execPath;
+    const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1' };
+
+    const args = [
+      path.join(loginDir, 'index.mjs'),
+      '--email', email,
+      '--password', password,
+    ];
+    if (!visible) args.push('--headless');
+    if (keepOpen) args.push('--keep-open');
+    if (profileDir) { args.push('--profile'); args.push(profileDir); }
+    if (proxy) { args.push('--proxy'); args.push(proxy); }
+
+    const child = spawn(nodeBin, args, {
+      cwd: loginDir,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: false,
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (data) => {
+      const text = data.toString();
+      stdout += text;
+      // Parse progress lines like "[dola-login] step: {...}"
+      for (const line of text.split('\n')) {
+        const match = line.match(/^\[dola-login\]\s+(\S+)(?::\s*(.*))?$/);
+        if (match) {
+          const step = match[1];
+          let stepData = {};
+          try { stepData = JSON.parse(match[2] || '{}'); } catch {}
+          sender.send('dola-login-progress', { step, data: stepData });
+        }
+      }
+    });
+
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    const exitCode = await new Promise((resolve) => {
+      child.on('close', resolve);
+      child.on('error', (err) => {
+        console.error('[dola-login] spawn error:', err);
+        resolve(-1);
+      });
+    });
+
+    if (exitCode !== 0) {
+      const errorMsg = stderr.trim() || stdout.trim() || `exit code ${exitCode}`;
+      return { ok: false, error: errorMsg };
+    }
+
+    // Parse the final success output for state info
+    const hasCookie = stdout.includes('cookie: ok');
+    const hasAccessToken = stdout.includes('access_token: ok');
+    const locationMatch = stdout.match(/location:\s*(\S+)/);
+    const stateMatch = stdout.match(/\[dola-login\]\s+state_json:\s*(.+)/);
+
+    let state = null;
+    if (stateMatch) {
+      try { state = JSON.parse(stateMatch[1].trim()); } catch {}
+    }
+
+    // Save to wizstar backend if we got state with cookie
+    let saved = null;
+    if (state && state.cookie) {
+      try {
+        const resp = await fetch(`${WIZSTAR_BASE_URL}/dola/accounts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: email,
+            cookie: state.cookie,
+            note: `Google login: ${email}`,
+            user_agent: state.user_agent,
+            device_id: state.device_id,
+            web_id: state.web_id,
+            tea_uuid: state.tea_uuid,
+            web_tab_id: state.web_tab_id,
+            fp: state.fp,
+            ms_token: state.ms_token,
+          }),
+        });
+        saved = await resp.json();
+      } catch (e) {
+        saved = { error: e.message };
+      }
+    }
+
+    return {
+      ok: true,
+      hasCookie,
+      hasAccessToken,
+      location: locationMatch?.[1] || '',
+      state,
+      saved,
+      raw: stdout,
+    };
+  } catch (e) {
+    console.error('[dola-login] failed:', e);
+    return { ok: false, error: e.message || String(e) };
+  }
+});
+
+// Dola batch Google login — runs multiple accounts concurrently
+ipcMain.handle('dola-batch-login', async (event, payload = {}) => {
+  const { accounts, concurrency = 2 } = payload || {};
+  if (!accounts || !Array.isArray(accounts) || accounts.length === 0) {
+    return { ok: false, error: 'No accounts provided' };
+  }
+
+  const sender = event.sender;
+  const loginDir = app.isPackaged
+    ? path.join(process.resourcesPath, 'dola-google-login')
+    : path.join(__dirname, '..', 'dola-google-login');
+  const nodeBin = process.execPath;
+  const baseEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1' };
+
+  function runOneLogin(email, password, index) {
+    return new Promise((resolve) => {
+      const profileDir = path.join(loginDir, '.dola-profiles', `batch-${index}-${Date.now()}`);
+      const args = [
+        path.join(loginDir, 'index.mjs'),
+        '--email', email,
+        '--password', password,
+        '--profile', profileDir,
+      ];
+
+      const child = spawn(nodeBin, args, {
+        cwd: loginDir,
+        env: baseEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: false,
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', (data) => {
+        const text = data.toString();
+        stdout += text;
+        for (const line of text.split('\n')) {
+          const match = line.match(/^\[dola-login\]\s+(\S+)(?::\s*(.*))?$/);
+          if (match) {
+            const step = match[1];
+            let stepData = {};
+            try { stepData = JSON.parse(match[2] || '{}'); } catch {}
+            sender.send('dola-batch-progress', { index, email, step, data: stepData });
+          }
+        }
+      });
+
+      child.stderr.on('data', (data) => { stderr += data.toString(); });
+
+      child.on('close', (exitCode) => {
+        const stateMatch = stdout.match(/\[dola-login\]\s+state_json:\s*(.+)/);
+        if (exitCode === 0 && stateMatch) {
+          try {
+            const state = JSON.parse(stateMatch[1].trim());
+            resolve({ ok: true, email, index, state });
+          } catch {
+            resolve({ ok: false, email, index, error: 'Failed to parse state' });
+          }
+        } else {
+          const errorMsg = stderr.trim() || stdout.match(/\[dola-login\]\s+failed:\s*(.+)/)?.[1] || `exit code ${exitCode}`;
+          resolve({ ok: false, email, index, error: errorMsg });
+        }
+      });
+
+      child.on('error', () => {
+        resolve({ ok: false, email, index, error: 'spawn error' });
+      });
+    });
+  }
+
+  async function saveToBackend(state, email) {
+    try {
+      const resp = await fetch(`${WIZSTAR_BASE_URL}/dola/accounts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: email,
+          cookie: state.cookie,
+          note: `Google login: ${email}`,
+        }),
+      });
+      return await resp.json();
+    } catch (e) {
+      return { error: e.message };
+    }
+  }
+
+  // Run with concurrency limit
+  const results = [];
+  const queue = accounts.map((acc, i) => ({ ...acc, index: i }));
+  const running = [];
+
+  while (queue.length > 0 || running.length > 0) {
+    while (running.length < concurrency && queue.length > 0) {
+      const item = queue.shift();
+      const promise = runOneLogin(item.email, item.password, item.index).then(async (result) => {
+        if (result.ok && result.state) {
+          const saveResult = await saveToBackend(result.state, item.email);
+          result.saved = saveResult;
+          sender.send('dola-batch-progress', { index: item.index, email: item.email, step: 'saved_to_db', data: { ok: !saveResult.error } });
+        }
+        return result;
+      });
+      running.push(promise);
+      sender.send('dola-batch-progress', { index: item.index, email: item.email, step: 'starting', data: {} });
+    }
+    const settled = await Promise.race(running);
+    results.push(settled);
+    const idx = running.indexOf(running.find(r => r === settled) || running[0]);
+    running.splice(idx, 1);
+  }
+
+  results.sort((a, b) => a.index - b.index);
+  const succeeded = results.filter(r => r.ok).length;
+  const failed = results.filter(r => !r.ok).length;
+
+  sender.send('dola-batch-progress', { step: 'batch_complete', data: { total: results.length, succeeded, failed } });
+
+  return { ok: true, results, succeeded, failed };
+});
+
 ipcMain.handle('wizstar-server-status', async () => {
   try {
     return await new Promise((resolve) => {

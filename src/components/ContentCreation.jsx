@@ -37,6 +37,7 @@ import {
 import { WIZSTAR_API } from '../config';
 import ImageMergeModal from './ImageMergeModal';
 import FaceCensorModal from './FaceCensorModal';
+import GridMaskModal from './GridMaskModal';
 import { mergeImages, blobToUint8Array, timestampForFilename } from '../utils/imageMerge';
 
 const TASK_REGISTRY_KEY = 'maocanju_generation_task_registry';
@@ -67,6 +68,11 @@ const DEFAULT_PROMPT_SUFFIX_TEMPLATES = [
 ];
 const PROMPT_SUFFIX_TEMPLATES_KEY = 'maocanju_prompt_suffix_templates';
 
+const DEFAULT_PROMPT_PREFIX_TEMPLATES = [
+  { id: 'none', name: '无前缀', prefix: '' },
+];
+const PROMPT_PREFIX_TEMPLATES_KEY = 'maocanju_prompt_prefix_templates';
+
 const isDolaBusyMessage = (message = '') => /Dola 同一账号一次只能跑一个视频任务|请等待当前任务完成后再提交|正在生成中/.test(String(message || ''));
 
 const statusUrlForTask = (task) => task.channel === 'pixmax'
@@ -89,6 +95,26 @@ const localFilePathFromUrlValue = (url = '') => {
     try { return decodeURIComponent(new URL(raw).pathname); } catch (_) { return raw.replace(/^file:\/\/+/, '/'); }
   }
   return isLocalFilePathValue(raw) ? raw : '';
+};
+const extractRealUrlFromProxy = (url = '') => {
+  const raw = String(url || '').trim();
+  if (!raw) return { localPath: '', remoteUrl: '' };
+  try {
+    const parsed = new URL(raw, WIZSTAR_API);
+    const api = new URL(WIZSTAR_API);
+    if (parsed.hostname !== api.hostname || parsed.port !== api.port) {
+      return { localPath: '', remoteUrl: '' };
+    }
+    if (parsed.pathname === '/local/video' || parsed.pathname === '/local/image') {
+      const p = parsed.searchParams.get('path') || '';
+      return { localPath: p ? decodeURIComponent(p) : '', remoteUrl: '' };
+    }
+    if (parsed.pathname === '/proxy/video' || parsed.pathname === '/download/video') {
+      const u = parsed.searchParams.get('url') || '';
+      return { localPath: '', remoteUrl: u };
+    }
+  } catch (_) {}
+  return { localPath: '', remoteUrl: '' };
 };
 const isLocalVideoServiceUrlValue = (url = '') => {
   const raw = String(url || '').trim();
@@ -121,6 +147,7 @@ const withLocalVideoCacheBuster = (url = '') => {
   return `${raw}${raw.includes('?') ? '&' : '?'}v=${LOCAL_VIDEO_CACHE_BUSTER}`;
 };
 const toLocalVideoUrlValue = (filePath = '') => withLocalVideoCacheBuster(`${WIZSTAR_API}/local/video?path=${encodeURIComponent(filePath)}`);
+const toLocalImageUrlValue = (filePath = '') => `${WIZSTAR_API}/local/image?path=${encodeURIComponent(filePath)}`;
 const toPlayableVideoUrlValue = (url = '') => {
   if (!url) return url;
   if (isLocalVideoServiceUrlValue(url)) return withLocalVideoCacheBuster(url);
@@ -212,12 +239,20 @@ const triggerAutoCollectDolaTask = async (task, payload = {}) => {
   return data.data || {};
 };
 
+const DOLA_AUTO_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+
 const startGlobalGenerationPolling = () => {
   if (globalPollingStarted) return;
   globalPollingStarted = true;
   window.setInterval(async () => {
     if (globalPollingBusy) return;
-    const registry = readGenerationTaskRegistry().filter(t => t && t.taskId && t.status !== 'completed' && t.status !== 'failed');
+    const now = Date.now();
+    const registry = readGenerationTaskRegistry().filter(t => {
+      if (!t || !t.taskId || t.status === 'completed' || t.status === 'failed') return false;
+      // Dola tasks stop auto-polling 10 minutes after creation; user must trigger manual collect after that.
+      if (t.channel === 'dola' && t.createdAt && (now - t.createdAt) > DOLA_AUTO_POLL_TIMEOUT_MS) return false;
+      return true;
+    });
     if (registry.length === 0) return;
 
     globalPollingBusy = true;
@@ -458,7 +493,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         : fallbackByOrientation.landscape;
     return ratioGroup.find(r => supported.includes(r)) || supported[0];
   };
-  const [activePopover, setActivePopover] = useState(null); // 'model' | 'params' | 'suffix' | null
+  const [activePopover, setActivePopover] = useState(null); // 'model' | 'params' | 'suffix' | 'prefix' | null
   const [userPromptSuffixTemplates, setUserPromptSuffixTemplates] = useState(() => {
     try {
       const raw = localStorage.getItem(PROMPT_SUFFIX_TEMPLATES_KEY);
@@ -478,8 +513,19 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   const selectedPromptSuffix = promptSuffixTemplates.find(t => t.id === selectedPromptSuffixId) || DEFAULT_PROMPT_SUFFIX_TEMPLATES[0];
   const saveUserPromptSuffixTemplates = (templates) => {
     setUserPromptSuffixTemplates(templates);
-    localStorage.setItem(PROMPT_SUFFIX_TEMPLATES_KEY, JSON.stringify(templates));
+    try { localStorage.setItem(PROMPT_SUFFIX_TEMPLATES_KEY, JSON.stringify(templates)); } catch (e) { console.warn('Failed to save suffix templates:', e); }
   };
+  const isSuffixTemplatesMountedRef = useRef(false);
+  useEffect(() => {
+    try { localStorage.setItem('maocanju_prompt_suffix_id', selectedPromptSuffixId); } catch (e) { console.warn('Failed to save suffix id:', e); }
+  }, [selectedPromptSuffixId]);
+  useEffect(() => {
+    if (!isSuffixTemplatesMountedRef.current) {
+      isSuffixTemplatesMountedRef.current = true;
+      return;
+    }
+    try { localStorage.setItem(PROMPT_SUFFIX_TEMPLATES_KEY, JSON.stringify(userPromptSuffixTemplates)); } catch (e) { console.warn('Failed to save suffix templates:', e); }
+  }, [userPromptSuffixTemplates]);
   const resetPromptSuffixForm = () => {
     setIsAddingPromptSuffix(false);
     setEditingPromptSuffixId(null);
@@ -549,6 +595,109 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       resetPromptSuffixForm();
     }
   };
+
+  // ---- 提示词前缀模板（与后缀对称）----
+  const [userPromptPrefixTemplates, setUserPromptPrefixTemplates] = useState(() => {
+    try {
+      const raw = localStorage.getItem(PROMPT_PREFIX_TEMPLATES_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter(t => t?.name && t?.prefix) : [];
+    } catch {
+      return [];
+    }
+  });
+  const promptPrefixTemplates = [...DEFAULT_PROMPT_PREFIX_TEMPLATES, ...userPromptPrefixTemplates];
+  const [selectedPromptPrefixId, setSelectedPromptPrefixId] = useState(() => localStorage.getItem('maocanju_prompt_prefix_id') || 'none');
+  const [isAddingPromptPrefix, setIsAddingPromptPrefix] = useState(false);
+  const [editingPromptPrefixId, setEditingPromptPrefixId] = useState(null);
+  const [expandedPromptPrefixId, setExpandedPromptPrefixId] = useState(null);
+  const [newPromptPrefixName, setNewPromptPrefixName] = useState('');
+  const [newPromptPrefixValue, setNewPromptPrefixValue] = useState('');
+  const selectedPromptPrefix = promptPrefixTemplates.find(t => t.id === selectedPromptPrefixId) || DEFAULT_PROMPT_PREFIX_TEMPLATES[0];
+  const saveUserPromptPrefixTemplates = (templates) => {
+    setUserPromptPrefixTemplates(templates);
+    try { localStorage.setItem(PROMPT_PREFIX_TEMPLATES_KEY, JSON.stringify(templates)); } catch (e) { console.warn('Failed to save prefix templates:', e); }
+  };
+  const isPrefixTemplatesMountedRef = useRef(false);
+  useEffect(() => {
+    try { localStorage.setItem('maocanju_prompt_prefix_id', selectedPromptPrefixId); } catch (e) { console.warn('Failed to save prefix id:', e); }
+  }, [selectedPromptPrefixId]);
+  useEffect(() => {
+    if (!isPrefixTemplatesMountedRef.current) {
+      isPrefixTemplatesMountedRef.current = true;
+      return;
+    }
+    try { localStorage.setItem(PROMPT_PREFIX_TEMPLATES_KEY, JSON.stringify(userPromptPrefixTemplates)); } catch (e) { console.warn('Failed to save prefix templates:', e); }
+  }, [userPromptPrefixTemplates]);
+  const resetPromptPrefixForm = () => {
+    setIsAddingPromptPrefix(false);
+    setEditingPromptPrefixId(null);
+    setNewPromptPrefixName('');
+    setNewPromptPrefixValue('');
+  };
+  const startAddingPromptPrefixTemplate = () => {
+    setEditingPromptPrefixId(null);
+    setNewPromptPrefixName('');
+    setNewPromptPrefixValue('');
+    setIsAddingPromptPrefix(true);
+  };
+  const startEditingPromptPrefixTemplate = (template) => {
+    if (!template || template.id === 'none') return;
+    setEditingPromptPrefixId(template.id);
+    setNewPromptPrefixName(template.name || '');
+    setNewPromptPrefixValue(template.prefix || '');
+    setIsAddingPromptPrefix(true);
+  };
+  const savePromptPrefixTemplateForm = () => {
+    const cleanName = newPromptPrefixName.trim();
+    const cleanPrefix = newPromptPrefixValue.trim();
+    if (!cleanName || !cleanPrefix) {
+      alert('请填写模板名称和前缀内容。');
+      return;
+    }
+
+    if (editingPromptPrefixId) {
+      const exists = userPromptPrefixTemplates.some(t => t.id === editingPromptPrefixId);
+      if (!exists) {
+        alert('没有找到要修改的前缀模板，请重新选择。');
+        resetPromptPrefixForm();
+        return;
+      }
+      const nextTemplates = userPromptPrefixTemplates.map(t => (
+        t.id === editingPromptPrefixId ? { ...t, name: cleanName, prefix: cleanPrefix } : t
+      ));
+      saveUserPromptPrefixTemplates(nextTemplates);
+      setSelectedPromptPrefixId(editingPromptPrefixId);
+      localStorage.setItem('maocanju_prompt_prefix_id', editingPromptPrefixId);
+      resetPromptPrefixForm();
+      return;
+    }
+
+    const nextTemplate = {
+      id: `user-prefix-${Date.now()}`,
+      name: cleanName,
+      prefix: cleanPrefix,
+    };
+    const nextTemplates = [...userPromptPrefixTemplates, nextTemplate];
+    saveUserPromptPrefixTemplates(nextTemplates);
+    setSelectedPromptPrefixId(nextTemplate.id);
+    localStorage.setItem('maocanju_prompt_prefix_id', nextTemplate.id);
+    resetPromptPrefixForm();
+  };
+  const deletePromptPrefixTemplate = (templateId) => {
+    const target = userPromptPrefixTemplates.find(t => t.id === templateId);
+    if (!target) return;
+    if (!confirm(`确定删除前缀模板「${target.name}」吗？`)) return;
+    const nextTemplates = userPromptPrefixTemplates.filter(t => t.id !== templateId);
+    saveUserPromptPrefixTemplates(nextTemplates);
+    if (selectedPromptPrefixId === templateId) {
+      setSelectedPromptPrefixId('none');
+      localStorage.setItem('maocanju_prompt_prefix_id', 'none');
+    }
+    if (editingPromptPrefixId === templateId) {
+      resetPromptPrefixForm();
+    }
+  };
   const parseDurationSeconds = (durationValue, fallback = 5) => {
     const match = String(durationValue || '').match(/\d+(?:\.\d+)?/);
     if (!match) return fallback;
@@ -565,13 +714,20 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     parseDurationSeconds(rowDuration, parseDurationSeconds(fallbackDuration, fallback))
   );
 
-  const buildPromptWithSuffix = (text = '') => {
+  const buildPromptWithAffixes = (text = '') => {
     const base = String(text || '').trim();
+    const prefix = (selectedPromptPrefix.prefix || '').trim();
     const suffix = (selectedPromptSuffix.suffix || '').trim();
-    if (!suffix) return base;
-    if (!base) return suffix;
-    return base.includes(suffix) ? base : `${base}，${suffix}`;
+    let result = base;
+    if (prefix && !result.startsWith(prefix)) {
+      result = result ? `${prefix}，${result}` : prefix;
+    }
+    if (suffix && !result.endsWith(suffix) && !result.includes(suffix)) {
+      result = result ? `${result}，${suffix}` : suffix;
+    }
+    return result;
   };
+  const buildPromptWithSuffix = buildPromptWithAffixes;
   const [modelPopoverTab, setModelPopoverTab] = useState(() => getModelMediaType(readGlobalGenerationSetting('model')));
   const [editingRowId, setEditingRowId] = useState(null); // row.id of the row currently being edited as plain text
   const promptDraftsRef = useRef({});
@@ -589,8 +745,13 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     requestAnimationFrame(() => resizePromptTextarea(promptTextareaRefs.current[rowId]));
   };
   const [fullscreenVideo, setFullscreenVideo] = useState(null); // { src, mediaType } for fullscreen preview
+  const [fullscreenLoading, setFullscreenLoading] = useState(false);
   const [imageEditorEnabled, setImageEditorEnabled] = useState(false);
   const [imageEditorSaving, setImageEditorSaving] = useState(false);
+  const [imageEditorColor, setImageEditorColor] = useState('#ff2f2f');
+  const [imageEditorLineWidth, setImageEditorLineWidth] = useState(3);
+  const [imageEditorShowGrid, setImageEditorShowGrid] = useState(false);
+  const [imageEditorGridSize, setImageEditorGridSize] = useState(3);
   const imageEditorCanvasRef = useRef(null);
   const imageEditorImageRef = useRef(null);
   const imageEditorDrawingRef = useRef(false);
@@ -652,6 +813,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     return `file://${normalized.startsWith('/') ? '' : '/'}${normalized}`;
   };
   const toLocalVideoUrl = toLocalVideoUrlValue;
+  const toLocalImageUrl = toLocalImageUrlValue;
   const toPlayableUrl = toPlayableVideoUrlValue;
   const originalLocalVideoPathFromPlayable = (filePath = '') => {
     const raw = String(filePath || '').trim();
@@ -824,7 +986,17 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     const remoteUrl = getReferenceRemoteUrl(seg);
     const normalizeMediaList = (items = [], fallbackType = 'image') => asArray(items).map((m) => {
       if (m && typeof m === 'object') {
-        return { ...m, mediaType: m.mediaType || (isVideoUrl(m.thumbnail) ? 'video' : fallbackType) };
+        const mediaType = m.mediaType || (isVideoUrl(m.thumbnail) ? 'video' : fallbackType);
+        let thumb = m.thumbnail || '';
+        // Fix old image thumbnails that incorrectly use /local/video endpoint
+        if (thumb && mediaType === 'image' && thumb.includes('/local/video?path=')) {
+          thumb = thumb.replace('/local/video?path=', '/local/image?path=');
+        }
+        let srcUrl = m.sourceUrl || '';
+        if (srcUrl && mediaType === 'image' && srcUrl.includes('/local/video?path=')) {
+          srcUrl = srcUrl.replace('/local/video?path=', '/local/image?path=');
+        }
+        return { ...m, mediaType, thumbnail: thumb, sourceUrl: srcUrl };
       }
       const textValue = String(m || '').trim();
       return {
@@ -854,7 +1026,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         ? { ...seg.currentMaterialVideo, mediaType: seg.currentMaterialVideo.mediaType || (isVideoUrl(seg.currentMaterialVideo.thumbnail) ? 'video' : 'image') }
         : seg.currentMaterialVideo,
       currentMaterialImage: seg.currentMaterialImage && typeof seg.currentMaterialImage === 'object'
-        ? { ...seg.currentMaterialImage, mediaType: seg.currentMaterialImage.mediaType || (isVideoUrl(seg.currentMaterialImage.thumbnail) ? 'video' : 'image') }
+        ? (() => {
+            const m = seg.currentMaterialImage;
+            const mediaType = m.mediaType || (isVideoUrl(m.thumbnail) ? 'video' : 'image');
+            let thumb = m.thumbnail || '';
+            if (thumb && mediaType === 'image' && thumb.includes('/local/video?path=')) {
+              thumb = thumb.replace('/local/video?path=', '/local/image?path=');
+            }
+            return { ...m, mediaType, thumbnail: thumb };
+          })()
         : seg.currentMaterialImage,
     };
   };
@@ -866,10 +1046,20 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   const [newCharAvatar, setNewCharAvatar] = useState('');
   const [newCharAvatarPath, setNewCharAvatarPath] = useState('');
   const [newCharAvatarOriginal, setNewCharAvatarOriginal] = useState('');
+  const [charGridOverlay, setCharGridOverlay] = useState(false);
+  // Scene/Item Asset Sub-Window Manager States (shared, type determined by editingAssetType)
+  const [showAssetModal, setShowAssetModal] = useState(false);
+  const [editingAssetType, setEditingAssetType] = useState('scene');
+  const [editingAssetId, setEditingAssetId] = useState(null);
+  const [newAssetName, setNewAssetName] = useState('');
+  const [newAssetAvatar, setNewAssetAvatar] = useState('');
+  const [newAssetAvatarPath, setNewAssetAvatarPath] = useState('');
   // 角色一键打码进度：running 进行中，current/total 用于显示 x/y
   const [censorProgress, setCensorProgress] = useState({ running: false, current: 0, total: 0 });
   // 手动打码弹窗
   const [manualCensorOpen, setManualCensorOpen] = useState(false);
+  // 网格遮罩弹窗
+  const [gridMaskOpen, setGridMaskOpen] = useState(false);
 
   const [mergeModalState, setMergeModalState] = useState({ open: false, rowId: null, items: [] });
   const [mergeAllProgress, setMergeAllProgress] = useState({ running: false, current: 0, total: 0 });
@@ -1269,17 +1459,21 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     }));
   };
 
-  // Handle local image upload as base64
+  // Handle local image upload — prefer file:// URL in Electron to avoid heavy base64
   const handleLocalAvatarUpload = (e) => {
     const file = e.target.files[0];
     if (file) {
       setNewCharAvatarPath(file.path || '');
       setNewCharAvatarOriginal(''); // 换了底图，清掉旧的打码原图备份
-      const reader = new FileReader();
-      reader.onload = () => {
-        setNewCharAvatar(reader.result);
-      };
-      reader.readAsDataURL(file);
+      if (file.path) {
+        setNewCharAvatar(makeLocalFileUrl(file.path));
+      } else {
+        const reader = new FileReader();
+        reader.onload = () => {
+          setNewCharAvatar(reader.result);
+        };
+        reader.readAsDataURL(file);
+      }
     }
   };
 
@@ -1300,6 +1494,26 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         return;
       }
       setNewCharAvatarOriginal((prev) => prev || newCharAvatar);
+      // Try saving to local file to avoid heavy base64 in state
+      if (window.electronAPI?.saveMergedImage && res.dataUrl?.startsWith('data:image/')) {
+        try {
+          const blob = await (await fetch(res.dataUrl)).blob();
+          const bytes = new Uint8Array(await blob.arrayBuffer());
+          const saveRes = await window.electronAPI.saveMergedImage({
+            bytes,
+            ext: 'png',
+            defaultName: `censor_${Date.now()}`,
+            silent: true,
+          });
+          if (saveRes?.ok && saveRes.filePath) {
+            setNewCharAvatar(makeLocalFileUrl(saveRes.filePath));
+            setNewCharAvatarPath(saveRes.filePath);
+            return;
+          }
+        } catch (e) {
+          console.warn('Failed to save auto-censored image to local file, falling back to dataURL:', e);
+        }
+      }
       setNewCharAvatar(res.dataUrl);
       setNewCharAvatarPath('');
     } catch (err) {
@@ -1318,9 +1532,29 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   };
 
   // 手动打码确定后回填到当前编辑表单（需点「保存资产」落库）。
-  const handleApplyManualCensor = (dataUrl) => {
+  const handleApplyManualCensor = async (dataUrl) => {
     if (!dataUrl) return;
     setNewCharAvatarOriginal((prev) => prev || newCharAvatar);
+    // Try saving to local file to avoid heavy base64 in state
+    if (window.electronAPI?.saveMergedImage && dataUrl.startsWith('data:image/')) {
+      try {
+        const blob = await (await fetch(dataUrl)).blob();
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const res = await window.electronAPI.saveMergedImage({
+          bytes,
+          ext: 'png',
+          defaultName: `censor_${Date.now()}`,
+          silent: true,
+        });
+        if (res?.ok && res.filePath) {
+          setNewCharAvatar(makeLocalFileUrl(res.filePath));
+          setNewCharAvatarPath(res.filePath);
+          return;
+        }
+      } catch (e) {
+        console.warn('Failed to save censored image to local file, falling back to dataURL:', e);
+      }
+    }
     setNewCharAvatar(dataUrl);
     setNewCharAvatarPath('');
   };
@@ -1429,6 +1663,83 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       }
     }
   };
+
+  // Handle local image upload for scene/item assets
+  const handleLocalAssetUpload = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      setNewAssetAvatarPath(file.path || '');
+      if (file.path) {
+        setNewAssetAvatar(makeLocalFileUrl(file.path));
+      } else {
+        const reader = new FileReader();
+        reader.onload = () => {
+          setNewAssetAvatar(reader.result);
+        };
+        reader.readAsDataURL(file);
+      }
+    }
+  };
+
+  // Save scene/item asset (create or update)
+  const handleSaveAsset = () => {
+    const isScene = editingAssetType === 'scene';
+    const label = isScene ? '场景' : '物品';
+    const triggerSym = isScene ? '$' : '#';
+    const cleanName = cleanAssetName(newAssetName.trim(), triggerSym);
+    if (!cleanName) {
+      alert(`请输入${label}名称！`);
+      return;
+    }
+
+    const asset = {
+      id: editingAssetId === 'new' ? `${editingAssetType}-${Date.now()}` : editingAssetId,
+      name: cleanName,
+      role: label,
+      avatar: newAssetAvatar,
+      avatarPath: newAssetAvatarPath,
+    };
+
+    if (isScene) {
+      if (editingAssetId === 'new') {
+        setSceneAssets(prev => [...prev, asset]);
+        setEditingAssetId(asset.id);
+      } else {
+        setSceneAssets(prev => prev.map(x => x.id === editingAssetId ? { ...x, ...asset, id: editingAssetId } : x));
+      }
+    } else {
+      if (editingAssetId === 'new') {
+        setItemAssets(prev => [...prev, asset]);
+        setEditingAssetId(asset.id);
+      } else {
+        setItemAssets(prev => prev.map(x => x.id === editingAssetId ? { ...x, ...asset, id: editingAssetId } : x));
+      }
+    }
+    alert(`${label}资产保存成功！现在可在描述词中输入 ${triggerSym} 调用。`);
+  };
+
+  // Delete scene/item asset
+  const handleDeleteAsset = () => {
+    const isScene = editingAssetType === 'scene';
+    const label = isScene ? '场景' : '物品';
+    const assets = isScene ? sceneAssets : itemAssets;
+    const setAssets = isScene ? setSceneAssets : setItemAssets;
+    if (!confirm(`确认删除${label} "${newAssetName}" 吗？`)) return;
+    const remaining = assets.filter(x => x.id !== editingAssetId);
+    setAssets(remaining);
+    if (remaining.length > 0) {
+      setEditingAssetId(remaining[0].id);
+      setNewAssetName(remaining[0].name);
+      setNewAssetAvatar(remaining[0].avatar || '');
+      setNewAssetAvatarPath(remaining[0].avatarPath || '');
+    } else {
+      setEditingAssetId('new');
+      setNewAssetName('');
+      setNewAssetAvatar('');
+      setNewAssetAvatarPath('');
+    }
+  };
+
   const fileToDataUrl = (file) => new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result || ''));
@@ -1484,16 +1795,80 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     alert(`成功！已将生成图片 "${material.name}" 设置为该分镜的视频生成垫图！可以在视频模式下一键发送进行 Image-to-Video 渲染！`);
   };
 
-  // Download a remote video via the local proxy (forces video/mp4 + attachment)
-  const handleDownloadVideo = (url, name = 'video') => {
-    if (!url || !/^https?:\/\//i.test(url)) {
-      alert('该素材不是可下载的远程视频');
+  // Download a video — supports remote URLs (via proxy), local paths (via /local/video), and proxy URLs
+  const handleDownloadVideo = (material, name = 'video') => {
+    const safeName = String(name).replace(/[\\/:*?"<>|]/g, '_');
+    const thumbUrl = material?.thumbnail || '';
+    const sourceUrl = material?.sourceUrl || material?.remoteUrl || '';
+
+    // Try to extract real path/url from proxy service URLs first
+    const extracted = extractRealUrlFromProxy(thumbUrl) || extractRealUrlFromProxy(sourceUrl);
+    let localPath = material?.localPath || extracted?.localPath || localFilePathFromUrlValue(thumbUrl || sourceUrl) || '';
+    let remoteUrl = extracted?.remoteUrl || '';
+    if (!remoteUrl && sourceUrl && /^https?:\/\//i.test(sourceUrl) && !sourceUrl.includes('/local/') && !sourceUrl.includes('/proxy/')) {
+      remoteUrl = sourceUrl;
+    }
+    if (!remoteUrl && thumbUrl && /^https?:\/\//i.test(thumbUrl) && !thumbUrl.includes('/local/') && !thumbUrl.includes('/proxy/')) {
+      remoteUrl = thumbUrl;
+    }
+
+    let downloadUrl = '';
+    if (localPath) {
+      downloadUrl = `${WIZSTAR_API}/local/video?path=${encodeURIComponent(localPath)}&download=1&filename=${encodeURIComponent(safeName + '.mp4')}`;
+    } else if (remoteUrl && /^https?:\/\//i.test(remoteUrl)) {
+      downloadUrl = toDownloadUrl(remoteUrl, `${safeName}.mp4`);
+    } else if (thumbUrl && thumbUrl.startsWith('/local/video')) {
+      downloadUrl = `${thumbUrl}&download=1&filename=${encodeURIComponent(safeName + '.mp4')}`;
+    }
+
+    if (!downloadUrl) {
+      alert('该素材没有可下载的视频地址');
       return;
     }
-    const safeName = String(name).replace(/[\\/:*?"<>|]/g, '_');
     const a = document.createElement('a');
-    a.href = toDownloadUrl(url, `${safeName}.mp4`);
+    a.href = downloadUrl;
     a.download = `${safeName}.mp4`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  // Download an image — supports local paths (via /local/image), remote URLs, and proxy URLs
+  const handleDownloadImage = (material, name = 'image') => {
+    const safeName = String(name).replace(/[\\/:*?"<>|]/g, '_');
+    const thumbUrl = material?.thumbnail || '';
+    const sourceUrl = material?.sourceUrl || material?.remoteUrl || '';
+
+    // Try to extract real path/url from proxy service URLs first
+    const extracted = extractRealUrlFromProxy(thumbUrl) || extractRealUrlFromProxy(sourceUrl);
+    let localPath = material?.localPath || extracted?.localPath || localFilePathFromUrlValue(thumbUrl || sourceUrl) || '';
+    let remoteUrl = extracted?.remoteUrl || '';
+    if (!remoteUrl && sourceUrl && /^https?:\/\//i.test(sourceUrl) && !sourceUrl.includes('/local/') && !sourceUrl.includes('/proxy/')) {
+      remoteUrl = sourceUrl;
+    }
+    if (!remoteUrl && thumbUrl && /^https?:\/\//i.test(thumbUrl) && !thumbUrl.includes('/local/') && !thumbUrl.includes('/proxy/')) {
+      remoteUrl = thumbUrl;
+    }
+
+    let downloadUrl = '';
+    let ext = '.png';
+    if (localPath) {
+      const extMatch = localPath.match(/\.(jpg|jpeg|png|webp|bmp|gif)$/i);
+      if (extMatch) ext = '.' + extMatch[1].toLowerCase();
+      downloadUrl = `${WIZSTAR_API}/local/image?path=${encodeURIComponent(localPath)}&download=1&filename=${encodeURIComponent(safeName + ext)}`;
+    } else if (remoteUrl && /^https?:\/\//i.test(remoteUrl)) {
+      downloadUrl = remoteUrl;
+    } else if (thumbUrl && thumbUrl.startsWith('/local/image')) {
+      downloadUrl = `${thumbUrl}&download=1&filename=${encodeURIComponent(safeName + ext)}`;
+    }
+
+    if (!downloadUrl) {
+      alert('该素材没有可下载的图片地址');
+      return;
+    }
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = `${safeName}${ext}`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -1632,8 +2007,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     const nextPoint = imageEditorPointFromEvent(event);
     if (!canvas || !lastPoint || !nextPoint) return;
     const ctx = canvas.getContext('2d');
-    ctx.strokeStyle = '#ff2f2f';
-    ctx.lineWidth = Math.max(3, Math.round(canvas.width / 160));
+    ctx.strokeStyle = imageEditorColor;
+    ctx.lineWidth = imageEditorLineWidth;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.beginPath();
@@ -1704,7 +2079,13 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
   const saveEditedImage = async () => {
     const canvas = imageEditorCanvasRef.current;
-    if (!canvas || !fullscreenVideo?.rowId) return;
+    if (!canvas || !fullscreenVideo) return;
+    const { rowId, assetType, assetId } = fullscreenVideo;
+    console.log('[saveEditedImage] fullscreenVideo:', { rowId, assetType, assetId, editingCharId, editingAssetId });
+    if (!rowId && !assetId) {
+      console.warn('[saveEditedImage] No rowId or assetId, skipping save');
+      return;
+    }
     if (!window.electronAPI?.saveMergedImage) {
       alert('当前环境不支持本地保存，请在桌面客户端中使用此功能。');
       return;
@@ -1715,17 +2096,57 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         canvas.toBlob((item) => item ? resolve(item) : reject(new Error('图片导出失败')), 'image/png');
       });
       const bytes = await blobToUint8Array(blob);
+      const namePrefix = assetId ? `编辑图片_${assetType}_${assetId}` : `编辑图片_${rowId}`;
       const res = await window.electronAPI.saveMergedImage({
         bytes,
         ext: 'png',
-        defaultName: `编辑图片_${fullscreenVideo.rowId}_${timestampForFilename()}`,
+        defaultName: `${namePrefix}_${timestampForFilename()}`,
         silent: true,
       });
       if (!res?.ok) throw new Error(res?.error || '保存失败');
-      appendEditedImageToRow(fullscreenVideo.rowId, res.filePath);
-      setFullscreenVideo((prev) => prev ? { ...prev, src: makeLocalFileUrl(res.filePath), localPath: res.filePath } : prev);
+      const savedPath = res.filePath;
+      const savedUrl = makeLocalFileUrl(savedPath);
+
+      if (assetId) {
+        // Save back to character/scene/item asset
+        if (assetType === 'character') {
+          if (assetId === 'new' || assetId === editingCharId) {
+            // Updating the currently-edited character (new or existing)
+            setNewCharAvatar(savedUrl);
+            setNewCharAvatarPath(savedPath);
+          }
+          if (assetId !== 'new') {
+            setCharacterAssets((prev) => prev.map((a) => {
+              if (a.id !== assetId) return a;
+              return { ...a, avatar: savedUrl, avatarPath: savedPath, avatarOriginal: a.avatarOriginal || a.avatar };
+            }));
+          }
+        } else if (assetType === 'scene') {
+          if (assetId === editingAssetId) {
+            setNewAssetAvatar(savedUrl);
+            setNewAssetAvatarPath(savedPath);
+          }
+          setSceneAssets((prev) => prev.map((a) => {
+            if (a.id !== assetId) return a;
+            return { ...a, avatar: savedUrl, avatarPath: savedPath, avatarOriginal: a.avatarOriginal || a.avatar };
+          }));
+        } else if (assetType === 'item') {
+          if (assetId === editingAssetId) {
+            setNewAssetAvatar(savedUrl);
+            setNewAssetAvatarPath(savedPath);
+          }
+          setItemAssets((prev) => prev.map((a) => {
+            if (a.id !== assetId) return a;
+            return { ...a, avatar: savedUrl, avatarPath: savedPath, avatarOriginal: a.avatarOriginal || a.avatar };
+          }));
+        }
+      } else if (rowId) {
+        appendEditedImageToRow(rowId, savedPath);
+      }
+
+      setFullscreenVideo((prev) => prev ? { ...prev, src: savedUrl, localPath: savedPath } : prev);
       setImageEditorEnabled(false);
-      alert('已保存为新的当前图片素材');
+      alert('已保存');
     } catch (e) {
       console.warn('Save edited image failed:', e);
       alert(`保存失败：${e.message || e}`);
@@ -1738,6 +2159,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     setImageEditorEnabled(false);
     setImageEditorSaving(false);
     setFullscreenVideo(null);
+    setFullscreenLoading(false);
   };
 
   const imageDragPrepareRef = useRef(new Map());
@@ -1848,9 +2270,19 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
     // Browser fallback: trigger sequential downloads named by index
     for (const item of items) {
+      const dlName = `${item.name || item.index}.${item.ext}`;
+      let dlUrl = '';
+      if (item.localPath) {
+        const isVidItem = /\.(mp4|webm|mov|m4v)$/i.test(item.localPath);
+        const base = isVidItem ? '/local/video' : '/local/image';
+        dlUrl = `${WIZSTAR_API}${base}?path=${encodeURIComponent(item.localPath)}&download=1&filename=${encodeURIComponent(dlName)}`;
+      } else if (item.url && /^https?:\/\//i.test(item.url)) {
+        dlUrl = toDownloadUrl(item.url, dlName);
+      }
+      if (!dlUrl) continue;
       const a = document.createElement('a');
-      a.href = toDownloadUrl(item.url, `${item.name || item.index}.${item.ext}`);
-      a.download = `${item.name || item.index}.${item.ext}`;
+      a.href = dlUrl;
+      a.download = dlName;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -2011,10 +2443,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   };
 
   const parseSceneDuration = (block = '') => {
-    const header = String(block || '').split('\n').find(line => /镜头\s*\d+/i.test(line)) || '';
+    const text = String(block || '');
+    // Try [镜头N / Xs] format first
+    const header = text.split('\n').find(line => /镜头\s*\d+/i.test(line)) || '';
     const match = header.match(/[\[/【]\s*镜头\s*\d+\s*\/\s*(\d+(?:\.\d+)?)\s*s?\s*[\]】]/i);
-    if (!match) return '';
-    return formatDurationLabel(parseDurationSeconds(match[1], 5));
+    if (match) return formatDurationLabel(parseDurationSeconds(match[1], 5));
+    // Fallback: 时长是Xs / 时长: Xs / 时长 Xs
+    const durMatch = text.match(/时长(?:是|[:：])?\s*(\d+(?:\.\d+)?)\s*s?/i);
+    if (durMatch) return formatDurationLabel(parseDurationSeconds(durMatch[1], 5));
+    return '';
   };
 
   const normalizeImportedShotBlock = (block = '') => String(block || '')
@@ -2024,15 +2461,30 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
   const splitPromptByShotHeaders = (raw = '') => {
     const source = String(raw || '');
-    const shotHeaderRegex = /(?:^|\n)\s*(?:\d+\s*[.．、]\s*)?(?:#{1,6}\s*)?[^\n]*?[\[【]\s*镜头\s*\d+\s*\/\s*\d+(?:\.\d+)?\s*s?\s*[\]】][^\n]*/g;
-    const matches = [...source.matchAll(shotHeaderRegex)];
-    if (matches.length === 0) return [];
 
-    return matches.map((match, index) => {
-      const start = match.index + (match[0].startsWith('\n') ? 1 : 0);
-      const end = index + 1 < matches.length ? matches[index + 1].index : source.length;
-      return normalizeImportedShotBlock(source.slice(start, end));
-    }).filter(Boolean);
+    // Pattern 1: [镜头N / Xs] format (existing)
+    const shotHeaderRegex = /(?:^|\n)\s*(?:\d+\s*[.．、]\s*)?(?:#{1,6}\s*)?[^\n]*?[\[【]\s*镜头\s*\d+\s*\/\s*\d+(?:\.\d+)?\s*s?\s*[\]】][^\n]*/g;
+    const shotMatches = [...source.matchAll(shotHeaderRegex)];
+    if (shotMatches.length > 0) {
+      return shotMatches.map((match, index) => {
+        const start = match.index + (match[0].startsWith('\n') ? 1 : 0);
+        const end = index + 1 < shotMatches.length ? shotMatches[index + 1].index : source.length;
+        return normalizeImportedShotBlock(source.slice(start, end));
+      }).filter(Boolean);
+    }
+
+    // Pattern 2: ## 标题 - [分镜N ] format (new)
+    const fenjingHeaderRegex = /(?:^|\n)\s*(?:#{1,6}\s*)?[^\n]*?[\[【]\s*分镜\s*\d+[^\]】]*[\]】][^\n]*/g;
+    const fenjingMatches = [...source.matchAll(fenjingHeaderRegex)];
+    if (fenjingMatches.length > 0) {
+      return fenjingMatches.map((match, index) => {
+        const start = match.index + (match[0].startsWith('\n') ? 1 : 0);
+        const end = index + 1 < fenjingMatches.length ? fenjingMatches[index + 1].index : source.length;
+        return normalizeImportedShotBlock(source.slice(start, end));
+      }).filter(Boolean);
+    }
+
+    return [];
   };
 
   const parseBatchPromptBlocks = (text = '') => {
@@ -2159,12 +2611,131 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         if (cancelled) return;
-        const loadedSegments = asArray(data.data?.segments).map(normalizeSegmentRecord);
+        let loadedSegments = asArray(data.data?.segments).map(normalizeSegmentRecord);
         const loadedChars = asArray(data.data?.character_assets).map((asset) => (
           asset && typeof asset === 'object'
             ? { ...asset }
             : { id: String(asset || ''), name: String(asset || ''), role: '', avatar: '', avatarPath: '' }
         ));
+        // Backfill pendingAccounts from the backend Dola task list for segments that
+        // have pendingTaskIds but no pendingAccounts yet. This recovers the "generating
+        // placeholder cell" state right after refresh, even for older tasks.
+        try {
+          const hasPending = loadedSegments.some(s => {
+            const ids = [...new Set([s.pendingTaskId, ...(s.pendingTaskIds || [])].filter(Boolean))];
+            return ids.length > 0;
+          });
+          if (hasPending) {
+            const tRes = await fetch(`${WIZSTAR_API}/dola/tasks?limit=200`);
+            if (tRes.ok) {
+              const tData = await tRes.json();
+              const byId = new Map(asArray(tData.data).map(t => [t.task_id, t]));
+              const DONE = new Set(['completed', 'failed', 'done', 'succeeded']);
+              loadedSegments = loadedSegments.map(s => {
+                const ids = [...new Set([s.pendingTaskId, ...(s.pendingTaskIds || [])].filter(Boolean))];
+                if (ids.length === 0) return s;
+                // Even if pendingAccounts already exists, correct each entry's
+                // accountId/accountName from the backend task list to fix stale data.
+                if (s.pendingAccounts && s.pendingAccounts.length) {
+                  const corrected = s.pendingAccounts.map(a => {
+                    const t = byId.get(a.taskId);
+                    if (!t) return a;
+                    return {
+                      ...a,
+                      accountId: t.account_id || a.accountId || 0,
+                      accountName: t.account_name || a.accountName || '',
+                    };
+                  });
+                  const changed = corrected.some((a, i) => a.accountId !== s.pendingAccounts[i].accountId);
+                  return changed ? { ...s, pendingAccounts: corrected } : s;
+                }
+                const rebuilt = ids.map(tid => {
+                  const t = byId.get(tid);
+                  if (!t) return null;
+                  if (DONE.has(String(t.status || '').toLowerCase())) return null;
+                  return {
+                    taskId: tid,
+                    accountId: t.account_id || 0,
+                    accountName: t.account_name || '',
+                    conversationId: t.conversation_id || '',
+                    localConversationId: t.local_conversation_id || '',
+                    pageUrl: t.page_url || '',
+                    sendMode: t.send_mode || '',
+                    sendModeLabel: t.send_mode_label || '',
+                    status: t.status || 'processing',
+                    startedAt: Date.now(),
+                  };
+                }).filter(Boolean);
+                if (rebuilt.length === 0) {
+                  // 所有相关任务都已结束：清掉残留的占位格子，避免它们永远转圈
+                  const hasStalePending = (s.pendingAccounts || []).length > 0;
+                  if (!hasStalePending) return s;
+                  return {
+                    ...s,
+                    pendingAccounts: [],
+                    generating: false,
+                  };
+                }
+                const anyActive = ids.some(tid => {
+                  const t = byId.get(tid);
+                  return t && !DONE.has(String(t.status || '').toLowerCase());
+                });
+                // 用重建的活跃账号列表替换，同时清掉 pendingAccounts 里引用已结束任务的残留项
+                const rebuiltTaskIds = new Set(rebuilt.map(r => r.taskId));
+                const preserved = (s.pendingAccounts || []).filter(a =>
+                  !ids.includes(a.taskId) && !rebuiltTaskIds.has(a.taskId)
+                );
+                return {
+                  ...s,
+                  pendingAccounts: [...rebuilt, ...preserved],
+                  generating: anyActive ? true : s.generating,
+                  pendingChannel: s.pendingChannel || 'dola',
+                  generateStatus: anyActive ? (s.generateStatus || 'processing') : s.generateStatus,
+                };
+              });
+            }
+          }
+        } catch (e) {
+          // backfill is best-effort; ignore errors
+        }
+        // Sync corrected accountId from pendingAccounts into the generation task registry
+        // so the poller uses the right account info instead of stale data.
+        try {
+          const reg = readGenerationTaskRegistry();
+          let regChanged = false;
+          loadedSegments.forEach(s => {
+            (s.pendingAccounts || []).forEach(pa => {
+              if (!pa.taskId || !pa.accountId) return;
+              const idx = reg.findIndex(r => r.taskId === pa.taskId);
+              if (idx >= 0 && reg[idx].accountId !== pa.accountId) {
+                reg[idx] = { ...reg[idx], accountId: pa.accountId, accountName: pa.accountName || reg[idx].accountName || '' };
+                regChanged = true;
+              }
+            });
+          });
+          if (regChanged) writeGenerationTaskRegistry(reg);
+        } catch (_) {}
+        // Merge back referenceImage from localStorage cache for segments where
+        // backend data lost the referenceImage (e.g. unmount flush failed).
+        try {
+          const rawLocal = localStorage.getItem(STORAGE_KEY_SEGMENTS);
+          if (rawLocal) {
+            const localSegs = JSON.parse(rawLocal);
+            if (Array.isArray(localSegs)) {
+              const localById = new Map(localSegs.map(s => [String(s.id), s]));
+              loadedSegments = loadedSegments.map(s => {
+                const local = localById.get(String(s.id));
+                if (!local) return s;
+                const hasRefRemote = !!(s.referenceImage && typeof s.referenceImage === 'object' && (s.referenceImage.displayUrl || s.referenceImage.dataUrl || s.referenceImage.remoteUrl || s.referenceImage.localPath));
+                const hasRefLocal = !!(local.referenceImage && typeof local.referenceImage === 'object' && (local.referenceImage.displayUrl || local.referenceImage.dataUrl || local.referenceImage.remoteUrl || local.referenceImage.localPath));
+                if (!hasRefRemote && hasRefLocal) {
+                  return { ...s, referenceImage: local.referenceImage, referenceImagePath: local.referenceImagePath || s.referenceImagePath };
+                }
+                return s;
+              });
+            }
+          }
+        } catch (_) {}
         setSegments(loadedSegments);
         setCharacterAssets(loadedChars);
         localStorage.setItem(STORAGE_KEY_SEGMENTS, JSON.stringify(loadedSegments));
@@ -2203,7 +2774,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       generateProgress: null,
       queuePosition: null,
     }));
-    const persistKey = JSON.stringify({ segments: toSave, character_assets: characterAssets });
+    // Strip base64 data URLs from character avatars to avoid huge persist payloads.
+    // If avatarPath exists, the avatar can be reconstructed via file:// URL on load.
+    const charsToSave = characterAssets.map(c => {
+      if (c.avatar && c.avatar.startsWith('data:image/') && c.avatarPath) {
+        return { ...c, avatar: makeLocalFileUrl(c.avatarPath) };
+      }
+      return c;
+    });
+    const persistKey = JSON.stringify({ segments: toSave, character_assets: charsToSave });
     if (persistKey === lastPersistKeyRef.current) return;
     lastPersistKeyRef.current = persistKey;
     try {
@@ -2215,7 +2794,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         const res = await fetch(`${WIZSTAR_API}/projects/${encodeURIComponent(draftId)}/payload`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ segments: toSave, character_assets: characterAssets }),
+          body: JSON.stringify({ segments: toSave, character_assets: charsToSave }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         onProjectChanged?.();
@@ -2224,8 +2803,64 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       }
     }, 1200);
 
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      // Flush current pending save to backend so changes are not lost when
+      // switching tabs quickly. Use the current closure's toSave/charsToSave
+      // (not lastPersistKeyRef) to avoid flushing a stale state that could
+      // overwrite a newer save.
+      try {
+        fetch(`${WIZSTAR_API}/projects/${encodeURIComponent(draftId)}/payload`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ segments: toSave, character_assets: charsToSave }),
+        }).catch(() => {});
+      } catch (_) {}
+    };
   }, [segments, characterAssets, draftId, STORAGE_KEY_SEGMENTS, WIZSTAR_API, onProjectChanged]);
+
+  // Sync project-level progress/status back to the projects table so the Dashboard
+  // cards reflect real generation progress instead of staying stuck at 0/0.
+  const lastProgressSyncRef = useRef('');
+  useEffect(() => {
+    if (isLoadingProjectRef.current) return;
+    if (draftId === 'default') return;
+
+    const segHasContent = (s) => (String(s.text || '').trim()) || (s.materialsVideo && s.materialsVideo.length) || (s.materialsImage && s.materialsImage.length);
+    const segHasResult = (s) => (s.materialsVideo && s.materialsVideo.length) || (s.materialsImage && s.materialsImage.length);
+    const totalSegs = segments.filter(segHasContent).length;
+    const doneSegs = segments.filter(segHasResult).length;
+    const anyGenerating = segments.some(s => s.generating || s.generateStatus === 'processing' || s.generateStatus === 'pending' || s.generateStatus === 'collecting' || s.generateStatus === 'collectable');
+    const nextProgress = totalSegs > 0 ? `${doneSegs}/${totalSegs}` : '0/0';
+    const nextStatus = totalSegs === 0 ? '未生成' : (doneSegs >= totalSegs ? '已完成' : (doneSegs > 0 || anyGenerating ? '生成中' : '未生成'));
+    const syncKey = `${nextProgress}|${nextStatus}`;
+    if (syncKey === lastProgressSyncRef.current) return;
+    lastProgressSyncRef.current = syncKey;
+
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(`${WIZSTAR_API}/projects/${encodeURIComponent(draftId)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: draftId,
+            title: activeDraft?.title || '',
+            date: activeDraft?.date || '',
+            time: activeDraft?.time || '',
+            collection: activeDraft?.collection || '',
+            thumbnail: activeDraft?.thumbnail || '',
+            progress: nextProgress,
+            status: nextStatus,
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        onProjectChanged?.();
+      } catch (e) {
+        console.warn('Failed to sync project progress:', e);
+      }
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [segments, draftId, activeDraft, WIZSTAR_API, onProjectChanged]);
 
   useEffect(() => {
     if (isLoadingProjectRef.current) return;
@@ -2396,7 +3031,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         pageUrl: nextTask.pageUrl || t.pageUrl || '',
         sendMode: nextTask.sendMode || t.sendMode || '',
         sendModeLabel: nextTask.sendModeLabel || t.sendModeLabel || '',
-        createdAt: t.createdAt || now,
+        createdAt: (nextTask.status === 'collecting' || nextTask.status === 'collectable') ? now : (t.createdAt || now),
       } : t)
       : [...registry, nextTask]);
     startGlobalGenerationPolling();
@@ -2436,6 +3071,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
             if (!taskBelongsToCurrentRow) {
               if (acceptedTaskIds.size === 0 || ['completed', 'failed'].includes(task.status)) {
                 doneIds.add(task.taskId);
+                // 清理残留的占位格子：任务已结束但 pendingAccounts 仍引用它
+                const stale = (nextSeg.pendingAccounts || []).some(a => a.taskId === task.taskId);
+                if (stale) {
+                  rowChanged = true;
+                  nextSeg = {
+                    ...nextSeg,
+                    pendingAccounts: (nextSeg.pendingAccounts || []).filter(a => a.taskId !== task.taskId),
+                  };
+                }
               }
               return;
             }
@@ -2444,13 +3088,16 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
             if (task.status === 'completed' && (completedMediaUrl || completedLocalPath)) {
               doneIds.add(task.taskId);
               rowChanged = true;
+              // Remove this finished task from pendingAccounts so its placeholder cell disappears.
+              nextSeg = { ...nextSeg, pendingAccounts: (nextSeg.pendingAccounts || []).filter(a => a.taskId !== task.taskId) };
               const shouldPromoteResult = !nextSeg.isLocked && task.taskId === primaryTaskId;
               const localPath = completedLocalPath;
               const sourceUrl = task.videoUrl || task.downloadUrl || task.cdnUrl || task.mediaUrl || completedMediaUrl;
-              const playableUrl = localPath ? toLocalVideoUrl(localPath) : toPlayableUrl(sourceUrl || completedMediaUrl);
               const resultPayload = taskPayloadLike(task);
-              const resultMediaType = inferResultMediaType(resultPayload, task, playableUrl);
-              const isVid = resultMediaType === 'video';
+              const isVid = inferResultMediaType(resultPayload, task, sourceUrl || completedMediaUrl) === 'video';
+              const playableUrl = localPath
+                ? (isVid ? toLocalVideoUrl(localPath) : toLocalImageUrl(localPath))
+                : toPlayableUrl(sourceUrl || completedMediaUrl);
               const list = isVid ? nextSeg.materialsVideo : nextSeg.materialsImage;
               const normalizedMediaUrl = (localPath || sourceUrl || playableUrl).split('?')[0];
               const existing = list.find(m => ((m.localPath || m.sourceUrl || m.thumbnail || '').split('?')[0]) === normalizedMediaUrl);
@@ -2501,9 +3148,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               rowChanged = true;
               nextSeg = {
                 ...nextSeg,
+                pendingAccounts: (nextSeg.pendingAccounts || []).filter(a => a.taskId !== task.taskId),
                 generationError: task.error || '生成任务失败，请检查账号、积分、模型或参考图后重试。',
                 lastFailedTaskId: task.taskId,
                 lastFailedChannel: task.channel,
+                lastFailedAccountId: task.accountId || nextSeg.pendingAccountId || 0,
                 lastConversationId: task.conversationId || nextSeg.pendingConversationId || '',
               };
             }
@@ -2514,10 +3163,13 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
             const displayTask = activeTasks[activeTasks.length - 1];
             const nextStatus = ['pending', 'running', 'processing', 'collecting', 'collectable'].includes(displayTask.status) ? displayTask.status : (displayTask.status || 'processing');
             const nextProgress = typeof displayTask.progress === 'number' ? displayTask.progress : nextSeg.generateProgress;
+            // collectable 表示"可手动采集"，不是正在生成：不套全屏转圈遮罩，
+            // 只保留任务信息让 UI 显示"可手动采集"按钮，避免一直卡在"手动采集中..."。
+            const isCollectableOnly = activeTasks.every(t => t.status === 'collectable');
             rowChanged = true;
             nextSeg = {
               ...nextSeg,
-              generating: true,
+              generating: !isCollectableOnly,
               pendingTaskId: displayTask.taskId,
               pendingTaskIds: activeTasks.map(task => task.taskId),
               pendingPrimaryTaskId: nextSeg.pendingPrimaryTaskId || displayTask.taskId,
@@ -2529,12 +3181,30 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               pendingDolaPageUrl: displayTask.pageUrl || nextSeg.pendingDolaPageUrl || '',
               pendingDolaSendMode: displayTask.sendMode || nextSeg.pendingDolaSendMode || '',
               pendingDolaSendModeLabel: displayTask.sendModeLabel || nextSeg.pendingDolaSendModeLabel || '',
+              pendingAccounts: activeTasks.map(t => {
+                const existing = (nextSeg.pendingAccounts || []).find(a => a.taskId === t.taskId);
+                return {
+                  taskId: t.taskId,
+                  accountId: (existing && existing.accountId) || t.accountId || 0,
+                  accountName: (existing && existing.accountName) || t.accountName || '',
+                  conversationId: t.conversationId || (existing && existing.conversationId) || '',
+                  localConversationId: t.localConversationId || (existing && existing.localConversationId) || '',
+                  pageUrl: t.pageUrl || (existing && existing.pageUrl) || '',
+                  sendMode: t.sendMode || (existing && existing.sendMode) || '',
+                  sendModeLabel: t.sendModeLabel || (existing && existing.sendModeLabel) || '',
+                  status: t.status || (existing && existing.status) || 'processing',
+                  startedAt: (existing && existing.startedAt) || Date.now(),
+                };
+              }),
               generateStatus: nextStatus,
               queuePosition: displayTask.queuePosition,
               generateProgress: nextProgress,
               activeTaskCount: activeTasks.length,
             };
           } else if (rowChanged || nextSeg.generating || nextSeg.pendingTaskId) {
+            // NOTE: do NOT clear pendingAccounts here. They are rebuilt from the
+            // backend task list on load and only removed when a task actually
+            // produces a material (handled in the completed branch above).
             nextSeg = {
               ...nextSeg,
               generating: false,
@@ -2747,10 +3417,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     try {
       const accRes = await fetch(`${WIZSTAR_API}/accounts`);
       const accData = await accRes.json();
-      const accounts = (accData.data || []).filter(a => a.status !== 'forbidden');
+      const allAccounts = accData.data || [];
+      const dailyLimited = allAccounts.filter(a => a.status === 'daily_limit');
+      const accounts = allAccounts.filter(a => a.status !== 'forbidden' && a.status !== 'daily_limit');
       const availableAccounts = accounts.filter(a => (a.active_task_count || 0) < (a.max_concurrency || 1));
       if (accounts.length === 0) {
-        alert('没有可用的渠道一账号：账号库为空或账号都已被平台禁用，请注册/切换账号');
+        const msg = dailyLimited.length > 0
+          ? `渠道一账号今日生成次数已达上限（${dailyLimited.length} 个账号被限制），明天自动恢复，请切换其他渠道或添加更多账号`
+          : '没有可用的渠道一账号：账号库为空或账号都已被平台禁用，请注册/切换账号';
+        alert(msg);
         resetRowGenerationState(id);
         return false;
       }
@@ -2834,9 +3509,12 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     } catch (e) {
       console.error('[wizstar] generate failed:', e);
       const msg = e.message || '';
-      const friendlyMsg = msg.toLowerCase().includes('user forbidden')
-        ? '当前渠道一账号已被平台禁用，已自动标记为不可用，请换账号后重试'
-        : msg;
+      let friendlyMsg = msg;
+      if (msg.toLowerCase().includes('user forbidden')) {
+        friendlyMsg = '当前渠道一账号已被平台禁用，已自动标记为不可用，请换账号后重试';
+      } else if (msg.includes('达到上限') || msg.includes('已达上限') || msg.includes('生成次数') || msg.includes('明天再来')) {
+        friendlyMsg = '当前渠道一账号今日生成次数已达上限，已自动限制，明天自动恢复，请换账号或切换其他渠道';
+      }
       if (!silent) alert(`生成失败: ${friendlyMsg}`);
       clearRowGenerationPlaceholder(id);
       return false;
@@ -2934,12 +3612,19 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       ].filter(Boolean);
       const referenceImages = [...new Set(allReferenceImages)];
 
+      const excludeAccountIds = [];
+      const failedAccountId = seg?.pendingAccountId || seg?.lastFailedAccountId || 0;
+      if (failedAccountId && (seg?.generationError || seg?.lastFailedTaskId)) {
+        excludeAccountIds.push(Number(failedAccountId));
+      }
+
       const body = {
         prompt: promptText,
         model,
         ratio,
         duration: durationSec,
         reference_images: referenceImages,
+        exclude_account_ids: excludeAccountIds,
       };
 
       const createRes = await fetch(`${WIZSTAR_API}/dola/tasks/create`, {
@@ -2987,6 +3672,18 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         pendingDolaPageUrl: payload.page_url || '',
         pendingDolaSendMode: payload.send_mode || dolaSendMode,
         pendingDolaSendModeLabel: payload.send_mode_label || dolaSendModeLabel,
+        pendingAccounts: [...(s.pendingAccounts || []).filter(a => a.taskId !== taskId), {
+          taskId,
+          accountId,
+          accountName,
+          conversationId: payload.conversation_id || '',
+          localConversationId: payload.local_conversation_id || '',
+          pageUrl: payload.page_url || '',
+          sendMode: payload.send_mode || dolaSendMode,
+          sendModeLabel: payload.send_mode_label || dolaSendModeLabel,
+          status: payload.status || 'processing',
+          startedAt: Date.now(),
+        }],
         generating: true,
         generateStatus: 'processing',
         activeTaskCount: Math.max(1, [...new Set([...(s.pendingTaskIds || []), taskId])].length),
@@ -3121,6 +3818,58 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       } : seg));
       alert(`手动采集失败: ${e.message || e}`);
     }
+  };
+
+  const [batchCollecting, setBatchCollecting] = useState(false);
+  const handleBatchCollectDolaTasks = async () => {
+    if (batchCollecting) return;
+    // Gather all dola tasks with a conversation_id that are still pending/processing/collectable.
+    const targets = [];
+    segments.forEach(seg => {
+      const conv = seg.pendingConversationId || seg.lastConversationId || '';
+      const taskId = seg.pendingTaskId || (seg.pendingTaskIds || [])[0] || seg.lastFailedTaskId;
+      const accountId = seg.pendingAccountId || 0;
+      if (taskId && conv && seg.pendingChannel === 'dola') {
+        targets.push({ seg, taskId, conversationId: conv, accountId });
+      }
+    });
+    if (targets.length === 0) {
+      alert('没有可批量采集的渠道六任务：需要有 conversation_id 且未完成的 dola 任务。');
+      return;
+    }
+    if (!confirm(`确定要批量采集 ${targets.length} 个渠道六任务吗？`)) return;
+    setBatchCollecting(true);
+    let ok = 0;
+    let fail = 0;
+    await Promise.all(targets.map(async (t) => {
+      try {
+        const res = await fetch(`${WIZSTAR_API}/dola/tasks/${encodeURIComponent(t.taskId)}/collect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ conversation_id: t.conversationId, account_id: t.accountId }),
+        });
+        if (!res.ok) {
+          let errMsg = `HTTP ${res.status}`;
+          try { const err = await res.json(); errMsg = err.detail || errMsg; } catch (_) {}
+          throw new Error(errMsg);
+        }
+        const data = await res.json();
+        const payload = data.data || {};
+        registerGenerationTask(t.seg.id, payload.task_id || t.taskId, 'dola', 'video', {
+          accountId: t.accountId || payload.account_id || 0,
+          conversationId: t.conversationId,
+          status: 'collecting',
+          progress: typeof payload.progress === 'number' ? Math.max(20, payload.progress) : 20,
+        });
+        ok += 1;
+      } catch (e) {
+        fail += 1;
+        console.warn(`[batch-collect] ${t.taskId} failed:`, e);
+      }
+    }));
+    setBatchCollecting(false);
+    alert(`批量采集完成：成功 ${ok} 个${fail > 0 ? `，失败 ${fail} 个` : ''}。`);
+    onProjectChanged?.();
   };
 
   const handleGeneratePixmax = async (id, options = {}) => {
@@ -3488,8 +4237,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
             currentMaterialVideo: {
               id: material.id,
               name: `${material.name} - 备份`,
-              thumbnail: material.thumbnail.replace('&w=120', '&w=500'),
+              thumbnail: material.thumbnail,
               sourceUrl: material.sourceUrl || material.thumbnail,
+              localPath: material.localPath || '',
+              remoteUrl: material.remoteUrl || '',
               mediaType: material.mediaType || (isVideoUrl(material.thumbnail) ? 'video' : 'image'),
               isPlaying: false,
               fps: 25,
@@ -3502,8 +4253,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
             currentMaterialImage: {
               id: material.id,
               name: `${material.name} - 原画`,
-              thumbnail: material.thumbnail.replace('&w=120', '&w=500'),
+              thumbnail: material.thumbnail,
               sourceUrl: material.sourceUrl || material.thumbnail,
+              localPath: material.localPath || '',
+              remoteUrl: material.remoteUrl || '',
               mediaType: material.mediaType || (isVideoUrl(material.thumbnail) ? 'video' : 'image'),
               fps: null,
               duration: material.mediaType === 'video' || isVideoUrl(material.thumbnail) ? '00:05' : '静态图片'
@@ -3923,6 +4676,16 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
             {batchStarting ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
             <span>{batchStarting ? '任务发送中' : (getModelMediaType(globalModel) === 'image' ? '一键发送生图' : '一键发送任务')}</span>
           </button>
+          <button
+            type="button"
+            onClick={handleBatchCollectDolaTasks}
+            disabled={batchCollecting}
+            className="flex items-center space-x-1 px-2.5 py-1 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/40 hover:border-amber-500 rounded text-amber-400 font-bold text-[10px] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            title="一键采集所有有 conversation_id 且未完成的渠道六 Dola 任务"
+          >
+            {batchCollecting ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+            <span>{batchCollecting ? '批量采集中' : '批量采集'}</span>
+          </button>
           <button 
             type="button"
             onClick={openBatchPromptModal}
@@ -4021,7 +4784,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               </button>
             </div>
           )}
-          <div className="grid grid-cols-4 gap-1.5 flex-1 items-stretch">
+          <div className="grid grid-cols-5 gap-1.5 flex-1 items-stretch">
             {/* Tile 1: 选择模型 dropdown trigger */}
             <div 
               onClick={() => setActivePopover(activePopover === 'model' ? null : 'model')}
@@ -4045,7 +4808,19 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               <span className="text-[7px] text-dark-subtle block scale-75 mt-0.5">生成参数</span>
             </div>
 
-            {/* Tile 3: 提示词后缀 */}
+            {/* Tile 3: 提示词前缀 */}
+            <div 
+              onClick={() => setActivePopover(activePopover === 'prefix' ? null : 'prefix')}
+              className={`bg-dark-input hover:bg-dark-bg border p-1.5 rounded-lg text-center flex flex-col justify-center cursor-pointer transition-all relative ${
+                activePopover === 'prefix' ? 'border-brand shadow-[0_0_8px_rgba(16,185,129,0.25)]' : 'border-dark-border hover:border-brand/40'
+              }`}
+            >
+              <span className="absolute -top-1 -right-1 text-[7px] bg-dark-border text-dark-muted px-1 rounded border border-white/5 scale-75">预设</span>
+              <Sparkles className="w-3.5 h-3.5 mx-auto text-brand mb-0.5" />
+              <span className="text-[8px] text-white truncate">{selectedPromptPrefix.name}</span>
+            </div>
+
+            {/* Tile 4: 提示词后缀 */}
             <div 
               onClick={() => setActivePopover(activePopover === 'suffix' ? null : 'suffix')}
               className={`bg-dark-input hover:bg-dark-bg border p-1.5 rounded-lg text-center flex flex-col justify-center cursor-pointer transition-all relative ${
@@ -4057,7 +4832,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               <span className="text-[8px] text-white truncate">{selectedPromptSuffix.name}</span>
             </div>
 
-            {/* Tile 4: 添加音频 */}
+            {/* Tile 5: 添加音频 */}
             <div 
               onClick={() => alert('选择本地音频背景乐')}
               className="bg-dark-input hover:bg-dark-bg border border-dark-border hover:border-brand/40 p-1.5 rounded-lg text-center flex flex-col justify-center cursor-pointer transition-all relative"
@@ -4300,9 +5075,183 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
             </div>
           )}
 
+          {/* POPOVER: 提示词前缀模板 */}
+          {activePopover === 'prefix' && (
+            <div className="absolute top-[102%] left-[100px] w-[420px] max-h-[78vh] overflow-hidden bg-[#1a1b1f] border border-dark-border p-4 rounded-xl shadow-[0_12px_30px_rgba(0,0,0,0.6)] z-50 text-xs text-dark-text animate-in fade-in slide-in-from-top-2 duration-150 flex flex-col">
+              <div className="flex justify-between items-center pb-2 border-b border-dark-border/40 mb-3">
+                <div>
+                  <span className="font-extrabold text-white text-[13px] tracking-wide">提示词前缀模板</span>
+                  <p className="text-[9px] text-dark-muted mt-0.5">选择预设后，生成时会自动追加到每个分镜提示词开头。</p>
+                </div>
+                <button onClick={() => setActivePopover(null)} className="text-dark-subtle hover:text-white text-sm font-bold">✕</button>
+              </div>
+
+              <div className="grid grid-cols-1 gap-2 overflow-y-auto pr-1 max-h-[42vh]">
+                {promptPrefixTemplates.map(tpl => {
+                  const isExpanded = expandedPromptPrefixId === tpl.id;
+                  const prefixText = tpl.prefix || '不追加任何全局前缀。';
+                  const isLongPrefix = prefixText.length > 120;
+                  return (
+                  <button
+                    key={tpl.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedPromptPrefixId(tpl.id);
+                      localStorage.setItem('maocanju_prompt_prefix_id', tpl.id);
+                    }}
+                    className={`p-2.5 rounded-lg border text-left transition-all ${
+                      selectedPromptPrefixId === tpl.id
+                        ? 'border-brand bg-brand/10 shadow-[0_0_8px_rgba(16,185,129,0.15)]'
+                        : 'border-dark-border bg-[#222328] hover:border-dark-subtle hover:bg-dark-card'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-extrabold text-white">{tpl.name}</span>
+                      <div className="flex items-center gap-1.5">
+                        {tpl.id !== 'none' && (
+                          <span
+                            role="button"
+                            tabIndex={0}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              startEditingPromptPrefixTemplate(tpl);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                startEditingPromptPrefixTemplate(tpl);
+                              }
+                            }}
+                            className="px-1.5 py-0.5 rounded text-[9px] font-bold text-dark-muted hover:text-brand hover:bg-brand/10"
+                          >
+                            编辑
+                          </span>
+                        )}
+                        {tpl.id !== 'none' && (
+                          <span
+                            role="button"
+                            tabIndex={0}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              deletePromptPrefixTemplate(tpl.id);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                deletePromptPrefixTemplate(tpl.id);
+                              }
+                            }}
+                            className="px-1.5 py-0.5 rounded text-[9px] font-bold text-dark-muted hover:text-red-300 hover:bg-red-500/10"
+                          >
+                            删除
+                          </span>
+                        )}
+                        {selectedPromptPrefixId === tpl.id && <Check className="w-3.5 h-3.5 text-brand" />}
+                      </div>
+                    </div>
+                    <p className={`text-[9px] text-dark-muted leading-relaxed mt-1 whitespace-pre-wrap break-words ${isExpanded ? 'max-h-40 overflow-y-auto pr-1' : 'line-clamp-3'}`}>{prefixText}</p>
+                    {isLongPrefix && (
+                      <span
+                        role="button"
+                        tabIndex={0}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setExpandedPromptPrefixId(isExpanded ? null : tpl.id);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setExpandedPromptPrefixId(isExpanded ? null : tpl.id);
+                          }
+                        }}
+                        className="inline-flex mt-1 text-[9px] font-bold text-brand hover:text-brand-dark"
+                      >
+                        {isExpanded ? '收起全文' : '展开全文'}
+                      </span>
+                    )}
+                  </button>
+                  );
+                })}
+              </div>
+
+              {isAddingPromptPrefix ? (
+                <div className="mt-3 p-3 rounded-xl border border-brand/40 bg-brand/5 space-y-2 animate-in fade-in slide-in-from-top-1 duration-150">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-extrabold text-white">
+                      {editingPromptPrefixId ? '修改前缀模板' : '添加前缀模板'}
+                    </span>
+                    {editingPromptPrefixId && (
+                      <button
+                        type="button"
+                        onClick={startAddingPromptPrefixTemplate}
+                        className="text-[9px] font-bold text-dark-muted hover:text-brand"
+                      >
+                        改为新增
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    type="text"
+                    value={newPromptPrefixName}
+                    onChange={(e) => setNewPromptPrefixName(e.target.value)}
+                    placeholder="模板名称，例如：中文风格"
+                    className="w-full bg-dark-bg border border-dark-border rounded-lg px-3 py-2 text-[10px] text-white placeholder:text-dark-subtle focus:outline-none focus:border-brand/60"
+                    autoFocus
+                  />
+                  <textarea
+                    value={newPromptPrefixValue}
+                    onChange={(e) => setNewPromptPrefixValue(e.target.value)}
+                    placeholder="前缀内容，例如：高质量电影感画面，"
+                    className="w-full h-20 bg-dark-bg border border-dark-border rounded-lg px-3 py-2 text-[10px] text-white placeholder:text-dark-subtle focus:outline-none focus:border-brand/60 resize-none leading-relaxed"
+                  />
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={savePromptPrefixTemplateForm}
+                      className="flex-1 py-2 rounded-lg bg-brand hover:bg-brand-dark text-black text-[10px] font-extrabold transition-all"
+                    >
+                      {editingPromptPrefixId ? '保存修改' : '保存模板'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={resetPromptPrefixForm}
+                      className="px-3 py-2 rounded-lg bg-dark-input border border-dark-border text-dark-muted hover:text-white hover:border-dark-subtle text-[10px] font-bold"
+                    >
+                      取消
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={startAddingPromptPrefixTemplate}
+                  className="w-full mt-3 py-2 rounded-lg border border-dashed border-brand/60 bg-brand/5 text-brand hover:bg-brand/10 text-[10px] font-extrabold transition-all"
+                >
+                  添加我的前缀模板
+                </button>
+              )}
+
+              <div className="flex items-center justify-between gap-2 mt-3 pt-3 border-t border-dark-border/40">
+                <span className="text-[9px] text-dark-muted leading-relaxed">
+                  选择模板后不会改写分镜文本，只会在点击生成/一键发送时自动带入。
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setActivePopover(null)}
+                  className="shrink-0 px-3 py-2 rounded-lg bg-dark-input border border-dark-border text-dark-muted hover:text-white hover:border-dark-subtle text-[10px] font-bold"
+                >
+                  完成
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* POPOVER: 提示词后缀模板 */}
           {activePopover === 'suffix' && (
-            <div className="absolute top-[102%] left-[155px] w-[420px] max-h-[78vh] overflow-hidden bg-[#1a1b1f] border border-dark-border p-4 rounded-xl shadow-[0_12px_30px_rgba(0,0,0,0.6)] z-50 text-xs text-dark-text animate-in fade-in slide-in-from-top-2 duration-150 flex flex-col">
+            <div className="absolute top-[102%] left-[200px] w-[420px] max-h-[78vh] overflow-hidden bg-[#1a1b1f] border border-dark-border p-4 rounded-xl shadow-[0_12px_30px_rgba(0,0,0,0.6)] z-50 text-xs text-dark-text animate-in fade-in slide-in-from-top-2 duration-150 flex flex-col">
               <div className="flex justify-between items-center pb-2 border-b border-dark-border/40 mb-3">
                 <div>
                   <span className="font-extrabold text-white text-[13px] tracking-wide">提示词后缀模板</span>
@@ -4598,15 +5547,12 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     setNewCharAvatarPath('');
                     setShowCharacterModal(true);
                   } else {
-                    const label = activeAssetSubTab === 'scene' ? '场景' : '物品';
-                    const name = prompt(`请输入新${label}名称:`);
-                    if (name && name.trim()) {
-                      const cleanName = cleanAssetName(name, activeAssetSubTab === 'scene' ? '$' : '#');
-                      if (!cleanName) return;
-                      const asset = { id: `${activeAssetSubTab}-${Date.now()}`, name: cleanName, role: label, avatar: '' };
-                      if (activeAssetSubTab === 'scene') setSceneAssets(prev => [...prev, asset]);
-                      else setItemAssets(prev => [...prev, asset]);
-                    }
+                    setEditingAssetType(activeAssetSubTab);
+                    setEditingAssetId('new');
+                    setNewAssetName('');
+                    setNewAssetAvatar('');
+                    setNewAssetAvatarPath('');
+                    setShowAssetModal(true);
                   }
                 }} 
                 className="hover:text-brand"
@@ -4633,20 +5579,20 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       setShowCharacterModal(true);
                     }
                   } else {
-                    const label = activeAssetSubTab === 'scene' ? '场景' : '物品';
-                    const triggerSym = activeAssetSubTab === 'scene' ? '$' : '#';
                     const assets = activeAssetSubTab === 'scene' ? sceneAssets : itemAssets;
-                    const setAssets = activeAssetSubTab === 'scene' ? setSceneAssets : setItemAssets;
-                    const target = assets[0];
-                    const nextName = prompt(target ? `编辑${label}名称:` : `请输入新${label}名称:`, target?.name || '');
-                    if (!nextName || !nextName.trim()) return;
-                    const cleanName = cleanAssetName(nextName, triggerSym);
-                    if (!cleanName) return;
-                    if (target) {
-                      setAssets(prev => prev.map(x => x.id === target.id ? { ...x, name: cleanName } : x));
+                    setEditingAssetType(activeAssetSubTab);
+                    if (assets[0]) {
+                      setEditingAssetId(assets[0].id);
+                      setNewAssetName(assets[0].name);
+                      setNewAssetAvatar(assets[0].avatar || '');
+                      setNewAssetAvatarPath(assets[0].avatarPath || '');
                     } else {
-                      setAssets(prev => [...prev, { id: `${activeAssetSubTab}-${Date.now()}`, name: cleanName, role: label, avatar: '' }]);
+                      setEditingAssetId('new');
+                      setNewAssetName('');
+                      setNewAssetAvatar('');
+                      setNewAssetAvatarPath('');
                     }
+                    setShowAssetModal(true);
                   }
                 }} 
                 className="hover:text-white"
@@ -4703,12 +5649,12 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               <div className="flex items-center space-x-2 flex-1 overflow-x-auto no-scrollbar pt-1">
                 <button
                   onClick={() => {
-                    const name = prompt(`请输入新${label}名称:`);
-                    if (name && name.trim()) {
-                      const cleanName = cleanAssetName(name, triggerSym);
-                      if (!cleanName) return;
-                      setList(prev => [...prev, { id: `${activeAssetSubTab}-${Date.now()}`, name: cleanName, role: label, avatar: '' }]);
-                    }
+                    setEditingAssetType(activeAssetSubTab);
+                    setEditingAssetId('new');
+                    setNewAssetName('');
+                    setNewAssetAvatar('');
+                    setNewAssetAvatarPath('');
+                    setShowAssetModal(true);
                   }}
                   className="w-7 h-7 rounded-full border border-dashed border-dark-border flex items-center justify-center text-dark-muted hover:text-brand hover:border-brand/40 transition-colors shrink-0"
                   title={`添加新${label}`}
@@ -4736,11 +5682,12 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     </button>
                     <div
                       onClick={() => {
-                        const nextName = prompt(`编辑${label}名称:`, a.name);
-                        if (!nextName || !nextName.trim()) return;
-                        const cleanName = cleanAssetName(nextName, triggerSym);
-                        if (!cleanName) return;
-                        setList(prev => prev.map(x => x.id === a.id ? { ...x, name: cleanName } : x));
+                        setEditingAssetType(activeAssetSubTab);
+                        setEditingAssetId(a.id);
+                        setNewAssetName(a.name);
+                        setNewAssetAvatar(a.avatar || '');
+                        setNewAssetAvatarPath(a.avatarPath || '');
+                        setShowAssetModal(true);
                       }}
                       className="flex flex-col items-center justify-center"
                     >
@@ -4869,7 +5816,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         {segments.map((row) => {
           const isVid = row.type === 'video';
           const currentMaterial = (isVid ? row.currentMaterialVideo : row.currentMaterialImage) || { id: 0, name: '暂无画面', thumbnail: '', duration: '00:00', fps: 0, isPlaying: false };
-          const materials = (isVid ? row.materialsVideo : row.materialsImage) || [];
+          const rawMaterials = (isVid ? row.materialsVideo : row.materialsImage) || [];
+          const materials = rawMaterials.filter(m => {
+            const matIsVideo = m.mediaType === 'video' || isVideoUrl(m.thumbnail || '');
+            return isVid ? matIsVideo : !matIsVideo;
+          });
           const isCurrentPlaying = isVid ? currentMaterial.isPlaying : false;
           const imageSource = currentMaterial.localPath || currentMaterial.sourceUrl || currentMaterial.thumbnail || '';
           const previewUrl = isVid
@@ -4915,7 +5866,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                             setGlobalModel(nextModel);
                             setGenerateChannel(nextChannel);
                             setGlobalAspectRatio(nextAspectRatio);
-                            setSegments(segments.map(s => s.id === row.id ? { ...s, type: 'video', model: nextModel, aspectRatio: nextAspectRatio } : s));
+                            setSegments(prev => prev.map(s => s.id === row.id ? { ...s, type: 'video', model: nextModel, aspectRatio: nextAspectRatio } : s));
                           }}
                           className={`flex items-center space-x-1 px-2.5 py-1 rounded-md font-bold transition-all ${
                             row.type === 'video' ? 'bg-brand text-black shadow-sm' : 'text-dark-muted hover:text-white'
@@ -4935,7 +5886,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                             setGlobalModel(nextModel);
                             setGenerateChannel('oiioii');
                             setGlobalAspectRatio(nextAspectRatio);
-                            setSegments(segments.map(s => s.id === row.id ? { ...s, type: 'image', model: nextModel, aspectRatio: nextAspectRatio } : s));
+                            setSegments(prev => prev.map(s => s.id === row.id ? { ...s, type: 'image', model: nextModel, aspectRatio: nextAspectRatio } : s));
                           }}
                           className={`flex items-center space-x-1 px-2.5 py-1 rounded-md font-bold transition-all ${
                             row.type === 'image' ? 'bg-brand text-black shadow-sm' : 'text-dark-muted hover:text-white'
@@ -5043,70 +5994,33 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       )}
                     </div>
 
-                    {editingRowId === row.id ? (
-                      <textarea
-                        autoFocus
-                        ref={(el) => {
-                          if (el) {
-                            promptTextareaRefs.current[row.id] = el;
-                            requestAnimationFrame(() => resizePromptTextarea(el));
-                          } else delete promptTextareaRefs.current[row.id];
-                        }}
-                        defaultValue={promptDraftsRef.current[row.id] ?? row.text}
-                        onChange={(e) => handleTextareaChange(row.id, e.target.value, e)}
-                        onKeyDown={(e) => handleTextareaKeyDown(row.id, e)}
-                        onBlur={() => {
-                          commitPromptDraft(row.id);
-                          setTimeout(() => {
-                            setEditingRowId(null);
-                            resetAtState();
-                          }, 150);
-                        }}
-                        placeholder="请输入描述词，输入 @ 选择角色、$ 选择场景、# 选择物品..."
-                        className="w-full min-h-[72px] max-h-[260px] bg-transparent text-xs leading-relaxed text-dark-text placeholder-dark-subtle resize-none overflow-y-auto border-none outline-none focus:ring-0 p-0"
-                      />
-                    ) : (
-                      <div 
-                        onClick={() => startEditingPrompt(row)}
-                        className="min-h-[72px] max-h-[260px] w-full cursor-text overflow-y-auto pr-1"
-                        title="点击开始编辑文本"
-                      >
-                        <div className="text-xs text-dark-text leading-relaxed font-normal whitespace-pre-wrap select-text">
-                          {/* Parser: renders （@角色）/（$场景）/（#物品）as colored pill badges */}
-                          {(() => {
-                            const text = row.text || '';
-                            // 捕获形如 （@名字）（$名字）（#名字）或半角括号版本
-                            const parts = text.split(/([（(][@$#][^）)]+[）)])/g);
-
-                            return parts.map((part, i) => {
-                              const m = part.match(/^[（(]([@$#])([^）)]+)[）)]$/);
-                              if (m) {
-                                const sym = m[1];
-                                const rawName = m[2];
-                                const meta = TRIGGERS[sym] || TRIGGERS['@'];
-                                const name = meta.type === 'scene' ? cleanAssetName(rawName, '$') : meta.type === 'item' ? cleanAssetName(rawName, '#') : rawName.trim();
-                                const asset = getAssetsForTrigger(sym).find(a => a.name === name);
-                                const Icon = meta.type === 'scene' ? Mountain : (meta.type === 'item' ? Gamepad2 : null);
-                                return (
-                                  <span key={i} className="inline-flex items-center bg-[#133125] text-white px-2 py-0.5 rounded-full mx-1 align-middle select-none border border-[#10b981]/25 scale-95 animate-fade-in">
-                                    {asset?.avatar ? (
-                                      <img src={asset.avatar} className="w-3.5 h-3.5 rounded-full object-cover mr-1" />
-                                    ) : (
-                                      <span className="w-3.5 h-3.5 rounded-full bg-black/40 flex items-center justify-center mr-1">
-                                        {Icon ? <Icon className="w-2 h-2 text-[#10b981]" /> : <span className="text-[7px] text-[#10b981] font-bold">{sym}</span>}
-                                      </span>
-                                    )}
-                                    <span className="text-[8px] bg-black/40 text-[#10b981] px-1 rounded mr-1 scale-90 font-bold">{meta.label}</span>
-                                    <span className="font-bold text-[10px] text-[#10b981]">{name}</span>
-                                  </span>
-                                );
-                              }
-                              return <span key={i}>{part}</span>;
-                            });
-                          })()}
-                        </div>
-                      </div>
-                    )}
+                    <textarea
+                      ref={(el) => {
+                        if (el) {
+                          promptTextareaRefs.current[row.id] = el;
+                          if (editingRowId === row.id) requestAnimationFrame(() => resizePromptTextarea(el));
+                        } else delete promptTextareaRefs.current[row.id];
+                      }}
+                      defaultValue={promptDraftsRef.current[row.id] ?? row.text}
+                      onChange={(e) => handleTextareaChange(row.id, e.target.value, e)}
+                      onKeyDown={(e) => handleTextareaKeyDown(row.id, e)}
+                      onFocus={() => {
+                        if (editingRowId !== row.id) {
+                          promptDraftsRef.current[row.id] = promptDraftsRef.current[row.id] ?? row.text ?? '';
+                          setEditingRowId(row.id);
+                          resizePromptTextareaById(row.id);
+                        }
+                      }}
+                      onBlur={() => {
+                        commitPromptDraft(row.id);
+                        setTimeout(() => {
+                          setEditingRowId(null);
+                          resetAtState();
+                        }, 150);
+                      }}
+                      placeholder="请输入描述词，输入 @ 选择角色、$ 选择场景、# 选择物品..."
+                      className="w-full min-h-[72px] max-h-[260px] bg-transparent text-xs leading-relaxed text-dark-text placeholder-dark-subtle resize-none overflow-y-auto border-none outline-none focus:ring-0 p-0 cursor-text"
+                    />
 
                     {/* Autocomplete @ / $ / # asset choice popover */}
                     {atState.isOpen && atState.rowId === row.id && (() => {
@@ -5217,7 +6131,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       onClick={() => {
                         const currentChannel = row.channel || 'API';
                         const nextChannel = currentChannel === 'API' ? '本地' : 'API';
-                        setSegments(segments.map(s => s.id === row.id ? { ...s, channel: nextChannel } : s));
+                        setSegments(prev => prev.map(s => s.id === row.id ? { ...s, channel: nextChannel } : s));
                       }}
                       className="bg-[#222328] hover:bg-dark-bg border border-dark-border hover:border-brand/40 px-2.5 py-1.5 rounded-lg text-dark-muted font-bold cursor-pointer transition-colors flex items-center space-x-1.5 uppercase scale-95"
                       title="点击切换渠道"
@@ -5247,15 +6161,14 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       <Combine className="w-3 h-3" />
                       <span>合并图片</span>
                     </button>
-                    {/* Reasoning button */}
+                    {/* Browser collect button */}
                     <button 
                       type="button"
-                      onClick={() => {
-                        alert(`正在对分镜行 ${row.id} 描述词进行大模型智能推理扩写...\n成功优化语义！已开启多角色动作衔接特征。`);
-                      }}
+                      onClick={() => handleCollectDolaTask(row)}
                       className="px-3 py-1.5 bg-[#162923] hover:bg-[#1f3a2f] border border-[#1a3d31] text-[#10b981] font-bold rounded-lg text-[11px] transition-colors"
+                      title="打开浏览器采集 Dola 视频结果（浏览器优先，API 回退）"
                     >
-                      推理
+                      浏览器采集
                     </button>
 
                     {/* Generate button */}
@@ -5347,6 +6260,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       const previewSrc = isVid
                         ? playableUrlForMaterial(currentMaterial)
                         : previewUrl;
+                      setFullscreenLoading(isVid);
                       setFullscreenVideo({
                         src: previewSrc,
                         fallbackSrc: isVid ? playableFallbackUrlForMaterial(currentMaterial) : '',
@@ -5403,19 +6317,6 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   {row.generating && (
                     <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-zinc-950/80 backdrop-blur-[2px] px-5 space-y-2.5">
                       <RefreshCw className="w-5 h-5 text-brand animate-spin" />
-                      {row.pendingChannel === 'dola' && (row.pendingAccountName || row.pendingAccountId) && (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleOpenDolaAccountBrowser(row);
-                          }}
-                          className="max-w-full rounded-full border border-brand/35 bg-brand/10 px-2.5 py-1 text-[9px] font-extrabold text-brand hover:bg-brand hover:text-black transition-all truncate"
-                          title="点击打开这个渠道六账号的浏览器窗口"
-                        >
-                          {row.pendingAccountName || `Dola账号 #${row.pendingAccountId}`}
-                        </button>
-                      )}
                       <span className="text-[10px] font-bold text-white">
                         {row.activeTaskCount > 1
                           ? `${row.activeTaskCount} 个任务生成中...`
@@ -5480,8 +6381,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         const previewSrc = isVid
                           ? playableUrlForMaterial(currentMaterial)
                           : (currentMaterial.sourceUrl || currentMaterial.remoteUrl || (currentMaterial.localPath ? makeLocalFileUrl(currentMaterial.localPath) : '') || currentMaterial.thumbnail);
+                        setFullscreenLoading(isVid);
                         setFullscreenVideo({
                           src: previewSrc,
+                          fallbackSrc: isVid ? playableFallbackUrlForMaterial(currentMaterial) : '',
                           mediaType: currentMaterial.mediaType || (isVideoUrl(previewSrc) ? 'video' : 'image'),
                           rowId: row.id,
                           materialId: currentMaterial.id,
@@ -5495,12 +6398,19 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     </button>
                   )}
 
-                  {/* Download button (video only, remote http) */}
-                  {currentMaterial.thumbnail && isVid && /^https?:\/\//i.test(currentMaterial.thumbnail) && (
+                  {/* Download button (video and image, local and remote) */}
+                  {currentMaterial.thumbnail && currentMaterial.id > 0 && (
                     <button
-                      onClick={() => handleDownloadVideo(currentMaterial.thumbnail, `${row.id}-${currentMaterial.name || 'video'}`)}
+                      onClick={() => {
+                        const dlName = `${row.id}-${currentMaterial.name || (isVid ? 'video' : 'image')}`;
+                        if (isVid) {
+                          handleDownloadVideo(currentMaterial, dlName);
+                        } else {
+                          handleDownloadImage(currentMaterial, dlName);
+                        }
+                      }}
                       className="absolute top-2 right-10 p-1.5 rounded-md bg-black/60 hover:bg-brand text-white/70 hover:text-black opacity-0 group-hover/viewport:opacity-100 transition-all"
-                      title="下载视频"
+                      title={isVid ? '下载视频' : '下载图片'}
                     >
                       <Download className="w-3.5 h-3.5" />
                     </button>
@@ -5540,39 +6450,138 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     <span className="text-[10px] font-bold text-dark-muted">可选备选帧</span>
                     <span className="text-[9px] text-dark-subtle">({materials.length})</span>
                   </div>
-                  {/* Clean local upload trigger on header */}
-                  <button 
-                    onClick={() => {
-                      const name = prompt('请输入导入的本地素材名称:', `本地导入素材_${Date.now().toString().slice(-4)}.${isVid ? 'mp4' : 'jpg'}`);
-                      if (name) {
-                        const newMatId = Math.max(...materials.map(m => m.id)) + 1;
-                        const newMat = {
-                          id: newMatId,
-                          name,
-                          thumbnail: isVid ? 'https://images.unsplash.com/photo-1492691527719-9d1e07e534b4?auto=format&fit=crop&q=80&w=120' : 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?auto=format&fit=crop&q=80&w=120',
-                          status: 'new',
-                          textStatus: isVid ? '+ 拖拽' : '原画',
-                          mediaType: isVid ? 'video' : 'image'
-                        };
-                        setSegments(segments.map(s => {
-                          if (s.id === row.id) {
-                            return isVid 
-                              ? { ...s, materialsVideo: [newMat, ...s.materialsVideo] }
-                              : { ...s, materialsImage: [newMat, ...s.materialsImage] };
-                          }
-                          return s;
-                        }));
-                      }
-                    }}
-                    className="text-[9px] text-brand hover:text-brand-light font-bold bg-dark-card border border-dark-border hover:border-brand/40 px-1.5 py-0.5 rounded transition-all shrink-0"
-                    title="导入本地文件"
-                  >
-                    + 导入
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {/* 清理卡住的生成中占位格子（失败任务残留） */}
+                    {(row.pendingAccounts || []).filter(a => a.accountId || a.accountName).length > 0 && (
+                      <button
+                        onClick={() => {
+                          if (!confirm('确定清理本行所有「生成中」占位格子吗？\n这只会移除转圈的占位格子，不会影响已生成的素材。')) return;
+                          setSegments(prev => prev.map(s => {
+                            if (s.id !== row.id) return s;
+                            return {
+                              ...s,
+                              pendingAccounts: [],
+                              generating: false,
+                              generateStatus: null,
+                              generateProgress: null,
+                              pendingTaskId: null,
+                              pendingTaskIds: [],
+                              pendingPrimaryTaskId: '',
+                              pendingAccountId: 0,
+                              pendingAccountName: '',
+                              pendingConversationId: '',
+                              pendingLocalConversationId: '',
+                              pendingDolaPageUrl: '',
+                              pendingDolaSendMode: '',
+                              pendingDolaSendModeLabel: '',
+                              queuePosition: null,
+                              activeTaskCount: 0,
+                            };
+                          }));
+                        }}
+                        className="text-[9px] text-dark-muted hover:text-red-300 font-bold bg-dark-card border border-dark-border hover:border-red-400/40 px-1.5 py-0.5 rounded transition-all"
+                        title="清理本行所有卡住的「生成中」占位格子（失败任务残留）"
+                      >
+                        清空转圈
+                      </button>
+                    )}
+                    {/* Clean local upload trigger on header */}
+                    <button 
+                      onClick={() => {
+                        const name = prompt('请输入导入的本地素材名称:', `本地导入素材_${Date.now().toString().slice(-4)}.${isVid ? 'mp4' : 'jpg'}`);
+                        if (name) {
+                          const newMatId = Math.max(...materials.map(m => m.id)) + 1;
+                          const newMat = {
+                            id: newMatId,
+                            name,
+                            thumbnail: isVid ? 'https://images.unsplash.com/photo-1492691527719-9d1e07e534b4?auto=format&fit=crop&q=80&w=120' : 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?auto=format&fit=crop&q=80&w=120',
+                            status: 'new',
+                            textStatus: isVid ? '+ 拖拽' : '原画',
+                            mediaType: isVid ? 'video' : 'image'
+                          };
+                          setSegments(prev => prev.map(s => {
+                            if (s.id === row.id) {
+                              return isVid 
+                                ? { ...s, materialsVideo: [newMat, ...s.materialsVideo] }
+                                : { ...s, materialsImage: [newMat, ...s.materialsImage] };
+                            }
+                            return s;
+                          }));
+                        }
+                      }}
+                      className="text-[9px] text-brand hover:text-brand-light font-bold bg-dark-card border border-dark-border hover:border-brand/40 px-1.5 py-0.5 rounded transition-all shrink-0"
+                      title="导入本地文件"
+                    >
+                      + 导入
+                    </button>
+                  </div>
                 </div>
 
                 {/* Materials grid container - 2x2 forcing height */}
                 <div className="grid grid-cols-2 gap-1.5 h-[156px] overflow-y-auto no-scrollbar pb-1 relative">
+                  
+                  {/* Generating placeholder cells: one per pending Dola account, with "open browser" button */}
+                  {(row.pendingAccounts || []).filter(a => a.accountId || a.accountName).map((acc) => (
+                    <div
+                      key={`gen-${acc.taskId}`}
+                      className="relative rounded-lg border border-brand/40 bg-brand/5 overflow-hidden h-[74px] flex flex-col items-center justify-center"
+                    >
+                      <div className="absolute inset-0 bg-gradient-to-br from-brand/10 to-transparent animate-pulse" />
+                      <RefreshCw className="w-3.5 h-3.5 text-brand animate-spin relative z-10 mb-1" />
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleOpenDolaAccountBrowser({
+                            id: row.id,
+                            pendingAccountId: acc.accountId,
+                            pendingAccountName: acc.accountName,
+                            pendingTaskId: acc.taskId,
+                            pendingConversationId: acc.conversationId,
+                          });
+                        }}
+                        className="relative z-10 max-w-full truncate rounded-full border border-brand/50 bg-brand/15 px-1.5 py-0.5 text-[8px] font-extrabold text-brand hover:bg-brand hover:text-black transition-all"
+                        title={`点击打开账号 ${acc.accountName || '#' + acc.accountId} 的 Dola 浏览器`}
+                      >
+                        {(() => {
+                          const name = acc.accountName || '';
+                          const match = name.match(/#(\d+)/);
+                          return match ? `#${match[1]}` : (name || `#${acc.accountId}`);
+                        })()}
+                      </button>
+                    </div>
+                  ))}
+
+                  {/* Generic generating placeholder for non-Dola channels (shows progress bar) */}
+                  {row.generating && (row.pendingAccounts || []).filter(a => a.accountId || a.accountName).length === 0 && (
+                    <div
+                      key={`gen-generic-${row.id}`}
+                      className="relative rounded-lg border border-brand/40 bg-brand/5 overflow-hidden h-[74px] flex flex-col items-center justify-center"
+                    >
+                      <div className="absolute inset-0 bg-gradient-to-br from-brand/10 to-transparent animate-pulse" />
+                      <RefreshCw className="w-3.5 h-3.5 text-brand animate-spin relative z-10 mb-1" />
+                      <span className="relative z-10 text-[8px] font-bold text-brand mb-1 truncate max-w-full px-1">
+                        {row.activeTaskCount > 1
+                          ? `${row.activeTaskCount} 个任务`
+                          : row.queuePosition != null && row.queuePosition > 0
+                          ? `排队 #${row.queuePosition}`
+                          : row.generateStatus === 'collecting' ? '采集中'
+                          : (typeof row.generateProgress === 'number' && row.generateProgress > 0
+                              ? `生成中 ${row.generateProgress}%`
+                              : '生成中...')}
+                      </span>
+                      <div className="relative z-10 w-[80%] h-1 rounded-full bg-dark-border/60 overflow-hidden">
+                        {typeof row.generateProgress === 'number' && row.generateProgress > 0 ? (
+                          <div
+                            className="h-full bg-brand rounded-full transition-all duration-500 ease-out shadow-[0_0_6px_rgba(16,185,129,0.5)]"
+                            style={{ width: `${Math.min(100, Math.max(2, row.generateProgress))}%` }}
+                          />
+                        ) : (
+                          <div className="h-full w-1/3 bg-brand/70 rounded-full animate-pulse" />
+                        )}
+                      </div>
+                    </div>
+                  )}
                   
                   {/* Candidates items in 2x2 grid */}
                   {materials.map((mat) => {
@@ -5590,8 +6599,13 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         onClick={() => handleSelectCandidateMaterial(row.id, mat)}
                         onDoubleClick={(e) => {
                           e.stopPropagation();
-                          if (matThumb) setFullscreenVideo({
-                            src: matThumb,
+                          if (!matThumb) return;
+                          const isVidMat = mat.mediaType === 'video' || isVideoUrl(matThumb);
+                          const fullSrc = isVidMat ? playableUrlForMaterial(mat) : matThumb;
+                          setFullscreenLoading(isVidMat);
+                          setFullscreenVideo({
+                            src: fullSrc,
+                            fallbackSrc: isVidMat ? playableFallbackUrlForMaterial(mat) : '',
                             mediaType: mat.mediaType || (isVideoUrl(matThumb) ? 'video' : 'image'),
                             rowId: row.id,
                             materialId: mat.id,
@@ -5866,7 +6880,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                             isActive ? 'bg-[#323338]/30 border-[#10b981]/40 text-brand' : 'hover:bg-[#1c1d22]/40 border-transparent text-dark-text'
                           }`}
                         >
-                          <img src={char.avatar} alt={char.name} className="w-7 h-7 rounded-full object-cover border border-dark-border/20 shrink-0" />
+                          <img
+                            src={char.avatar}
+                            alt={char.name}
+                            className="w-7 h-7 rounded-full object-cover border border-dark-border/20 shrink-0"
+                            onDoubleClick={(e) => {
+                              e.stopPropagation();
+                              if (char.avatar) setFullscreenVideo({ src: char.avatar, mediaType: 'image', materialName: char.name, assetType: 'character', assetId: char.id });
+                            }}
+                          />
                           <div className="flex-1 min-w-0">
                             <div className="text-xs font-bold truncate">{char.name}</div>
                             <div className="text-[9px] text-dark-subtle truncate">{char.role || '无标签'}</div>
@@ -5907,7 +6929,24 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       <div className="w-32 h-32 relative rounded-xl border border-dashed border-dark-border/80 hover:border-brand/40 bg-dark-input/20 flex flex-col items-center justify-center overflow-hidden cursor-pointer group transition-colors shrink-0">
                         {newCharAvatar ? (
                           <div className="w-full h-full relative">
-                            <img src={newCharAvatar} alt="upload preview" className="w-full h-full object-cover" />
+                            <img
+                              src={newCharAvatar}
+                              alt="upload preview"
+                              className="w-full h-full object-cover"
+                              onDoubleClick={(e) => {
+                                e.stopPropagation();
+                                setFullscreenVideo({ src: newCharAvatar, mediaType: 'image', materialName: newCharName, assetType: 'character', assetId: editingCharId });
+                              }}
+                            />
+                            {charGridOverlay && (
+                              <div
+                                className="absolute inset-0 pointer-events-none"
+                                style={{
+                                  backgroundImage: `linear-gradient(to right, rgba(255,255,255,0.3) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.3) 1px, transparent 1px)`,
+                                  backgroundSize: '10% 10%',
+                                }}
+                              />
+                            )}
                             <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex flex-col items-center justify-center space-y-1 text-[9px] text-white transition-opacity">
                               <span>更换本地图片</span>
                               <span className="text-[7px] text-dark-subtle">点击选择文件</span>
@@ -5924,6 +6963,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                           type="file"
                           accept="image/*"
                           onChange={handleLocalAvatarUpload}
+                          onDoubleClick={(e) => { e.stopPropagation(); e.preventDefault(); }}
                           className="absolute inset-0 opacity-0 cursor-pointer z-10"
                         />
                       </div>
@@ -5931,6 +6971,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         支持 PNG, JPG, WebP 格式<br />点击自动导入本地特征图
                       </div>
                       <div className="flex flex-wrap items-center justify-center gap-1.5 mt-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setCharGridOverlay((v) => !v)}
+                          disabled={!newCharAvatar}
+                          title="切换 10x10 宫格辅助线"
+                          className={`px-2 py-1 rounded-md text-[10px] font-bold transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${charGridOverlay ? 'bg-brand/20 border border-brand/50 text-brand' : 'bg-dark-input border border-dark-border text-dark-text hover:text-white hover:border-brand/40'}`}
+                        >
+                          宫格
+                        </button>
                         <button
                           type="button"
                           onClick={handleCensorCurrentCharacter}
@@ -5948,6 +6997,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                           className="px-2 py-1 rounded-md bg-dark-input border border-dark-border text-[10px] font-bold text-dark-text hover:text-white hover:border-brand/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                         >
                           手动打码
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setGridMaskOpen(true)}
+                          disabled={censorProgress.running || !newCharAvatar}
+                          title="用网格方块遮挡面部，可拖动定位、调大小和格数"
+                          className="px-2 py-1 rounded-md bg-dark-input border border-dark-border text-[10px] font-bold text-dark-text hover:text-white hover:border-brand/40 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        >
+                          网格遮罩
                         </button>
                         {newCharAvatarOriginal && (
                           <button
@@ -6024,12 +7082,208 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         </div>
       )}
 
+      {/* Scene/Item Asset Manager Modal */}
+      {showAssetModal && (() => {
+        const isScene = editingAssetType === 'scene';
+        const label = isScene ? '场景' : '物品';
+        const triggerSym = isScene ? '$' : '#';
+        const assets = isScene ? sceneAssets : itemAssets;
+        const AssetIcon = isScene ? Mountain : Gamepad2;
+        return (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[100] select-none">
+          <div className="w-[640px] h-[460px] bg-[#1a1b1f] border border-dark-border/80 rounded-xl shadow-[0_20px_50px_rgba(0,0,0,0.7)] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+
+            {/* Titlebar */}
+            <div className="h-10 bg-[#111214] border-b border-dark-border px-4 flex items-center justify-between shrink-0">
+              <div className="flex items-center space-x-2">
+                <span className="w-2.5 h-2.5 rounded-full bg-brand animate-pulse" />
+                <span className="text-xs font-bold text-dark-text">{label}资产管理器</span>
+              </div>
+              <button
+                onClick={() => setShowAssetModal(false)}
+                className="text-dark-muted hover:text-white text-base hover:bg-white/10 w-6 h-6 rounded flex items-center justify-center transition-colors"
+              >
+                ✕
+              </button>
+            </div>
+
+            {/* Main Content Area */}
+            <div className="flex-1 flex overflow-hidden">
+
+              {/* Left List Pane */}
+              <div className="w-[200px] border-r border-dark-border/40 bg-[#15161a] p-3 flex flex-col justify-between overflow-y-auto no-scrollbar shrink-0">
+                <div className="space-y-1.5 flex-1 flex flex-col min-h-0">
+                  <div className="text-[10px] text-dark-muted font-bold px-1 uppercase tracking-wider">当前{label}资产 ({assets.length})</div>
+                  <div className="space-y-1 mt-2 flex-1 overflow-y-auto no-scrollbar">
+                    {assets.map((a) => {
+                      const isActive = editingAssetId === a.id;
+                      return (
+                        <div
+                          key={a.id}
+                          onClick={() => {
+                            setEditingAssetId(a.id);
+                            setNewAssetName(a.name);
+                            setNewAssetAvatar(a.avatar || '');
+                            setNewAssetAvatarPath(a.avatarPath || '');
+                          }}
+                          className={`flex items-center space-x-2.5 p-2 rounded-lg cursor-pointer transition-all border ${
+                            isActive ? 'bg-[#323338]/30 border-[#10b981]/40 text-brand' : 'hover:bg-[#1c1d22]/40 border-transparent text-dark-text'
+                          }`}
+                        >
+                          {a.avatar ? (
+                            <img
+                              src={a.avatar}
+                              alt={a.name}
+                              className="w-7 h-7 rounded-full object-cover border border-dark-border/20 shrink-0"
+                              onDoubleClick={(e) => {
+                                e.stopPropagation();
+                                setFullscreenVideo({ src: a.avatar, mediaType: 'image', materialName: a.name, assetType: editingAssetType, assetId: a.id });
+                              }}
+                            />
+                          ) : (
+                            <span className="w-7 h-7 rounded-full border border-dark-border/20 bg-[#18191c] flex items-center justify-center shrink-0">
+                              <AssetIcon className="w-3.5 h-3.5 text-dark-muted" />
+                            </span>
+                          )}
+                          <div className="flex-1 min-w-0">
+                            <div className="text-xs font-bold truncate">{a.name}</div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingAssetId('new');
+                    setNewAssetName('');
+                    setNewAssetAvatar('');
+                    setNewAssetAvatarPath('');
+                  }}
+                  className="w-full py-1.5 rounded-lg bg-dark-card border border-dashed border-dark-border hover:border-brand/40 text-xs font-bold text-dark-muted hover:text-brand transition-colors flex items-center justify-center space-x-1 mt-3 shrink-0"
+                >
+                  <span>+ 新增{label}资产</span>
+                </button>
+              </div>
+
+              {/* Right Detail Pane */}
+              <div className="flex-1 p-5 flex flex-col justify-between bg-[#1e1f24]/30 overflow-y-auto no-scrollbar">
+                <div className="space-y-4">
+                  <div className="text-[10px] text-dark-muted font-bold uppercase tracking-wider">
+                    {editingAssetId === 'new' ? `✨ 新增${label}资产` : `📝 编辑${label}资产`}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    {/* Image Selector Slot */}
+                    <div className="space-y-1.5 flex flex-col items-center">
+                      <label className="text-[10px] text-dark-muted self-start font-bold">{label}图片</label>
+                      <div className="w-32 h-32 relative rounded-xl border border-dashed border-dark-border/80 hover:border-brand/40 bg-dark-input/20 flex flex-col items-center justify-center overflow-hidden cursor-pointer group transition-colors shrink-0">
+                        {newAssetAvatar ? (
+                          <div className="w-full h-full relative">
+                            <img
+                              src={newAssetAvatar}
+                              alt="upload preview"
+                              className="w-full h-full object-cover"
+                              onDoubleClick={(e) => {
+                                e.stopPropagation();
+                                setFullscreenVideo({ src: newAssetAvatar, mediaType: 'image', materialName: newAssetName, assetType: editingAssetType, assetId: editingAssetId });
+                              }}
+                            />
+                            <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex flex-col items-center justify-center space-y-1 text-[9px] text-white transition-opacity">
+                              <span>更换本地图片</span>
+                              <span className="text-[7px] text-dark-subtle">点击选择文件</span>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex flex-col items-center text-center p-2 text-dark-subtle">
+                            <Plus className="w-6 h-6 text-dark-muted group-hover:text-brand" />
+                            <span className="text-[9px] mt-1">本地图片</span>
+                          </div>
+                        )}
+                        <input
+                          type="file"
+                          accept="image/*"
+                          onChange={handleLocalAssetUpload}
+                          onDoubleClick={(e) => { e.stopPropagation(); e.preventDefault(); }}
+                          className="absolute inset-0 opacity-0 cursor-pointer z-10"
+                        />
+                      </div>
+                      <div className="text-[8px] text-dark-subtle mt-1 text-center leading-tight">
+                        支持 PNG, JPG, WebP 格式<br />点击导入本地{label}图片
+                      </div>
+                    </div>
+
+                    {/* Form inputs */}
+                    <div className="space-y-3.5 flex flex-col justify-center">
+                      <div className="space-y-1">
+                        <label className="text-[10px] text-dark-muted font-bold">{label}名称 ({triggerSym}触发名称)</label>
+                        <input
+                          type="text"
+                          value={newAssetName}
+                          onChange={(e) => setNewAssetName(e.target.value)}
+                          placeholder={`例如: ${isScene ? '森林, 城堡, 街道' : '宝剑, 药瓶, 信件'}`}
+                          className="w-full bg-[#18191c] border border-dark-border rounded-lg px-2.5 py-1.5 text-xs text-dark-text placeholder-dark-subtle focus:border-brand/50 focus:ring-0 outline-none"
+                        />
+                      </div>
+                      <div className="text-[9px] text-dark-subtle leading-relaxed">
+                        在描述词中输入 <span className="text-brand font-bold">{triggerSym}</span> 可触发调用该{label}图片作为垫图。
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Action buttons */}
+                <div className="flex items-center justify-end space-x-2 border-t border-dark-border/20 pt-3 mt-4 shrink-0">
+                  {editingAssetId !== 'new' && (
+                    <button
+                      type="button"
+                      onClick={handleDeleteAsset}
+                      className="px-3 py-1.5 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 hover:bg-red-500 hover:text-white transition-all text-xs font-bold mr-auto"
+                    >
+                      删除{label}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setShowAssetModal(false)}
+                    className="px-4 py-1.5 rounded-lg bg-[#222328] border border-dark-border text-xs font-bold text-dark-text hover:bg-[#2d2e33] transition-colors"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSaveAsset}
+                    className="px-4 py-1.5 rounded-lg bg-brand text-xs font-bold text-black hover:bg-brand/90 transition-colors shadow-[0_0_8px_rgba(16,185,129,0.3)]"
+                  >
+                    保存资产
+                  </button>
+                </div>
+
+              </div>
+
+            </div>
+
+          </div>
+        </div>
+        );
+      })()}
+
       {/* 手动打码弹窗 */}
       <FaceCensorModal
         open={manualCensorOpen}
         src={newCharAvatarOriginal || newCharAvatar}
         onApply={handleApplyManualCensor}
         onClose={() => setManualCensorOpen(false)}
+      />
+
+      {/* 网格遮罩弹窗 */}
+      <GridMaskModal
+        open={gridMaskOpen}
+        src={newCharAvatarOriginal || newCharAvatar}
+        onApply={handleApplyManualCensor}
+        onClose={() => setGridMaskOpen(false)}
       />
 
       {/* Fullscreen Video/Image Preview Modal */}
@@ -6045,7 +7299,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
             <X className="w-5 h-5" />
           </button>
           {!(fullscreenVideo.mediaType === 'video' || isVideoUrl(fullscreenVideo.src)) && (
-            <div className="absolute top-4 right-16 flex items-center space-x-2">
+            <div className="absolute top-4 right-16 flex items-center space-x-2 flex-wrap justify-end max-w-[40%]">
               <button
                 onClick={(e) => { e.stopPropagation(); setImageEditorEnabled((value) => !value); }}
                 className={`flex items-center space-x-1.5 px-3 py-2 rounded-full font-bold text-xs transition-colors ${imageEditorEnabled ? 'bg-red-500 hover:bg-red-400 text-white' : 'bg-white/10 hover:bg-white/20 text-white'}`}
@@ -6079,21 +7333,22 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   >
                     <span>清空线条</span>
                   </button>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); saveEditedImage(); }}
-                    disabled={imageEditorSaving}
-                    className="flex items-center space-x-1.5 px-3 py-2 rounded-full bg-brand hover:bg-brand-dark disabled:opacity-60 disabled:cursor-wait text-black font-bold text-xs transition-colors"
-                    title="保存为新的当前图片素材"
-                  >
-                    <span>{imageEditorSaving ? '保存中...' : '保存编辑'}</span>
-                  </button>
                 </>
               )}
             </div>
           )}
-          {(fullscreenVideo.mediaType === 'video' || isVideoUrl(fullscreenVideo.src)) && /^https?:\/\//i.test(fullscreenVideo.src) && (
+          {fullscreenVideo.src && (fullscreenVideo.mediaType === 'video' || isVideoUrl(fullscreenVideo.src)) && (
             <button
-              onClick={(e) => { e.stopPropagation(); handleDownloadVideo(fullscreenVideo.src, 'video'); }}
+              onClick={(e) => {
+                e.stopPropagation();
+                const fsMaterial = {
+                  thumbnail: fullscreenVideo.src,
+                  sourceUrl: fullscreenVideo.src,
+                  localPath: localFilePathFromUrlValue(fullscreenVideo.src) || '',
+                  remoteUrl: fullscreenVideo.src,
+                };
+                handleDownloadVideo(fsMaterial, fullscreenVideo.materialName || 'video');
+              }}
               className="absolute top-4 right-16 flex items-center space-x-1.5 px-3 py-2 rounded-full bg-brand hover:bg-brand-dark text-black font-bold text-xs transition-colors"
               title="下载视频"
             >
@@ -6101,34 +7356,141 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               <span>下载</span>
             </button>
           )}
+          {fullscreenVideo.src && fullscreenVideo.mediaType !== 'video' && !isVideoUrl(fullscreenVideo.src) && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                const fsMaterial = {
+                  thumbnail: fullscreenVideo.src,
+                  sourceUrl: fullscreenVideo.src,
+                  localPath: localFilePathFromUrlValue(fullscreenVideo.src) || '',
+                  remoteUrl: fullscreenVideo.src,
+                };
+                handleDownloadImage(fsMaterial, fullscreenVideo.materialName || 'image');
+              }}
+              className="absolute top-4 right-16 flex items-center space-x-1.5 px-3 py-2 rounded-full bg-brand hover:bg-brand-dark text-black font-bold text-xs transition-colors"
+              title="下载图片"
+            >
+              <Download className="w-4 h-4" />
+              <span>下载</span>
+            </button>
+          )}
           {imageEditorEnabled && !(fullscreenVideo.mediaType === 'video' || isVideoUrl(fullscreenVideo.src)) && (
-            <div className="absolute left-1/2 top-4 -translate-x-1/2 rounded-full border border-red-400/40 bg-red-500/15 px-4 py-2 text-xs font-bold text-red-100">
-              鼠标左键按住拖动即可画红线；保存后会生成一张新的当前图片
+            <div className="absolute left-1/2 top-4 -translate-x-1/2 rounded-full border border-white/20 bg-black/70 px-4 py-2 flex items-center space-x-3">
+              <div className="flex items-center space-x-1.5">
+                {['#ff2f2f', '#ffeb3b', '#10b981', '#3b82f6', '#ffffff', '#000000'].map((c) => (
+                  <button
+                    key={c}
+                    onClick={(e) => { e.stopPropagation(); setImageEditorColor(c); }}
+                    className={`w-5 h-5 rounded-full border-2 transition-transform ${imageEditorColor === c ? 'border-white scale-110' : 'border-white/30 hover:border-white/60'}`}
+                    style={{ backgroundColor: c }}
+                    title={c}
+                  />
+                ))}
+                <input
+                  type="color"
+                  value={imageEditorColor}
+                  onChange={(e) => setImageEditorColor(e.target.value)}
+                  onClick={(e) => e.stopPropagation()}
+                  className="w-5 h-5 rounded cursor-pointer border-0 bg-transparent p-0"
+                  title="自定义颜色"
+                />
+              </div>
+              <div className="w-px h-5 bg-white/20" />
+              <div className="flex items-center space-x-1.5">
+                <span className="text-[10px] text-white/70 font-bold">粗细</span>
+                <input
+                  type="range"
+                  min="1"
+                  max="20"
+                  value={imageEditorLineWidth}
+                  onChange={(e) => setImageEditorLineWidth(Number(e.target.value))}
+                  onClick={(e) => e.stopPropagation()}
+                  className="w-16 h-1 cursor-pointer accent-brand"
+                />
+                <span className="text-[10px] text-white/70 font-bold w-4">{imageEditorLineWidth}</span>
+              </div>
+              <div className="w-px h-5 bg-white/20" />
+              <div className="flex items-center space-x-1.5">
+                <button
+                  onClick={(e) => { e.stopPropagation(); setImageEditorShowGrid((v) => !v); }}
+                  className={`px-2 py-0.5 rounded-full text-[10px] font-bold transition-colors ${imageEditorShowGrid ? 'bg-brand text-black' : 'bg-white/10 text-white hover:bg-white/20'}`}
+                  title="切换九宫格/三分线辅助网格"
+                >
+                  网格
+                </button>
+                {imageEditorShowGrid && (
+                  <select
+                    value={imageEditorGridSize}
+                    onChange={(e) => setImageEditorGridSize(Number(e.target.value))}
+                    onClick={(e) => e.stopPropagation()}
+                    className="bg-white/10 text-white text-[10px] rounded px-1 py-0.5 border-0 outline-none cursor-pointer"
+                    title="网格类型"
+                  >
+                    <option value={3} className="bg-zinc-800">三分线</option>
+                    <option value={2} className="bg-zinc-800">二分线</option>
+                    <option value={4} className="bg-zinc-800">四分格</option>
+                    <option value={6} className="bg-zinc-800">六分格</option>
+                  </select>
+                )}
+              </div>
+              <div className="w-px h-5 bg-white/20" />
+              <span className="text-[10px] text-white/60 font-bold">左键拖动画线</span>
+              <div className="w-px h-5 bg-white/20" />
+              <button
+                onClick={(e) => { e.stopPropagation(); saveEditedImage(); }}
+                disabled={imageEditorSaving}
+                className="px-3 py-1 rounded-full bg-brand hover:bg-brand-dark disabled:opacity-60 disabled:cursor-wait text-black text-[10px] font-bold transition-colors"
+                title="保存编辑后的图片"
+              >
+                {imageEditorSaving ? '保存中...' : '保存编辑'}
+              </button>
             </div>
           )}
           <div className="max-w-[90vw] max-h-[90vh] flex items-center justify-center" onClick={(e) => e.stopPropagation()}>
             {fullscreenVideo.mediaType === 'video' || isVideoUrl(fullscreenVideo.src) ? (
-              <video
-                key={toPlayableUrl(fullscreenVideo.src)}
-                src={toPlayableUrl(fullscreenVideo.src)}
-                className="max-w-full max-h-[85vh] rounded-lg shadow-2xl"
-                controls
-                autoPlay
-                loop
-                onError={(event) => switchVideoToFallback(event, fullscreenVideo.fallbackSrc || '', true)}
-              />
+              <div className="relative flex items-center justify-center">
+                {fullscreenLoading && (
+                  <div className="absolute inset-0 flex items-center justify-center z-10">
+                    <RefreshCw className="w-8 h-8 text-white/70 animate-spin" />
+                  </div>
+                )}
+                <video
+                  key={toPlayableUrl(fullscreenVideo.src)}
+                  src={toPlayableUrl(fullscreenVideo.src)}
+                  className="max-w-full max-h-[85vh] rounded-lg shadow-2xl"
+                  controls
+                  autoPlay
+                  loop
+                  preload="auto"
+                  onLoadedData={() => setFullscreenLoading(false)}
+                  onCanPlay={() => setFullscreenLoading(false)}
+                  onError={(event) => { setFullscreenLoading(false); switchVideoToFallback(event, fullscreenVideo.fallbackSrc || '', true); }}
+                />
+              </div>
             ) : imageEditorEnabled ? (
-              <canvas
-                ref={imageEditorCanvasRef}
-                className="max-w-full max-h-[82vh] rounded-lg shadow-2xl object-contain cursor-crosshair touch-none bg-black"
-                onMouseDown={startImageEditorStroke}
-                onMouseMove={moveImageEditorStroke}
-                onMouseUp={endImageEditorStroke}
-                onMouseLeave={endImageEditorStroke}
-                onTouchStart={startImageEditorStroke}
-                onTouchMove={moveImageEditorStroke}
-                onTouchEnd={endImageEditorStroke}
-              />
+              <div className="relative inline-block">
+                <canvas
+                  ref={imageEditorCanvasRef}
+                  className="max-w-full max-h-[82vh] rounded-lg shadow-2xl object-contain cursor-crosshair touch-none bg-black"
+                  onMouseDown={startImageEditorStroke}
+                  onMouseMove={moveImageEditorStroke}
+                  onMouseUp={endImageEditorStroke}
+                  onMouseLeave={endImageEditorStroke}
+                  onTouchStart={startImageEditorStroke}
+                  onTouchMove={moveImageEditorStroke}
+                  onTouchEnd={endImageEditorStroke}
+                />
+                {imageEditorShowGrid && (
+                  <div
+                    className="absolute inset-0 pointer-events-none rounded-lg"
+                    style={{
+                      backgroundImage: `linear-gradient(to right, rgba(255,255,255,0.35) 1px, transparent 1px), linear-gradient(to bottom, rgba(255,255,255,0.35) 1px, transparent 1px)`,
+                      backgroundSize: `${100 / imageEditorGridSize}% ${100 / imageEditorGridSize}%`,
+                    }}
+                  />
+                )}
+              </div>
             ) : (
               <img
                 src={fullscreenVideo.src}

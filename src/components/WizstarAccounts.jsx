@@ -53,6 +53,7 @@ export default function WizstarAccounts() {
   const [oiRefreshingPoints, setOiRefreshingPoints] = useState(false);
   const [oiRefreshingEmail, setOiRefreshingEmail] = useState(null);
   const [oiClaimingDaily, setOiClaimingDaily] = useState(false);
+  const [oiCleaningZero, setOiCleaningZero] = useState(false);
   const [showOiRegister, setShowOiRegister] = useState(false);
   const [oiRegCount, setOiRegCount] = useState(1);
   const [oiRegConcurrency, setOiRegConcurrency] = useState(2);
@@ -83,6 +84,14 @@ export default function WizstarAccounts() {
   const [dolaImportEnvFile, setDolaImportEnvFile] = useState('');
   const [dolaImportProfileDir, setDolaImportProfileDir] = useState('');
   const [dolaImportNote, setDolaImportNote] = useState('');
+
+  // ---- Dola Google 批量登录 ----
+  const [showDolaBatchLogin, setShowDolaBatchLogin] = useState(false);
+  const [dolaBatchText, setDolaBatchText] = useState('');
+  const [dolaBatchConcurrency, setDolaBatchConcurrency] = useState(2);
+  const [dolaBatchStep, setDolaBatchStep] = useState('idle');
+  const [dolaBatchResults, setDolaBatchResults] = useState({});
+  const [dolaBatchSummary, setDolaBatchSummary] = useState(null);
 
   const fetchAccounts = async () => {
     try {
@@ -339,6 +348,32 @@ export default function WizstarAccounts() {
     }
   };
 
+  const handleOiCleanupZero = async () => {
+    if (!confirm('确定删除所有积分为 0 的渠道四账号？此操作不可撤销。')) return;
+    setOiCleaningZero(true);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/oiioii/accounts/cleanup-zero`, { method: 'POST' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const result = await res.json();
+      const d = result.data || {};
+      const count = d.deleted_count || 0;
+      setSuccessMsg(`已清理 ${count} 个零积分账号`);
+      if (d.skipped && d.skipped.length > 0) {
+        setError(`${d.skipped.length} 个账号跳过：${d.skipped.map(s => s.file).join(', ')}`);
+      }
+      fetchOiAccounts();
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setOiCleaningZero(false);
+    }
+  };
+
   const fetchDolaAccounts = async () => {
     try {
       setDolaLoading(true);
@@ -501,6 +536,68 @@ export default function WizstarAccounts() {
       setError(e.message || '打开浏览器失败');
     } finally {
       setDolaOpeningId(null);
+    }
+  };
+
+  // Listen for Dola batch login progress from Electron
+  useEffect(() => {
+    if (!window.electronAPI?.onDolaBatchProgress) return;
+    const unsubscribe = window.electronAPI.onDolaBatchProgress((data) => {
+      if (data?.step === 'batch_complete') {
+        setDolaBatchSummary(data.data);
+        setDolaBatchStep('done');
+        fetchDolaAccounts();
+        return;
+      }
+      if (data?.index !== undefined) {
+        setDolaBatchResults(prev => ({
+          ...prev,
+          [data.index]: {
+            email: data.email,
+            step: data.step,
+            ok: data.step === 'saved_to_db' ? data.data?.ok : prev[data.index]?.ok,
+          }
+        }));
+      }
+    });
+    return unsubscribe;
+  }, []);
+
+  const handleDolaBatchLogin = async () => {
+    const lines = dolaBatchText.trim().split('\n').filter(l => l.trim());
+    const accounts = lines.map(line => {
+      const [email, password] = line.trim().split('|');
+      return { email: (email || '').trim(), password: (password || '').trim() };
+    }).filter(a => a.email && a.password);
+    if (accounts.length === 0) {
+      setError('请输入有效的账号密码，每行一个，格式: email|password');
+      return;
+    }
+    setDolaBatchStep('running');
+    setDolaBatchResults({});
+    setDolaBatchSummary(null);
+    setError('');
+    setSuccessMsg('');
+    try {
+      if (!window.electronAPI?.dolaBatchLogin) {
+        throw new Error('Electron 环境不可用，请确保在 Electron 应用中运行（非浏览器 dev server）。如已更新 preload，请重启 Electron 应用。');
+      }
+      const result = await window.electronAPI.dolaBatchLogin({
+        accounts,
+        concurrency: dolaBatchConcurrency,
+      });
+      if (result?.ok) {
+        setDolaBatchSummary({ succeeded: result.succeeded, failed: result.failed, total: accounts.length });
+        setDolaBatchStep('done');
+        setSuccessMsg(`批量登录完成：成功 ${result.succeeded}，失败 ${result.failed}`);
+        fetchDolaAccounts();
+      } else {
+        setDolaBatchStep('idle');
+        setError(result?.error || '批量登录失败');
+      }
+    } catch (e) {
+      setDolaBatchStep('idle');
+      setError(e.message || String(e));
     }
   };
 
@@ -785,6 +882,14 @@ export default function WizstarAccounts() {
                 领取每日积分
               </button>
               <button
+                onClick={handleOiCleanupZero}
+                disabled={oiCleaningZero || oiAccounts.length === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-500/10 text-red-400 text-sm font-medium hover:bg-red-500/20 disabled:opacity-50 transition-colors"
+              >
+                {oiCleaningZero ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                清理零积分
+              </button>
+              <button
                 onClick={() => setShowOiRegister(true)}
                 disabled={oiRegistering || !oiSdkAvailable}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-green-500/10 text-green-400 text-sm font-medium hover:bg-green-500/20 disabled:opacity-50 transition-colors"
@@ -803,8 +908,16 @@ export default function WizstarAccounts() {
           ) : (
             <>
               <button
+                onClick={() => setShowDolaBatchLogin(prev => !prev)}
+                disabled={dolaCapturing || dolaImporting || dolaDeletingAll || dolaBatchStep === 'running'}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-500/10 text-blue-300 text-sm font-medium hover:bg-blue-500/20 disabled:opacity-50 transition-colors"
+              >
+                {dolaBatchStep === 'running' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mail className="w-4 h-4" />}
+                Google 批量登录
+              </button>
+              <button
                 onClick={() => setShowDolaGrab(true)}
-                disabled={dolaCapturing || dolaImporting || dolaDeletingAll}
+                disabled={dolaCapturing || dolaImporting || dolaDeletingAll || dolaBatchStep === 'running'}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-orange-500/10 text-orange-300 text-sm font-medium hover:bg-orange-500/20 disabled:opacity-50 transition-colors"
               >
                 {dolaCapturing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
@@ -1096,6 +1209,160 @@ export default function WizstarAccounts() {
                 </button>
               </div>
             </form>
+          </div>
+        )}
+
+        {activePool === 'dola' && showDolaBatchLogin && (
+          <div className="p-4 rounded-xl bg-dark-card border border-blue-500/20 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-medium text-white">Google 批量登录</h3>
+                <p className="text-xs text-dark-muted mt-1">
+                  每行一个账号，格式: 邮箱|密码。系统会为每个账号启动独立浏览器自动完成 Google OAuth 登录，提取 Cookie 并保存到账号库。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (dolaBatchStep !== 'running') setShowDolaBatchLogin(false);
+                }}
+                disabled={dolaBatchStep === 'running'}
+                className="p-1.5 rounded-lg text-dark-muted hover:text-white hover:bg-dark-bg disabled:opacity-50 transition-colors"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            </div>
+
+            {dolaBatchStep === 'idle' && (
+              <div className="space-y-3">
+                <textarea
+                  placeholder="email1@ffcfd.cfd|password1&#10;email2@ffcfd.cfd|password2&#10;email3@ffcfd.cfd|password3"
+                  value={dolaBatchText}
+                  onChange={(e) => setDolaBatchText(e.target.value)}
+                  rows={8}
+                  className="w-full bg-dark-input text-sm border border-dark-border focus:border-blue-500 focus:outline-none rounded-lg p-3 text-white placeholder-dark-subtle font-mono resize-none"
+                />
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-dark-muted">并发数</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="5"
+                    value={dolaBatchConcurrency}
+                    onChange={(e) => setDolaBatchConcurrency(Math.max(1, Math.min(5, parseInt(e.target.value) || 2)))}
+                    className="w-16 bg-dark-input text-sm border border-dark-border focus:border-blue-500 focus:outline-none rounded-lg p-2 text-white text-center"
+                  />
+                  <span className="text-xs text-dark-muted">同时登录的账号数量（建议 1-3）</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleDolaBatchLogin}
+                    disabled={!dolaBatchText.trim()}
+                    className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-blue-500/15 text-blue-300 text-sm font-medium hover:bg-blue-500/25 disabled:opacity-50 transition-colors"
+                  >
+                    <Mail className="w-4 h-4" />
+                    开始批量登录（{dolaBatchText.trim().split('\n').filter(l => l.trim() && l.includes('|')).length} 个账号）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowDolaBatchLogin(false)}
+                    className="px-4 py-2 rounded-lg text-dark-muted text-sm hover:text-white hover:bg-dark-card/80 transition-colors"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {dolaBatchStep === 'running' && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2 py-1">
+                  <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                  <span className="text-sm text-white">批量登录进行中...</span>
+                </div>
+                <div className="space-y-1.5 max-h-72 overflow-y-auto">
+                  {Object.entries(dolaBatchResults)
+                    .sort(([a], [b]) => parseInt(a) - parseInt(b))
+                    .map(([idx, info]) => (
+                      <div key={idx} className="flex items-center justify-between bg-dark-input/50 border border-dark-border/40 rounded-lg px-3 py-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          {info.ok === true ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
+                          ) : info.ok === false ? (
+                            <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                          ) : (
+                            <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin shrink-0" />
+                          )}
+                          <span className="text-xs text-white truncate">{info.email}</span>
+                        </div>
+                        <span className="text-[10px] text-dark-muted shrink-0 ml-2">
+                          {info.step === 'starting' ? '启动中' :
+                           info.step === 'saved_to_db' ? '已保存' :
+                           info.step === 'login_complete' ? '登录完成' :
+                           info.step?.includes('email') ? '输入邮箱' :
+                           info.step?.includes('password') ? '输入密码' :
+                           info.step?.includes('terms') ? '接受条款' :
+                           info.step?.includes('consent') ? '授权中' :
+                           info.step?.includes('continue') ? '点击继续' :
+                           info.step?.includes('redirect') ? '跳转中' :
+                           info.step?.includes('age') ? '确认年龄' :
+                           info.step || '处理中'}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
+
+            {dolaBatchStep === 'done' && dolaBatchSummary && (
+              <div className="space-y-3">
+                <div className="flex items-center gap-3 py-2">
+                  {dolaBatchSummary.failed === 0 ? (
+                    <CheckCircle2 className="w-5 h-5 text-green-400" />
+                  ) : (
+                    <AlertCircle className="w-5 h-5 text-orange-400" />
+                  )}
+                  <span className="text-sm text-white">
+                    批量登录完成：成功 <span className="text-green-400 font-bold">{dolaBatchSummary.succeeded}</span>，
+                    失败 <span className="text-red-400 font-bold">{dolaBatchSummary.failed}</span>，
+                    共 {dolaBatchSummary.total} 个账号
+                  </span>
+                </div>
+                <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                  {Object.entries(dolaBatchResults)
+                    .sort(([a], [b]) => parseInt(a) - parseInt(b))
+                    .map(([idx, info]) => (
+                      <div key={idx} className="flex items-center justify-between bg-dark-input/50 border border-dark-border/40 rounded-lg px-3 py-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          {info.ok ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
+                          ) : (
+                            <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                          )}
+                          <span className="text-xs text-white truncate">{info.email}</span>
+                        </div>
+                        <span className={`text-[10px] shrink-0 ml-2 ${info.ok ? 'text-green-400' : 'text-red-400'}`}>
+                          {info.ok ? '已保存到账号库' : '登录失败'}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowDolaBatchLogin(false);
+                    setDolaBatchStep('idle');
+                    setDolaBatchText('');
+                    setDolaBatchResults({});
+                    setDolaBatchSummary(null);
+                  }}
+                  className="px-4 py-2 rounded-lg text-dark-muted text-sm hover:text-white hover:bg-dark-card/80 transition-colors"
+                >
+                  完成
+                </button>
+              </div>
+            )}
           </div>
         )}
 

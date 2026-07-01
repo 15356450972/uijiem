@@ -1,44 +1,42 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { X, Plus, Trash2 } from 'lucide-react';
-import { drawSymbol, censorImageManual } from '../utils/faceCensor';
 
-// 手动放置打码符号：可在角色图上放多个符号（多视图拼图常见），
-// 拖动定位、滑块调当前选中符号大小，确定后合成并回传 dataURL。
-// 不走人脸识别，快速可靠，作为自动打码识别不准时的兜底。
+// 网格遮罩：可在角色图上放多个网格方块，拖动定位、滑块调大小，
+// 确定后合成并回传 dataURL。用于遮挡面部等隐私区域。
 //
 // props:
 //   open: boolean
-//   src: string            待打码的图片（dataURL / file:// / http）
+//   src: string            待遮罩的图片（dataURL / file:// / http）
 //   onApply: (dataUrl) => void
 //   onClose: () => void
-export default function FaceCensorModal({ open, src, onApply, onClose }) {
+export default function GridMaskModal({ open, src, onApply, onClose }) {
   const [imgEl, setImgEl] = useState(null);
   const [natural, setNatural] = useState({ w: 0, h: 0 });
-  const [symbols, setSymbols] = useState([]); // [{ id, cx, cy, half }]
+  const [boxes, setBoxes] = useState([]); // [{ id, cx, cy, half, gridLines }]
   const [selectedId, setSelectedId] = useState(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const canvasRef = useRef(null);
   const draggingRef = useRef(false);
   const idRef = useRef(0);
-  const dragPosRef = useRef(null); // { cx, cy } during drag, avoids per-frame setState
+  const dragPosRef = useRef(null);
   const rafRef = useRef(null);
 
-  const MAX_W = 600;
-  const MAX_H = 460;
+  const MAX_W = Math.min(window.innerWidth - 80, 900);
+  const MAX_H = Math.min(window.innerHeight - 200, 700);
   const displayScale = natural.w
     ? Math.min(MAX_W / natural.w, MAX_H / natural.h, 1)
     : 1;
   const dispW = Math.round(natural.w * displayScale);
   const dispH = Math.round(natural.h * displayScale);
   const defaultHalf = natural.w ? Math.min(natural.w, natural.h) * 0.22 : 40;
-  const selected = symbols.find((s) => s.id === selectedId) || null;
+  const selected = boxes.find((s) => s.id === selectedId) || null;
 
   useEffect(() => {
     if (!open || !src) return;
     setError('');
     setImgEl(null);
-    setSymbols([]);
+    setBoxes([]);
     setSelectedId(null);
     const img = new Image();
     if (/^https?:\/\//i.test(src)) img.crossOrigin = 'anonymous';
@@ -47,17 +45,44 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
       const h = img.naturalHeight || img.height;
       setImgEl(img);
       setNatural({ w, h });
-      // 默认先放一个在画面上半部分中央。
       const half = Math.min(w, h) * 0.22;
       const id = ++idRef.current;
-      setSymbols([{ id, cx: w / 2, cy: h * 0.4, half }]);
+      setBoxes([{ id, cx: w / 2, cy: h * 0.4, half, gridLines: 10 }]);
       setSelectedId(id);
     };
     img.onerror = () => setError('图片加载失败');
     img.src = src;
   }, [open, src]);
 
-  // 在叠加层 canvas 上按显示比例绘制图片 + 所有符号预览（选中的加虚线框）。
+  const drawGridBox = (ctx, cx, cy, half, gridLines = 10) => {
+    const x = cx - half;
+    const y = cy - half;
+    const size = half * 2;
+    const step = size / gridLines;
+
+    // No background fill — fully transparent so face is visible underneath
+
+    // Clip to box bounds so lines don't extend beyond edges
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x, y, size, size);
+    ctx.clip();
+
+    // Draw grid lines (semi-transparent white)
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = Math.max(0.5, size / gridLines / 12);
+    ctx.beginPath();
+    for (let i = 0; i <= gridLines; i++) {
+      const offset = i * step;
+      ctx.moveTo(x + offset, y);
+      ctx.lineTo(x + offset, y + size);
+      ctx.moveTo(x, y + offset);
+      ctx.lineTo(x + size, y + offset);
+    }
+    ctx.stroke();
+    ctx.restore();
+  };
+
   const redraw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !imgEl || !dispW || !dispH) return;
@@ -66,21 +91,13 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, dispW, dispH);
     ctx.drawImage(imgEl, 0, 0, dispW, dispH);
-    for (const s of symbols) {
+    for (const s of boxes) {
       const cx = s.cx * displayScale;
       const cy = s.cy * displayScale;
       const half = s.half * displayScale;
-      drawSymbol(ctx, cx, cy, half);
-      if (s.id === selectedId) {
-        ctx.save();
-        ctx.strokeStyle = 'rgba(16,185,129,0.9)';
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([5, 4]);
-        ctx.strokeRect(cx - half, cy - half, half * 2, half * 2);
-        ctx.restore();
-      }
+      drawGridBox(ctx, cx, cy, half, s.gridLines);
     }
-  }, [imgEl, dispW, dispH, symbols, selectedId, displayScale]);
+  }, [imgEl, dispW, dispH, boxes, selectedId, displayScale]);
 
   useEffect(() => {
     redraw();
@@ -94,10 +111,9 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
     };
   };
 
-  // 命中测试：返回点击位置落在哪个符号的包围盒内（从上层往下找）。
   const hitTest = (p) => {
-    for (let i = symbols.length - 1; i >= 0; i--) {
-      const s = symbols[i];
+    for (let i = boxes.length - 1; i >= 0; i--) {
+      const s = boxes[i];
       if (Math.abs(p.cx - s.cx) <= s.half && Math.abs(p.cy - s.cy) <= s.half) {
         return s.id;
       }
@@ -112,10 +128,10 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
       setSelectedId(hitId);
       draggingRef.current = true;
     } else {
-      // 点空白处：新放一个符号（大小沿用当前选中或默认）。
       const half = selected ? selected.half : defaultHalf;
+      const gridLines = selected ? selected.gridLines : 10;
       const id = ++idRef.current;
-      setSymbols((prev) => [...prev, { id, cx: p.cx, cy: p.cy, half }]);
+      setBoxes((prev) => [...prev, { id, cx: p.cx, cy: p.cy, half, gridLines }]);
       setSelectedId(id);
       draggingRef.current = true;
     }
@@ -130,25 +146,16 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
       rafRef.current = null;
       const pos = dragPosRef.current;
       if (!pos) return;
-      // Draw directly on canvas for smooth dragging without React re-render
       const canvas = canvasRef.current;
       if (!canvas || !imgEl || !dispW || !dispH) return;
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0, 0, dispW, dispH);
       ctx.drawImage(imgEl, 0, 0, dispW, dispH);
-      for (const s of symbols) {
+      for (const s of boxes) {
         const cx = (s.id === selectedId ? pos.cx : s.cx) * displayScale;
         const cy = (s.id === selectedId ? pos.cy : s.cy) * displayScale;
         const half = s.half * displayScale;
-        drawSymbol(ctx, cx, cy, half);
-        if (s.id === selectedId) {
-          ctx.save();
-          ctx.strokeStyle = 'rgba(16,185,129,0.9)';
-          ctx.lineWidth = 1.5;
-          ctx.setLineDash([5, 4]);
-          ctx.strokeRect(cx - half, cy - half, half * 2, half * 2);
-          ctx.restore();
-        }
+        drawGridBox(ctx, cx, cy, half, s.gridLines);
       }
     });
   };
@@ -161,21 +168,22 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
     const pos = dragPosRef.current;
     dragPosRef.current = null;
     if (pos && selectedId != null) {
-      setSymbols((prev) => prev.map((s) => (s.id === selectedId ? { ...s, cx: pos.cx, cy: pos.cy } : s)));
+      setBoxes((prev) => prev.map((s) => (s.id === selectedId ? { ...s, cx: pos.cx, cy: pos.cy } : s)));
     }
   };
 
-  const addSymbolAtCenter = () => {
+  const addBoxAtCenter = () => {
     if (!natural.w) return;
     const half = selected ? selected.half : defaultHalf;
+    const gridLines = selected ? selected.gridLines : 10;
     const id = ++idRef.current;
-    setSymbols((prev) => [...prev, { id, cx: natural.w / 2, cy: natural.h / 2, half }]);
+    setBoxes((prev) => [...prev, { id, cx: natural.w / 2, cy: natural.h / 2, half, gridLines }]);
     setSelectedId(id);
   };
 
   const deleteSelected = () => {
     if (selectedId == null) return;
-    setSymbols((prev) => {
+    setBoxes((prev) => {
       const next = prev.filter((s) => s.id !== selectedId);
       setSelectedId(next.length ? next[next.length - 1].id : null);
       return next;
@@ -183,15 +191,24 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
   };
 
   const handleApply = async () => {
-    if (!src || !symbols.length) {
-      setError('请至少放置一个符号');
+    if (!src || !boxes.length) {
+      setError('请至少放置一个网格');
       return;
     }
     setBusy(true);
     setError('');
     try {
-      const res = await censorImageManual(src, symbols);
-      onApply?.(res.dataUrl);
+      // Render at full natural resolution
+      const canvas = document.createElement('canvas');
+      canvas.width = natural.w;
+      canvas.height = natural.h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(imgEl, 0, 0, natural.w, natural.h);
+      for (const s of boxes) {
+        drawGridBox(ctx, s.cx, s.cy, s.half, s.gridLines);
+      }
+      const dataUrl = canvas.toDataURL('image/png');
+      onApply?.(dataUrl);
       onClose?.();
     } catch (err) {
       setError(err?.message || String(err));
@@ -210,7 +227,7 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
       <div className="bg-[#1a1b1f] border border-dark-border rounded-xl shadow-2xl flex flex-col overflow-hidden max-w-[92vw]">
         <div className="h-11 px-4 flex items-center justify-between border-b border-dark-border bg-[#111214]">
           <span className="text-xs font-bold text-dark-text">
-            手动打码 · 点空白处放一个，点中符号可拖动（已放 {symbols.length} 个）
+            网格遮罩 · 点空白处放一个，点中网格可拖动（已放 {boxes.length} 个）
           </span>
           <button
             onClick={onClose}
@@ -239,11 +256,11 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
                   className="block"
                 />
               </div>
-              <div className="w-full flex items-center space-x-3 px-1">
+              <div className="w-full flex items-center space-x-3 px-1 flex-wrap gap-y-2">
                 <button
                   type="button"
-                  onClick={addSymbolAtCenter}
-                  title="再放一个符号"
+                  onClick={addBoxAtCenter}
+                  title="再放一个网格"
                   className="flex items-center space-x-1 px-2 py-1 rounded-md bg-dark-input border border-dark-border text-[10px] font-bold text-dark-text hover:text-white hover:border-brand/40 shrink-0"
                 >
                   <Plus className="w-3 h-3" />
@@ -253,7 +270,7 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
                   type="button"
                   onClick={deleteSelected}
                   disabled={selectedId == null}
-                  title="删除选中的符号"
+                  title="删除选中的网格"
                   className="flex items-center space-x-1 px-2 py-1 rounded-md bg-dark-input border border-dark-border text-[10px] font-bold text-dark-muted hover:text-red-400 hover:border-red-400/40 disabled:opacity-40 shrink-0"
                 >
                   <Trash2 className="w-3 h-3" />
@@ -269,10 +286,25 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
                   disabled={!selected}
                   onChange={(e) => {
                     const val = Number(e.target.value);
-                    setSymbols((prev) => prev.map((s) => (s.id === selectedId ? { ...s, half: val } : s)));
+                    setBoxes((prev) => prev.map((s) => (s.id === selectedId ? { ...s, half: val } : s)));
                   }}
-                  className="flex-1 accent-brand disabled:opacity-40"
+                  className="flex-1 accent-brand disabled:opacity-40 min-w-[80px]"
                 />
+                <span className="text-[10px] text-dark-muted shrink-0 ml-1">格数</span>
+                <input
+                  type="range"
+                  min={3}
+                  max={20}
+                  step={1}
+                  value={selected ? selected.gridLines : 10}
+                  disabled={!selected}
+                  onChange={(e) => {
+                    const val = Number(e.target.value);
+                    setBoxes((prev) => prev.map((s) => (s.id === selectedId ? { ...s, gridLines: val } : s)));
+                  }}
+                  className="w-20 accent-brand disabled:opacity-40"
+                />
+                <span className="text-[10px] text-dark-muted w-4 shrink-0">{selected ? selected.gridLines : 10}</span>
               </div>
             </>
           )}
@@ -287,10 +319,10 @@ export default function FaceCensorModal({ open, src, onApply, onClose }) {
           </button>
           <button
             onClick={handleApply}
-            disabled={busy || !imgEl || !symbols.length}
+            disabled={busy || !imgEl || !boxes.length}
             className="px-4 py-1.5 rounded-lg bg-brand text-xs font-bold text-black hover:bg-brand/90 disabled:opacity-50 transition-colors"
           >
-            {busy ? '处理中…' : '确定打码'}
+            {busy ? '处理中…' : '确定遮罩'}
           </button>
         </div>
       </div>

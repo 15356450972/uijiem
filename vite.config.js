@@ -8,6 +8,28 @@ export default defineConfig({
   server: {
     port: 5174,
     strictPort: true,
+    watch: {
+      ignored: [
+        '**/_wizstar_data_test/**',
+        '**/wizstar/**',
+        '**/.venv/**',
+        '**/.venv-build/**',
+        '**/py-build/**',
+        '**/py-dist/**',
+        '**/nuitka-dist/**',
+        '**/build/**',
+        '**/dist/**',
+        '**/node_modules/**',
+        '**/.cache/**',
+        '**/oiioii-sdk/**',
+        '**/quickframe-sdk-full/**',
+        '**/dola-video-standalone/**',
+        '**/dola-send-task-kit/**',
+        '**/*.db',
+        '**/*.db-wal',
+        '**/*.db-shm',
+      ],
+    },
   },
   build: {
     outDir: 'dist',

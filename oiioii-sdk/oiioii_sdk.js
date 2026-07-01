@@ -731,45 +731,48 @@ class OiiOiiClient {
   // 6. 生成图片
   // ===========================================================================
   async generateImage(options = {}) {
-    await this.getWorkspace();
+    await this.getWorkspace({ force: true });
     const model = IMAGE_MODELS[options.model] || options.mcpMethodName || options.model || IMAGE_MODELS['gpt-image2'];
     const modelParam = options.modelParam !== undefined ? options.modelParam : IMAGE_MODEL_PARAMS[options.model];
 
     let refImages = [];
     let refBindings = [];
-    const useReadFileReferences = options.useReadFileReferences !== undefined
-      ? options.useReadFileReferences
-      : !!options.imageToImage;
     if (options.referenceImages?.length) {
       const uris = [];
       for (const ref of options.referenceImages) {
         const uri = ref.startsWith('hogi://') || /^https?:\/\//.test(ref) ? ref : await this.uploadImage(ref);
-        uris.push(useReadFileReferences ? this._toReadFileUrl(uri) : uri);
+        uris.push(uri);
       }
       refImages = uris;
-      refBindings = options.imageRefBindings || (useReadFileReferences ? [] : uris.map((uri, i) => ({ index: i + 1, kind: 'image', label: `Image_${i + 1}`, uri })));
+      // GPT-Image2 网页端发送 imageRefBindings: []，其他模型才发送 binding 数组
+      refBindings = options.imageRefBindings || (options.model === 'gpt-image2' ? [] : uris.map((uri, i) => ({ index: i + 1, kind: 'image', label: `Image_${i + 1}`, uri })));
     }
 
     const imageUri = options.model === 'gpt-image2' ? '' : (options.imageUri || (options.imageToImage && refImages[0] ? refImages[0] : ''));
     let prompt = options.prompt || '生成一张精美的图片';
     if (options.model === 'gpt-image2' && refImages.length) {
-      const hasImageToken = /\[Image\d+\]/i.test(prompt);
+      // 网页端用 [Image:image/xxx.png] 格式，SDK 用 [Image1] 格式，两种都算已有 token
+      const hasImageToken = /\[Image\d+\]/i.test(prompt) || /\[Image:image\//i.test(prompt);
       if (!hasImageToken) {
         const tokens = refImages.map((_, i) => `[Image${i + 1}]`).join(' 和 ');
         prompt = `${tokens} ${prompt}`;
       }
     }
     const assetId = crypto.randomUUID();
+    const aspectRatio = options.aspectRatio || '1:1';
     const body = {
       workspaceId: this.workspaceId,
       assetId,
-      aspectRatio: options.aspectRatio || '1:1',
+      aspectRatio,
       imageUri,
       mcpMethodName: model,
       prompt,
       resolution: options.resolution || '2K',
       referenceImages: refImages,
       imageRefBindings: refBindings,
+      roleAssets: [],
+      sceneAssets: [],
+      itemAssets: [],
       styleUri: options.styleUri || ''
     };
 
@@ -779,12 +782,13 @@ class OiiOiiClient {
       body.model = modelParam;
     }
 
-    this.log(`[image] 提交任务 model=${model}${body.model ? `/${body.model}` : ''} aspectRatio=${body.aspectRatio} resolution=${body.resolution} refs=${refImages.length} prompt="${(body.prompt).substring(0, 40)}"`);
+    this.log(`[image] 提交任务 model=${model}${body.model ? `/${body.model}` : ''} aspectRatio=${body.aspectRatio} resolution=${body.resolution} size=${body.size || 'N/A'} refs=${refImages.length} prompt="${(body.prompt).substring(0, 40)}"`);
+    this.log(`[image] 请求体: ${JSON.stringify(body)}`);
     const res = await this._request('/media/generate_image_asset/submit', {
       method: 'POST', body: JSON.stringify(body)
     });
-    this._dbg('image submit', res.data.substring(0, 200));
-    if (!res.json?.success || !res.json?.taskId) throw new Error(`图片任务提交失败: ${res.data.substring(0, 200)}`);
+    this.log(`[image] 提交返回: ${res.data.substring(0, 500)}`);
+    if (!res.json?.success || !res.json?.taskId) throw new Error(`图片任务提交失败: ${res.data.substring(0, 300)}`);
 
     const taskId = res.json.taskId;
     this.log(`[image] taskId: ${taskId}`);
@@ -797,7 +801,7 @@ class OiiOiiClient {
   // 7. 生成视频
   // ===========================================================================
   async generateVideo(options = {}) {
-    await this.getWorkspace();
+    await this.getWorkspace({ force: true });
     const model = VIDEO_MODELS[options.model] || options.mcpMethodName || options.model || VIDEO_MODELS['gemini'];
     const modelParam = options.modelParam !== undefined ? options.modelParam : VIDEO_MODEL_PARAMS[options.model];
 
@@ -905,6 +909,7 @@ class OiiOiiClient {
           return task;
         }
         if (task.status === 'failed') {
+          this.log(`[task] 失败完整返回: ${JSON.stringify(task)}`);
           const parts = [task.error_message, task.error_code, task.fail_reason, task.failure_reason]
             .filter(Boolean)
             .map(x => String(x).trim())
@@ -1029,7 +1034,6 @@ class OiiOiiClient {
       email: this.email,
       password: this.password,
       token: this.token,
-      workspaceId: this.workspaceId,
       savedAt: new Date().toISOString()
     };
   }
@@ -1050,7 +1054,6 @@ class OiiOiiClient {
     this.email = this.email || acc.email;
     this.password = this.password || acc.password;
     this.token = this.token || acc.token;
-    this.workspaceId = this.workspaceId || acc.workspaceId;
     return acc;
   }
 

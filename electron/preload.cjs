@@ -21,5 +21,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   maximizeWindow: () => ipcRenderer.send('maximize-window'),
   closeWindow: () => ipcRenderer.send('close-window'),
   wizstarServerStatus: () => ipcRenderer.invoke('wizstar-server-status'),
+  dolaGoogleLogin: (payload) => ipcRenderer.invoke('dola-google-login', payload),
+  dolaBatchLogin: (payload) => ipcRenderer.invoke('dola-batch-login', payload),
+  onDolaLoginProgress: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on('dola-login-progress', listener);
+    return () => ipcRenderer.removeListener('dola-login-progress', listener);
+  },
+  onDolaBatchProgress: (callback) => {
+    const listener = (_event, data) => callback?.(data);
+    ipcRenderer.on('dola-batch-progress', listener);
+    return () => ipcRenderer.removeListener('dola-batch-progress', listener);
+  },
   platform: process.platform
 });

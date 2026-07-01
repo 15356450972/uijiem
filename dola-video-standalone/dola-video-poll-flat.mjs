@@ -169,7 +169,7 @@ function extractMessageFailure(msg, blocks) {
   const code = ext.ai_creation_res_code || '';
   const toolList = ext.ai_creation_tool_list || '';
   const failedTool = /"status"\s*:\s*5|"fail_code"/i.test(toolList);
-  const textFailure = texts.find((text) => /无法|失败|错误|不支持|保护|换其他参考图|生成失败|侵权|违规|违法|违禁|无法返回|超过\s*\d+\s*秒|cannot be generated|longer than/i.test(text));
+  const textFailure = texts.find((text) => /无法|失败|错误|不支持|保护|换其他参考图|生成失败|侵权|违规|违法|违禁|无法返回|超过\s*\d+\s*秒|达到上限|已达上限|明天再来|降低配置|额度不足|cannot be generated|longer than/i.test(text));
   if (code || failedTool || textFailure) {
     return [textFailure, code ? `ai_creation_res_code=${code}` : '', failedTool ? 'tool_status=failed' : '']
       .filter(Boolean)

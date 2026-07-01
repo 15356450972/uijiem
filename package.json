@@ -51,6 +51,15 @@
           "sdk/**/*",
           "node_modules/**/*"
         ]
+      },
+      {
+        "from": "dola-google-login",
+        "to": "dola-google-login",
+        "filter": [
+          "package.json",
+          "index.mjs",
+          "node_modules/**/*"
+        ]
       }
     ],
     "win": {

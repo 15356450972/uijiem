@@ -72,10 +72,15 @@ def _cleanup_temp_files(paths: list[str]) -> None:
             pass
 
 
-def _friendly_image_error(message: str, model: str = "") -> str:
+def _friendly_error(message: str, model: str = "", is_video: bool = False) -> str:
     text = _clean_str(message)
     if not text:
-        return "图片生成失败，请稍后重试。"
+        return "视频生成失败，请稍后重试。" if is_video else "图片生成失败，请稍后重试。"
+    if re.search(r"INSUFFICIENT_POI|INSUFFICIENT_POINTS|insufficient.*poi|insufficient.*points", text, re.I):
+        return "渠道四账号积分不足，请签到领取积分或注册新账号后再试。"
+    if is_video:
+        if re.search(r"INSUFFICIENT_POINTS", text, re.I):
+            return "渠道四账号积分不足，视频生成需要消耗积分，请签到领取积分或注册新账号后再试。"
     if re.search(r"GPT Image 2|generate_image_gpt_image2|Failed to generate image", text, re.I):
         if model == "gpt-image2":
             return "渠道四 GPT-Image2 当前上游生成失败，已尝试自动切换 GPT-4o 重试；仍失败时请更换模型或稍后重试。"
@@ -247,8 +252,8 @@ process.chdir({json.dumps(sdk_dir)});
     raise OiiOiiError(f"SDK 输出无法解析为 JSON: {output[:300]}")
 
 
-def _run_sdk_script_stream(script: str, timeout: int = 300, on_event=None) -> dict:
-    """流式执行 Node.js 脚本，逐行接收 JSON 进度事件，并返回最终 JSON。"""
+def _run_sdk_script_stream(script: str, timeout: int = 300, on_event=None) -> tuple[dict, str]:
+    """流式执行 Node.js 脚本，逐行接收 JSON 进度事件，并返回 (最终JSON, stderr日志)。"""
     sdk_dir = _get_sdk_dir()
     node = _get_node_bin()
 
@@ -331,7 +336,7 @@ process.chdir({json.dumps(sdk_dir)});
             output = "\n".join(output_lines).strip()
             raise OiiOiiError(f"SDK 执行失败 (exit {proc.returncode}): {(output or stderr)[:500]}")
         if final_result is not None:
-            return final_result
+            return final_result, stderr
         if stderr:
             raise OiiOiiError(f"SDK 执行失败: {stderr[:500]}")
         raise OiiOiiError("SDK 输出无法解析为 JSON")
@@ -360,7 +365,8 @@ def _account_file_path(email: str | None = None) -> str:
 
 
 def _pick_account() -> dict:
-    """轮询选择一个可用账号，避免所有任务始终打到同一个账号。"""
+    """轮询选择一个可用账号，避免所有任务始终打到同一个账号。
+    优先选择积分 > 0 的账号，跳过积分为 0 的账号。"""
     global _account_pick_cursor
     Path(ACCOUNT_DIR).mkdir(parents=True, exist_ok=True)
     candidates = []
@@ -376,10 +382,18 @@ def _pick_account() -> dict:
     if not candidates:
         raise OiiOiiError("没有可用的渠道四账号，请先注册或导入账号")
 
+    def _account_points(acc: dict) -> int:
+        try:
+            return int(acc.get("points") or 0)
+        except (TypeError, ValueError):
+            return 0
+
     with _account_pick_lock:
-        index = _account_pick_cursor % len(candidates)
-        _account_pick_cursor = (index + 1) % len(candidates)
-        return candidates[index]
+        funded = [a for a in candidates if _account_points(a) > 0]
+        pool = funded if funded else candidates
+        index = _account_pick_cursor % len(pool)
+        _account_pick_cursor = (index + 1) % len(pool)
+        return pool[index]
 
 
 def _proxy_args() -> str:
@@ -596,30 +610,10 @@ def generate_video(
 
     import threading
 
-    def _run():
-        temp_refs = []
-        try:
-            refs = []
-            if image_path and os.path.isfile(image_path):
-                refs.append(image_path)
-            if image_url:
-                normalized_ref, ref_kind = _normalize_reference_image(image_url)
-                if normalized_ref:
-                    refs.append(normalized_ref)
-                    if ref_kind == "temp":
-                        temp_refs.append(normalized_ref)
-            for ref in reference_images:
-                normalized_ref, ref_kind = _normalize_reference_image(ref)
-                if not normalized_ref:
-                    continue
-                refs.append(normalized_ref)
-                if ref_kind == "temp":
-                    temp_refs.append(normalized_ref)
-            ref_arg = f"referenceImages: {json.dumps(refs)}," if refs else ""
-
-            script = f"""
+    def _build_script(acc_file: str, ref_arg: str = "") -> str:
+        return f"""
 const {{ OiiOiiClient }} = require('./oiioii_sdk');
-const client = OiiOiiClient.fromAccount({json.dumps(account_file)}, {{ {_proxy_args()} }});
+const client = OiiOiiClient.fromAccount({json.dumps(acc_file)}, {{ {_proxy_args()}, logger: (...a) => process.stderr.write(a.join(' ') + '\\n') }});
 await client.login();
 const result = await client.generateVideo({{
   prompt: {json.dumps(prompt)},
@@ -636,7 +630,7 @@ const result = await client.generateVideo({{
   }}
 }});
 const fs = require('fs');
-fs.writeFileSync({json.dumps(account_file)}, JSON.stringify(client.toAccount(), null, 2), 'utf-8');
+fs.writeFileSync({json.dumps(acc_file)}, JSON.stringify(client.toAccount(), null, 2), 'utf-8');
 process.stdout.write(JSON.stringify({{
   success: true,
   taskId: result.taskId,
@@ -650,60 +644,141 @@ process.stdout.write(JSON.stringify({{
   submittedModelParam: result.submittedModelParam
 }}));
 """
-            def _on_progress(event: dict):
-                progress = event.get("progress", 0)
-                try:
-                    progress = int(float(progress or 0))
-                except (TypeError, ValueError):
-                    progress = 0
-                progress = max(0, min(99, progress))
-                _task_cache[task_id].update({
-                    "status": "running",
-                    "progress": progress,
-                    "elapsed": event.get("elapsed"),
-                })
 
-            result = _run_sdk_script_stream(script, timeout=900, on_event=_on_progress)
-            if result.get("error"):
+    def _on_progress(event: dict):
+        progress = event.get("progress", 0)
+        try:
+            progress = int(float(progress or 0))
+        except (TypeError, ValueError):
+            progress = 0
+        progress = max(0, min(99, progress))
+        _task_cache[task_id].update({
+            "status": "running",
+            "progress": progress,
+            "elapsed": event.get("elapsed"),
+        })
+
+    def _run():
+        temp_refs = []
+        tried_account_files: set[str] = set()
+        current_account_file = account_file
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            try:
+                refs = []
+                if image_path and os.path.isfile(image_path):
+                    refs.append(image_path)
+                if image_url:
+                    normalized_ref, ref_kind = _normalize_reference_image(image_url)
+                    if normalized_ref:
+                        refs.append(normalized_ref)
+                        if ref_kind == "temp":
+                            temp_refs.append(normalized_ref)
+                for ref in reference_images:
+                    normalized_ref, ref_kind = _normalize_reference_image(ref)
+                    if not normalized_ref:
+                        continue
+                    refs.append(normalized_ref)
+                    if ref_kind == "temp":
+                        temp_refs.append(normalized_ref)
+                ref_arg = f"referenceImages: {json.dumps(refs)}," if refs else ""
+
+                script = _build_script(current_account_file, ref_arg)
+                result, sdk_logs = _run_sdk_script_stream(script, timeout=900, on_event=_on_progress)
+                if result.get("error"):
+                    err_text = str(result["error"])
+                    if re.search(r"INSUFFICIENT_POI|INSUFFICIENT_POINTS|insufficient.*poi|insufficient.*points", err_text, re.I):
+                        tried_account_files.add(current_account_file)
+                        try:
+                            if os.path.isfile(current_account_file):
+                                os.remove(current_account_file)
+                        except OSError:
+                            pass
+                        if attempt < max_retries:
+                            try:
+                                next_acc = _pick_account()
+                                next_file = next_acc["_file"]
+                                if next_file in tried_account_files:
+                                    raise OiiOiiError("没有可用的渠道四账号，请先注册或导入账号")
+                                current_account_file = next_file
+                                _task_cache[task_id].update({
+                                    "status": "running",
+                                    "progress": 0,
+                                    "error": f"账号积分不足，已删除并切换账号重试（第 {attempt + 1} 次）...",
+                                })
+                                continue
+                            except OiiOiiError:
+                                pass
+                    _task_cache[task_id] = {
+                        "status": "failed",
+                        "progress": 0,
+                        "video_url": "",
+                        "error": _friendly_error(err_text, model, is_video=True) + (f"\n\n[SDK日志]\n{sdk_logs[-1500:]}" if sdk_logs else ""),
+                        "submitted_model": model,
+                    }
+                    try:
+                        _acc_data = json.loads(Path(current_account_file).read_text(encoding="utf-8"))
+                        _acc_email = _clean_str(_acc_data.get("email"))
+                        if _acc_email:
+                            get_points(email=_acc_email, claim_daily=False)
+                    except Exception:
+                        pass
+                    return
+                else:
+                    _task_cache[task_id] = {
+                        "status": "completed",
+                        "progress": 100,
+                        "video_url": result.get("localPath") or result.get("downloadUrl") or result.get("cdnUrl") or "",
+                        "local_path": result.get("localPath") or "",
+                        "file_size": result.get("fileSize"),
+                        "cdn_url": result.get("cdnUrl") or "",
+                        "download_url": result.get("downloadUrl") or "",
+                        "output_uri": result.get("outputUri") or "",
+                        "submitted_model": result.get("submittedModel") or model,
+                        "submitted_mcp_method_name": result.get("submittedMcpMethodName") or "",
+                        "submitted_model_param": result.get("submittedModelParam") or "",
+                        "error": "",
+                        "sdk_task_id": result.get("taskId", ""),
+                    }
+                    return
+            except OiiOiiError as e:
                 _task_cache[task_id] = {
                     "status": "failed",
                     "progress": 0,
                     "video_url": "",
-                    "error": result["error"],
-                    "submitted_model": model,
+                    "error": _friendly_error(str(e), model, is_video=True),
                 }
-            else:
+                try:
+                    _acc_data = json.loads(Path(current_account_file).read_text(encoding="utf-8"))
+                    _acc_email = _clean_str(_acc_data.get("email"))
+                    if _acc_email:
+                        get_points(email=_acc_email, claim_daily=False)
+                except Exception:
+                    pass
+                return
+            except Exception as e:
                 _task_cache[task_id] = {
-                    "status": "completed",
-                    "progress": 100,
-                    "video_url": result.get("localPath") or result.get("downloadUrl") or result.get("cdnUrl") or "",
-                    "local_path": result.get("localPath") or "",
-                    "file_size": result.get("fileSize"),
-                    "cdn_url": result.get("cdnUrl") or "",
-                    "download_url": result.get("downloadUrl") or "",
-                    "output_uri": result.get("outputUri") or "",
-                    "submitted_model": result.get("submittedModel") or model,
-                    "submitted_mcp_method_name": result.get("submittedMcpMethodName") or "",
-                    "submitted_model_param": result.get("submittedModelParam") or "",
-                    "error": "",
-                    "sdk_task_id": result.get("taskId", ""),
+                    "status": "failed",
+                    "progress": 0,
+                    "video_url": "",
+                    "error": _friendly_error(str(e), model, is_video=True),
                 }
-        except OiiOiiError as e:
-            _task_cache[task_id] = {
-                "status": "failed",
-                "progress": 0,
-                "video_url": "",
-                "error": str(e),
-            }
-        except Exception as e:
-            _task_cache[task_id] = {
-                "status": "failed",
-                "progress": 0,
-                "video_url": "",
-                "error": str(e),
-            }
-        finally:
-            _cleanup_temp_files(temp_refs)
+                try:
+                    _acc_data = json.loads(Path(current_account_file).read_text(encoding="utf-8"))
+                    _acc_email = _clean_str(_acc_data.get("email"))
+                    if _acc_email:
+                        get_points(email=_acc_email, claim_daily=False)
+                except Exception:
+                    pass
+                return
+        _task_cache[task_id] = {
+            "status": "failed",
+            "progress": 0,
+            "video_url": "",
+            "error": "渠道四账号积分不足，已尝试多个账号均失败，请注册新账号后再试。",
+            "submitted_model": model,
+        }
+        _cleanup_temp_files(temp_refs)
 
     _task_cache[task_id]["status"] = "running"
     t = threading.Thread(target=_run, daemon=True)
@@ -769,7 +844,7 @@ def generate_image(
             output_file = os.path.join(DOWNLOAD_DIR, f"{task_id}.png")
             script = f"""
 const {{ OiiOiiClient }} = require('./oiioii_sdk');
-const client = OiiOiiClient.fromAccount({json.dumps(account_file)}, {{ {_proxy_args()} }});
+const client = OiiOiiClient.fromAccount({json.dumps(account_file)}, {{ {_proxy_args()}, logger: (...a) => process.stderr.write(a.join(' ') + '\\n') }});
 await client.login();
 const requestOptions = {{
   prompt: {json.dumps(prompt)},
@@ -828,9 +903,12 @@ process.stdout.write(JSON.stringify({{
                     "elapsed": event.get("elapsed"),
                 })
 
-            result = _run_sdk_script_stream(script, timeout=900, on_event=_on_progress)
+            result, sdk_logs = _run_sdk_script_stream(script, timeout=900, on_event=_on_progress)
             if result.get("error"):
-                error_message = _friendly_image_error(result.get("error"), model)
+                raw_err = result.get("error", "")
+                error_message = _friendly_error(raw_err, model, is_video=False)
+                if sdk_logs:
+                    error_message = f"{error_message}\n\n[SDK日志]\n{sdk_logs[-1500:]}"
                 _task_cache[task_id] = {
                     "status": "failed",
                     "progress": 0,
@@ -839,6 +917,13 @@ process.stdout.write(JSON.stringify({{
                     "submitted_model": model,
                     "media_type": "image",
                 }
+                try:
+                    _acc_data = json.loads(Path(account_file).read_text(encoding="utf-8"))
+                    _acc_email = _clean_str(_acc_data.get("email"))
+                    if _acc_email:
+                        get_points(email=_acc_email, claim_daily=False)
+                except Exception:
+                    pass
             else:
                 _task_cache[task_id] = {
                     "status": "completed",
@@ -861,9 +946,16 @@ process.stdout.write(JSON.stringify({{
                 "status": "failed",
                 "progress": 0,
                 "video_url": "",
-                "error": _friendly_image_error(str(e), model),
+                "error": _friendly_error(str(e), model, is_video=False),
                 "media_type": "image",
             }
+            try:
+                _acc_data = json.loads(Path(account_file).read_text(encoding="utf-8"))
+                _acc_email = _clean_str(_acc_data.get("email"))
+                if _acc_email:
+                    get_points(email=_acc_email, claim_daily=False)
+            except Exception:
+                pass
         finally:
             _cleanup_temp_files(temp_refs)
 
@@ -908,6 +1000,30 @@ def delete_account(email: str) -> dict:
         os.remove(account_file)
         return {"success": True, "deleted": account_file}
     return {"success": False, "error": "账号文件不存在"}
+
+
+def cleanup_zero_point_accounts() -> dict:
+    """删除所有积分为 0 的账号文件，返回删除详情。"""
+    Path(ACCOUNT_DIR).mkdir(parents=True, exist_ok=True)
+    deleted = []
+    skipped = []
+    for f in sorted(Path(ACCOUNT_DIR).glob("*.json"), key=lambda p: p.name.lower()):
+        try:
+            acc = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            skipped.append({"file": str(f), "reason": "文件解析失败"})
+            continue
+        try:
+            points = int(acc.get("points") or 0)
+        except (TypeError, ValueError):
+            points = 0
+        if points <= 0:
+            try:
+                os.remove(str(f))
+                deleted.append({"email": acc.get("email", ""), "file": str(f), "points": points})
+            except OSError as e:
+                skipped.append({"file": str(f), "reason": str(e)})
+    return {"success": True, "deleted": deleted, "deleted_count": len(deleted), "skipped": skipped}
 
 
 def test_connection() -> dict:
