@@ -728,6 +728,7 @@ def open_account_browser(
     wait_ms: int = 8000,
     proxy: str = "",
     url: str = "",
+    persistent: bool = False,
 ) -> dict:
     if proxy:
         save_config(proxy=proxy)
@@ -737,8 +738,11 @@ def open_account_browser(
     current_profile_dir = _clean_str(profile_dir) or profile_dir_path()
     target_url = _clean_str(url)
     has_env_cookie = bool(read_env_cookie(current_env_file))
+    # persistent=True 时强制使用持久化 profile（不 incognito），
+    # 避免 temp profile + cookie 注入不稳定导致会话丢失。
+    use_temp_profile = has_env_cookie and not persistent
     launch_port = 22000 + (int.from_bytes(os.urandom(2), "big") % 5000)
-    if target_url and not has_env_cookie and _open_url_in_existing_chrome(current_profile_dir, target_url):
+    if target_url and not use_temp_profile and _open_url_in_existing_chrome(current_profile_dir, target_url):
         return {
             "ok": True,
             "pid": 0,
@@ -753,7 +757,7 @@ def open_account_browser(
         "--visible",
         "--keep-open",
         "--open-only",
-        "--temp-profile" if has_env_cookie else "--persistent-profile",
+        "--temp-profile" if use_temp_profile else "--persistent-profile",
         "--profile", current_profile_dir,
         "--port", str(launch_port),
         "--wait-ms", str(int(wait_ms or 8000)),
@@ -871,6 +875,7 @@ def open_task_browser(task_id: str, url: str = "", wait_ms: int = 8000, proxy: s
                 wait_ms=wait_ms,
                 proxy=proxy,
                 url=target_url or "https://www.dola.com/chat/create-image",
+                persistent=True,
             )
             result["task_session"] = True
             result["task_session_restored"] = True
@@ -2278,18 +2283,22 @@ def _reopen_account_browser_and_collect(task_id: str, conversation_id: str) -> b
         return False
     account_env_file = _clean_str(task.get("account_env_file"))
     account_profile_dir = _clean_str(task.get("account_profile_dir"))
-    if not account_env_file and not account_profile_dir:
+    # 优先使用任务专属 profile（创建任务时从账号 profile 复制而来），
+    # 它保留了任务提交时的完整登录态，比重新从账号 profile 打开更可靠。
+    task_profile_dir = _clean_str(task.get("browser_profile_dir")) or account_profile_dir
+    if not account_env_file and not task_profile_dir:
         return False
     page_url = _clean_str(task.get("page_url")) or f"https://www.dola.com/chat/{conv}"
     try:
         _set_task(task_id, status="collecting", progress=30, error="", fail_reason="正在重新打开账号会话采集 Dola 结果...")
         result = open_account_browser(
-            profile_dir=account_profile_dir,
+            profile_dir=task_profile_dir,
             env_file=account_env_file,
             wait_ms=8000,
             url=page_url,
+            persistent=True,
         )
-        account_payload = {"env_file": account_env_file, "profile_dir": account_profile_dir}
+        account_payload = {"env_file": account_env_file, "profile_dir": task_profile_dir}
         remember_browser_session_for_conversation(conv, result, account_payload)
         try:
             browser_port = int(result.get("port") or 0)
