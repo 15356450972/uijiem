@@ -32,7 +32,8 @@ import {
   Download,
   Copy,
   X,
-  Combine
+  Combine,
+  Type
 } from 'lucide-react';
 import { WIZSTAR_API } from '../config';
 import ImageMergeModal from './ImageMergeModal';
@@ -63,6 +64,111 @@ const writeGenerationTaskRegistry = (items) => {
   }
 };
 
+const updateGenerationTaskRegistry = (taskId, patch) => {
+  if (!taskId) return;
+  const now = Date.now();
+  writeGenerationTaskRegistry(readGenerationTaskRegistry().map((task) => (
+    task.taskId === taskId ? { ...task, ...patch, updatedAt: now } : task
+  )));
+};
+
+const OREATEAI_STARTUP_RECOVERY_MARKER = '__maocanjuOreateaiStartupRecoveryDone';
+const OREATEAI_INTERRUPTED_MESSAGE = '应用重启，生成任务已中断，请重新提交。';
+
+const archiveInterruptedOreateaiTasks = () => {
+  if (globalThis[OREATEAI_STARTUP_RECOVERY_MARKER]) return;
+  globalThis[OREATEAI_STARTUP_RECOVERY_MARKER] = true;
+
+  const registry = readGenerationTaskRegistry();
+  const now = Date.now();
+  let changed = false;
+  const nextRegistry = registry.map((task) => {
+    if (task?.channel !== 'oreateai' || task.status !== 'processing') return task;
+    changed = true;
+    return {
+      ...task,
+      status: 'failed',
+      progress: 0,
+      error: OREATEAI_INTERRUPTED_MESSAGE,
+      interruptedAt: now,
+      updatedAt: now,
+    };
+  });
+  if (changed) writeGenerationTaskRegistry(nextRegistry);
+};
+
+const OREATEAI_STAGE_PROGRESS = {
+  validated: 8,
+  uploading: 30,
+  chat_creating: 52,
+  risk_runtime: 62,
+  generating: 72,
+  sse: 82,
+  history_recovering: 95,
+  complete: 96,
+};
+
+const oreateaiProgressPatch = (progress = {}) => {
+  let value = OREATEAI_STAGE_PROGRESS[progress.stage] ?? 5;
+  if (progress.stage === 'uploading' && Number(progress.total) > 0) {
+    const assetProgress = Math.max(0, Math.min(1, Number(progress.loaded || 0) / Number(progress.total)));
+    const assetIndex = Math.max(0, Number(progress.index || 0));
+    const assetCount = Math.max(1, Number(progress.totalAssets || 1));
+    value = 10 + Math.round(((assetIndex + assetProgress) / assetCount) * 40);
+  }
+  if (progress.stage === 'sse' && progress.event === 'end') value = 94;
+  return {
+    status: progress.stage === 'failed' ? 'failed' : 'processing',
+    progress: value,
+  };
+};
+
+const compareOreateaiCount = (actual, expression) => {
+  const match = /^(>=|<=|==|!=|>|<)\s*(-?\d+(?:\.\d+)?)$/.exec(String(expression || '').trim());
+  if (!match) return false;
+  const expected = Number(match[2]);
+  return ({ '>=': actual >= expected, '<=': actual <= expected, '==': actual === expected,
+    '!=': actual !== expected, '>': actual > expected, '<': actual < expected })[match[1]];
+};
+
+const getOreateaiEffectiveSlots = (capability, assets = []) => {
+  const restrictions = capability?.restrictions || {};
+  const slots = JSON.parse(JSON.stringify(restrictions.inputSlots || {}));
+  const counts = {
+    image: assets.filter((asset) => asset?.kind === 'image').length,
+    video: assets.filter((asset) => asset?.kind === 'video').length,
+  };
+  (restrictions.slotRules || []).forEach((rule) => {
+    const applies = Object.entries(rule.when || {}).every(([slot, expression]) => compareOreateaiCount(counts[slot] || 0, expression));
+    if (!applies) return;
+    Object.entries(rule.then || {}).forEach(([target, value]) => {
+      const [slot, field] = target.split('.');
+      slots[slot] ||= {};
+      slots[slot][field] = value;
+    });
+  });
+  return { slots, counts, groups: restrictions.inputGroups || [] };
+};
+
+const validateOreateaiAssetSelection = (capability, assets = [], { requireMinimum = false } = {}) => {
+  if (!capability) return '渠道八动态能力尚未加载';
+  const { slots, counts, groups } = getOreateaiEffectiveSlots(capability, assets);
+  for (const [slot, limits] of Object.entries(slots)) {
+    const count = counts[slot] || 0;
+    if (limits.max !== undefined && count > Number(limits.max)) return `${slot === 'image' ? '图片' : '视频'}素材最多允许 ${limits.max} 个`;
+    if (requireMinimum && limits.min !== undefined && count < Number(limits.min)) return `${slot === 'image' ? '图片' : '视频'}素材至少需要 ${limits.min} 个`;
+  }
+  for (const group of groups) {
+    const count = (group.slots || []).reduce((sum, slot) => sum + (counts[slot] || 0), 0);
+    if (group.max !== undefined && count > Number(group.max)) return `参考素材最多允许 ${group.max} 个`;
+    if (requireMinimum && group.min !== undefined && count < Number(group.min)) return `参考素材至少需要 ${group.min} 个`;
+  }
+  if (capability.scene === 'text_or_image' && assets.some((asset) => asset?.kind !== 'image')) return '文生/图生场景只接受图片素材';
+  if (capability.scene === 'text_or_image' && assets.length > 1) return '文生/图生场景最多允许 1 张图片素材';
+  if (requireMinimum && capability.scene === 'reference' && assets.length === 0) return '参考生视频至少需要 1 个本地素材';
+  return '';
+};
+
 const DEFAULT_PROMPT_SUFFIX_TEMPLATES = [
   { id: 'none', name: '无后缀', suffix: '' },
 ];
@@ -72,8 +178,56 @@ const DEFAULT_PROMPT_PREFIX_TEMPLATES = [
   { id: 'none', name: '无前缀', prefix: '' },
 ];
 const PROMPT_PREFIX_TEMPLATES_KEY = 'maocanju_prompt_prefix_templates';
+const PROMPT_INLINE_TOKEN_PATTERN = /([（(][@$#][^（）()\r\n]{1,80}[）)])/g;
+
+const renderPromptPreviewText = (value = '') => {
+  const text = String(value || '');
+  if (!text) {
+    return <span className="text-dark-subtle">请输入描述词，输入 @ 选择角色、$ 选择场景、# 选择物品...</span>;
+  }
+  return text.split(PROMPT_INLINE_TOKEN_PATTERN).filter(Boolean).map((part, index) => {
+    const tokenMatch = /^[（(]([@$#])/.exec(part);
+    if (!tokenMatch) return <React.Fragment key={`text-${index}`}>{part}</React.Fragment>;
+    const trigger = tokenMatch[1];
+    const colorClass = trigger === '@'
+      ? 'border-emerald-400/35 bg-emerald-400/12 text-emerald-100'
+      : trigger === '$'
+        ? 'border-sky-400/35 bg-sky-400/12 text-sky-100'
+        : 'border-amber-400/35 bg-amber-400/12 text-amber-100';
+    return (
+      <span
+        key={`token-${index}`}
+        className={`mx-0.5 inline-flex max-w-[180px] items-center rounded border px-1.5 py-0.5 align-middle text-[10px] font-bold leading-none ${colorClass}`}
+        title={`实际文本：${part}`}
+      >
+        <span className="truncate">{part.slice(1, -1)}</span>
+      </span>
+    );
+  });
+};
 
 const isDolaBusyMessage = (message = '') => /Dola 同一账号一次只能跑一个视频任务|请等待当前任务完成后再提交|正在生成中/.test(String(message || ''));
+
+const formatWaitDuration = (seconds) => {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value < 0) return '';
+  const minutes = Math.max(1, Math.ceil(value / 60));
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest > 0 ? `${hours}小时${rest}分钟` : `${hours}小时`;
+};
+
+const generationWaitLabel = (row = {}) => {
+  const elapsed = formatWaitDuration(row.elapsedSeconds);
+  const remaining = formatWaitDuration(row.estimatedWaitSeconds ?? row.remainingSeconds);
+  const timeout = formatWaitDuration(row.timeoutSeconds);
+  if (elapsed && remaining) return `已等 ${elapsed} · 最多还剩 ${remaining}`;
+  if (remaining) return `最多还剩 ${remaining}`;
+  if (timeout) return `最长等待 ${timeout}`;
+  if (elapsed) return `已等 ${elapsed}`;
+  return '';
+};
 
 const statusUrlForTask = (task) => task.channel === 'pixmax'
   ? `${WIZSTAR_API}/pixmax/tasks/${task.taskId}/status`
@@ -83,7 +237,13 @@ const statusUrlForTask = (task) => task.channel === 'pixmax'
       ? `${WIZSTAR_API}/chatgpt2api/tasks/${task.taskId}/status`
       : task.channel === 'dola'
         ? `${WIZSTAR_API}/dola/tasks/${task.taskId}/status`
-        : `${WIZSTAR_API}/tasks/${task.taskId}/status`;
+        : task.channel === 'lovart'
+          ? `${WIZSTAR_API}/lovart/tasks/${task.taskId}/status`
+          : task.channel === 'framia'
+            ? `${WIZSTAR_API}/framia/tasks/${task.taskId}/status`
+            : task.channel === 'tensorart'
+              ? `${WIZSTAR_API}/tensorart/tasks/${task.taskId}/status`
+              : `${WIZSTAR_API}/tasks/${task.taskId}/status`;
 
 const isLocalFilePathValue = (url = '') => /^\/(?!\/)/.test(String(url || '')) || /^[a-zA-Z]:[\\/]/.test(String(url || '')) || /^\\\\/.test(String(url || ''));
 const LOCAL_VIDEO_CACHE_BUSTER = String(Date.now());
@@ -204,6 +364,37 @@ const inferResultMediaType = (payload = {}, task = {}, fallbackUrl = '') => {
   return 'image';
 };
 
+const firstHttpMediaUrl = (...values) => values
+  .map(value => String(value || '').trim())
+  .find(value => /^https?:\/\//i.test(value)) || '';
+
+const safeMediaNamePart = (value = '') => String(value || '')
+  .replace(/[^a-zA-Z0-9._-]+/g, '-')
+  .replace(/^-+|-+$/g, '')
+  .slice(0, 48);
+
+const autoDownloadGeneratedMedia = async (task = {}, payload = {}, mediaUrl = '') => {
+  const remoteUrl = firstHttpMediaUrl(payload.video_url, payload.image_url, payload.cdn_url, payload.download_url, mediaUrl, task.videoUrl, task.imageUrl, task.cdnUrl, task.downloadUrl, task.mediaUrl);
+  if (!remoteUrl || !window.electronAPI?.downloadGeneratedMedia) return '';
+
+  const mediaType = inferResultMediaType(payload, task, remoteUrl);
+  const ext = mediaType === 'video' ? 'mp4' : 'png';
+  const taskPart = safeMediaNamePart(task.taskId) || String(Date.now());
+  const segPart = safeMediaNamePart(task.segId) || 'segment';
+  const channelPart = safeMediaNamePart(task.channel) || 'generated';
+
+  const result = await window.electronAPI.downloadGeneratedMedia({
+    url: remoteUrl,
+    ext,
+    defaultName: `${channelPart}-${segPart}-${taskPart}`,
+    channel: task.channel || 'generated',
+    projectId: task.draftId || '',
+    segmentId: task.segId || '',
+  });
+  if (result?.ok && result.filePath) return result.filePath;
+  throw new Error(result?.error || '自动下载生成结果失败');
+};
+
 const shouldAutoCollectDolaTask = (task = {}, payload = {}) => {
   const status = payload.status || task.status || '';
   const conversationId = payload.conversation_id || task.conversationId || '';
@@ -249,6 +440,8 @@ const startGlobalGenerationPolling = () => {
     const now = Date.now();
     const registry = readGenerationTaskRegistry().filter(t => {
       if (!t || !t.taskId || t.status === 'completed' || t.status === 'failed') return false;
+      // OreateAI 是由 Electron 主进程内的 SSE 驱动的本地统一任务，不存在后端 status 轮询接口。
+      if (t.channel === 'oreateai') return false;
       // Dola tasks stop auto-polling 10 minutes after creation; user must trigger manual collect after that.
       if (t.channel === 'dola' && t.createdAt && (now - t.createdAt) > DOLA_AUTO_POLL_TIMEOUT_MS) return false;
       return true;
@@ -287,10 +480,12 @@ const startGlobalGenerationPolling = () => {
           const data = await res.json();
           const payload = data.data || {};
           let status = payload.status || 'processing';
-          const localPath = payload.local_path || task.localPath || '';
+          let localPath = payload.local_path || task.localPath || '';
           let nextMediaUrl = mediaUrlFromPayload(payload, task);
           let autoCollectStartedAt = task.autoCollectStartedAt || 0;
           let autoCollectError = task.autoCollectError || '';
+          let downloadError = task.downloadError || '';
+          let downloadRetryCount = Number(task.downloadRetryCount || 0);
 
           if (shouldAutoCollectDolaTask(task, payload)) {
             try {
@@ -298,9 +493,28 @@ const startGlobalGenerationPolling = () => {
               const collectPayload = await triggerAutoCollectDolaTask(task, payload);
               status = collectPayload.status || 'collecting';
               nextMediaUrl = mediaUrlFromPayload(collectPayload, { ...task, mediaUrl: nextMediaUrl });
+              localPath = collectPayload.local_path || localPath;
               autoCollectError = '';
             } catch (collectError) {
               autoCollectError = collectError.message || String(collectError);
+            }
+          }
+
+          if (status === 'completed' && !localPath) {
+            try {
+              const downloadedLocalPath = await autoDownloadGeneratedMedia(task, payload, nextMediaUrl);
+              if (downloadedLocalPath) {
+                localPath = downloadedLocalPath;
+                nextMediaUrl = downloadedLocalPath;
+                downloadError = '';
+                downloadRetryCount = 0;
+              }
+            } catch (downloadFailure) {
+              downloadError = downloadFailure.message || String(downloadFailure);
+              downloadRetryCount += 1;
+              if (task.channel === 'tensorart' && downloadRetryCount <= 3) {
+                status = 'processing';
+              }
             }
           }
           updatedById.set(task.taskId, {
@@ -308,6 +522,11 @@ const startGlobalGenerationPolling = () => {
             status,
             progress: payload.progress,
             queuePosition: payload.queue_position,
+            elapsedSeconds: payload.elapsed_seconds ?? task.elapsedSeconds,
+            remainingSeconds: payload.remaining_seconds ?? task.remainingSeconds,
+            timeoutSeconds: payload.timeout_seconds ?? task.timeoutSeconds,
+            estimatedWaitSeconds: payload.estimated_wait_seconds ?? task.estimatedWaitSeconds,
+            startedAtSeconds: payload.started_at ?? task.startedAtSeconds,
             mediaUrl: nextMediaUrl,
             videoUrl: payload.video_url || task.videoUrl || '',
             imageUrl: payload.image_url || task.imageUrl || '',
@@ -322,11 +541,16 @@ const startGlobalGenerationPolling = () => {
             conversationId: payload.conversation_id || task.conversationId || '',
             localConversationId: payload.local_conversation_id || task.localConversationId || '',
             pageUrl: payload.page_url || task.pageUrl || '',
-            sendMode: payload.send_mode || task.sendMode || '',
-            sendModeLabel: payload.send_mode_label || task.sendModeLabel || '',
+            sendMode: 'api',
+            sendModeLabel: payload.send_mode_label || task.sendModeLabel || '纯 API（默认）',
+            browserHeadless: false,
             autoCollectStartedAt,
             autoCollectError,
-            error: payload.fail_reason || payload.error || payload.message || autoCollectError || task.error || '',
+            downloadError,
+            downloadRetryCount,
+            error: status === 'completed' && localPath
+              ? ''
+              : (payload.fail_reason || payload.error || payload.message || autoCollectError || downloadError || task.error || ''),
             updatedAt: Date.now(),
           });
         } catch (e) {
@@ -351,10 +575,37 @@ const startGlobalGenerationPolling = () => {
 export default function ContentCreation({ activeDraft, onBack, onProjectChanged }) {
   const GLOBAL_GENERATION_SETTINGS_KEY = 'maocanju_global_generation_settings';
   const DOLA_DEFAULT_DURATION_LABEL = '10秒';
+  const TENSORART_DURATION_CREDITS = {
+    4: 19,
+    5: 24,
+    6: 28,
+    7: 33,
+    8: 37,
+    9: 42,
+    10: 47,
+  };
+  const TENSORART_DURATION_OPTIONS = Object.keys(TENSORART_DURATION_CREDITS).map(seconds => `${seconds}秒`);
   const OIIOII_DEFAULT_SETTINGS = {
     model: 'nano-pro',
     aspectRatio: '1:1',
     resolution: '1K',
+  };
+  const LOVART_DEFAULT_SETTINGS = {
+    model: '渠道七 Lovart',
+    aspectRatio: '16:9',
+    resolution: '2K',
+  };
+  const FRAMIA_DEFAULT_SETTINGS = {
+    model: 'Seedance 2.0 Mini',
+    aspectRatio: '16:9',
+    resolution: '720p',
+    duration: '4秒',
+  };
+  const OREATEAI_DEFAULT_SETTINGS = {
+    model: 'Seedance 2.0 Mini',
+    aspectRatio: '16:9',
+    duration: '5秒',
+    resolution: '720',
   };
   const DEFAULT_GLOBAL_GENERATION_SETTINGS = {
     model: 'Seedance 2.0',
@@ -372,6 +623,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       if (key === 'duration') {
         const channel = (settings.generateChannel || localStorage.getItem('maocanju_generate_channel') || DEFAULT_GLOBAL_GENERATION_SETTINGS.generateChannel);
         if (channel === 'dola' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.duration)) return DOLA_DEFAULT_DURATION_LABEL;
+        if (channel === 'tensorart') {
+          const seconds = Number.parseInt(String(value || '').replace(/\D/g, ''), 10);
+          if (!Number.isFinite(seconds) || seconds < 4 || seconds > 10) return '4秒';
+        }
       }
       if (key === 'model' && (settings.generateChannel || localStorage.getItem('maocanju_generate_channel')) === 'oiioii' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.model)) {
         return OIIOII_DEFAULT_SETTINGS.model;
@@ -382,15 +637,34 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       if (key === 'resolution' && (settings.generateChannel || localStorage.getItem('maocanju_generate_channel')) === 'oiioii' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.resolution)) {
         return OIIOII_DEFAULT_SETTINGS.resolution;
       }
+      if (key === 'model' && (settings.generateChannel || localStorage.getItem('maocanju_generate_channel')) === 'lovart' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.model)) {
+        return LOVART_DEFAULT_SETTINGS.model;
+      }
+      if (key === 'aspectRatio' && (settings.generateChannel || localStorage.getItem('maocanju_generate_channel')) === 'lovart' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.aspectRatio)) {
+        return LOVART_DEFAULT_SETTINGS.aspectRatio;
+      }
+      if (key === 'resolution' && (settings.generateChannel || localStorage.getItem('maocanju_generate_channel')) === 'lovart' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.resolution)) {
+        return LOVART_DEFAULT_SETTINGS.resolution;
+      }
+      if ((settings.generateChannel || localStorage.getItem('maocanju_generate_channel')) === 'oreateai' && (!value || (key === 'resolution' && value === DEFAULT_GLOBAL_GENERATION_SETTINGS.resolution))) {
+        return OREATEAI_DEFAULT_SETTINGS[key] || normalized;
+      }
       return normalized;
     } catch {
       const channel = localStorage.getItem('maocanju_generate_channel');
       if (key === 'duration' && channel === 'dola') return DOLA_DEFAULT_DURATION_LABEL;
+      if (key === 'duration' && channel === 'tensorart') return '4秒';
       if (channel === 'oiioii') {
         if (key === 'model') return OIIOII_DEFAULT_SETTINGS.model;
         if (key === 'aspectRatio') return OIIOII_DEFAULT_SETTINGS.aspectRatio;
         if (key === 'resolution') return OIIOII_DEFAULT_SETTINGS.resolution;
       }
+      if (channel === 'lovart') {
+        if (key === 'model') return LOVART_DEFAULT_SETTINGS.model;
+        if (key === 'aspectRatio') return LOVART_DEFAULT_SETTINGS.aspectRatio;
+        if (key === 'resolution') return LOVART_DEFAULT_SETTINGS.resolution;
+      }
+      if (channel === 'oreateai') return OREATEAI_DEFAULT_SETTINGS[key] || DEFAULT_GLOBAL_GENERATION_SETTINGS[key];
       return DEFAULT_GLOBAL_GENERATION_SETTINGS[key];
     }
   };
@@ -400,20 +674,78 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   const [globalAspectRatio, setGlobalAspectRatio] = useState(() => readGlobalGenerationSetting('aspectRatio'));
   const [globalDuration, setGlobalDuration] = useState(() => readGlobalGenerationSetting('duration'));
   const [globalResolution, setGlobalResolution] = useState(() => readGlobalGenerationSetting('resolution'));
-  // 生成通道：'wizstar'（账号池/渠道一）| 'pixmax'（渠道二）| 'oiioii'（渠道四）| 'chatgpt2api'（渠道五生图）| 'dola'（渠道六）
+  // 生成通道：'wizstar'（账号池/渠道一）| 'pixmax'（渠道二）| 'oiioii'（渠道四）| 'chatgpt2api'（渠道五生图）| 'dola'（渠道六）| 'lovart'（渠道七）| 'oreateai'（渠道八）| 'framia'（渠道九）| 'tensorart'（渠道十）
   const [generateChannel, setGenerateChannel] = useState(() => readGlobalGenerationSetting('generateChannel'));
-  const [dolaSendMode, setDolaSendMode] = useState('browser');
-  const [dolaSendModeLabel, setDolaSendModeLabel] = useState('浏览器发送');
+  const [oreateaiCapabilities, setOreateaiCapabilities] = useState(null);
+  const [oreateaiCapabilitiesLoading, setOreateaiCapabilitiesLoading] = useState(false);
+  const [oreateaiCapabilitiesError, setOreateaiCapabilitiesError] = useState('');
+  const [oreateaiScene, setOreateaiScene] = useState('');
+  const [oreateaiAudio, setOreateaiAudio] = useState(false);
+  const getOreateaiCapability = (modelName = globalModel, scene = oreateaiScene) => (
+    oreateaiCapabilities?.capabilities?.find((item) => item.modelName === modelName && item.scene === scene) || null
+  );
+  const getOreateaiCombination = (capability, settings = {}) => {
+    if (!capability) return null;
+    const duration = Number(settings.duration ?? resolveDurationSeconds(globalDuration, globalDuration, 5));
+    const resolution = String(settings.resolution ?? globalResolution);
+    const audio = settings.audio ?? oreateaiAudio;
+    const matched = capability.combinations.find((item) => (
+      item.duration === duration
+      && item.resolution === resolution
+      && (capability.scene === 'reference' || item.audio === null || item.audio === Boolean(audio))
+    ));
+    return matched || capability.combinations[0] || null;
+  };
+  const refreshOreateaiCapabilities = useCallback(async () => {
+    if (!window.electronAPI?.oreateaiVideoCapabilities) {
+      setOreateaiCapabilitiesError('渠道八仅支持 Electron 桌面端');
+      return null;
+    }
+    setOreateaiCapabilitiesLoading(true);
+    setOreateaiCapabilitiesError('');
+    try {
+      const response = await window.electronAPI.oreateaiVideoCapabilities({});
+      if (!response?.ok || !response.data?.capabilities?.length) {
+        throw new Error(response?.error || '渠道八未返回可用的视频能力');
+      }
+      setOreateaiCapabilities(response.data);
+      return response.data;
+    } catch (error) {
+      setOreateaiCapabilitiesError(error.message || String(error));
+      return null;
+    } finally {
+      setOreateaiCapabilitiesLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    if (generateChannel !== 'oreateai') return;
+    refreshOreateaiCapabilities();
+  }, [generateChannel, refreshOreateaiCapabilities]);
+  useEffect(() => {
+    if (generateChannel !== 'oreateai' || !oreateaiCapabilities?.capabilities?.length) return;
+    const modelName = oreateaiCapabilities.models.includes(globalModel)
+      ? globalModel
+      : oreateaiCapabilities.models[0];
+    const capability = getOreateaiCapability(modelName, oreateaiScene)
+      || oreateaiCapabilities.capabilities.find((item) => item.modelName === modelName);
+    if (!capability) return;
+    if (oreateaiScene !== capability.scene) setOreateaiScene(capability.scene);
+    const combination = getOreateaiCombination(capability);
+    if (!combination) return;
+    const ratio = capability.ratios.includes(globalAspectRatio) ? globalAspectRatio : capability.ratios[0];
+    if (modelName !== globalModel) setGlobalModel(modelName);
+    if (ratio && ratio !== globalAspectRatio) setGlobalAspectRatio(ratio);
+    if (`${combination.duration}秒` !== globalDuration) setGlobalDuration(`${combination.duration}秒`);
+    if (combination.resolution !== globalResolution) setGlobalResolution(combination.resolution);
+  }, [generateChannel, oreateaiCapabilities, globalModel, oreateaiScene, globalAspectRatio, globalDuration, globalResolution, oreateaiAudio]);
+  const [dolaSendModeLabel, setDolaSendModeLabel] = useState('纯 API（默认）');
   const refreshDolaConfig = useCallback(async () => {
     try {
       const res = await fetch(`${WIZSTAR_API}/dola/config`);
       if (!res.ok) return;
       const data = await res.json();
       const payload = data.data || {};
-      const nextMode = payload.send_mode === 'api' ? 'api' : 'browser';
-      const nextLabel = payload.send_mode_label || (nextMode === 'api' ? 'API发送' : '浏览器发送');
-      setDolaSendMode(nextMode);
-      setDolaSendModeLabel(nextLabel);
+      setDolaSendModeLabel(payload.send_mode_label || '纯 API（默认）');
     } catch (_) {
       // 本地后端不可达时保留当前展示值。
     }
@@ -438,8 +770,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     '渠道四 Seedream 4.5',
     '渠道四 Midjourney niji7',
     '渠道四 Midjourney niji6',
+    '渠道四 Midjourney v8',
     '渠道四 NovelAI',
     '渠道四 GPT-4o',
+    '渠道七 Lovart',
   ]);
   const VIDEO_MODEL_NAMES = new Set([
     'Seedance 2.0',
@@ -449,17 +783,20 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     '渠道二 高质量',
     '渠道四 Gemini',
     '渠道四 Grok',
+    '渠道四 Grok 1.5',
     '渠道六 Seedance 2.0',
     '渠道六 Seedance 1.5',
     '渠道六 Seedance Lite',
+    '渠道九 Seedance 2.0 Mini',
+    '渠道九 Kling 3.0',
   ]);
   const getModelMediaType = (modelName) => IMAGE_MODEL_NAMES.has(modelName) ? 'image' : 'video';
   const getModelLabel = (modelName) => getModelMediaType(modelName) === 'image' ? '图片' : '视频';
   const getRowModelName = (row) => {
     const currentModel = row?.model || globalModel;
     const rowType = row?.type || getModelMediaType(currentModel);
-    if (rowType === 'image' && !IMAGE_MODEL_NAMES.has(currentModel)) return generateChannel === 'chatgpt2api' ? '渠道五 GPT-Image2' : '渠道四 GPT-Image2';
-    if (rowType === 'video' && IMAGE_MODEL_NAMES.has(currentModel)) return generateChannel === 'oiioii' ? '渠道四 Gemini' : generateChannel === 'dola' ? '渠道六 Seedance 2.0' : 'Seedance 2.0';
+    if (rowType === 'image' && !IMAGE_MODEL_NAMES.has(currentModel)) return generateChannel === 'chatgpt2api' ? '渠道五 GPT-Image2' : generateChannel === 'lovart' ? '渠道七 Lovart' : '渠道四 GPT-Image2';
+    if (rowType === 'video' && IMAGE_MODEL_NAMES.has(currentModel)) return generateChannel === 'oiioii' ? '渠道四 Gemini' : generateChannel === 'dola' ? '渠道六 Seedance 2.0' : generateChannel === 'framia' ? '渠道九 Seedance 2.0 Mini' : generateChannel === 'tensorart' ? '渠道十 Tensor.Art 视频' : 'Seedance 2.0';
     return currentModel;
   };
   const getRowMediaLabel = (row) => {
@@ -473,6 +810,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   // 与 Seedance 2.0 官方 API 一致，不存在"4:3 被静默改成 16:9"的情况。
   const DOLA_VIDEO_ASPECT_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'];
   const getSupportedAspectRatios = ({ channel = generateChannel, modelName = globalModel, mediaType = getModelMediaType(modelName) } = {}) => {
+    if (channel === 'oreateai') {
+      const capability = getOreateaiCapability(modelName, oreateaiScene);
+      return capability?.ratios?.length ? capability.ratios : BASIC_ASPECT_RATIOS;
+    }
     if (channel === 'chatgpt2api' || modelName === '渠道五 GPT-Image2') return CHATGPT2API_IMAGE_ASPECT_RATIOS;
     if (channel === 'dola' && mediaType === 'video') return DOLA_VIDEO_ASPECT_RATIOS;
     if (mediaType === 'image') return EXTENDED_IMAGE_ASPECT_RATIOS;
@@ -784,6 +1125,41 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   const [sceneAssets, setSceneAssets] = useState(() => parseArrayFromStorage(STORAGE_KEY_SCENES));
   const [itemAssets, setItemAssets] = useState(() => parseArrayFromStorage(STORAGE_KEY_ITEMS));
 
+  const stripLargePreviewPayload = (value) => {
+    if (Array.isArray(value)) return value.map(stripLargePreviewPayload);
+    if (!value || typeof value !== 'object') return value;
+    const next = { ...value };
+    for (const key of ['dataUrl', 'base64', 'imageData', 'videoData']) {
+      if (typeof next[key] === 'string' && next[key].startsWith('data:')) next[key] = '';
+    }
+    for (const key of ['thumbnail', 'displayUrl', 'url', 'src', 'sourceUrl', 'remoteUrl']) {
+      if (typeof next[key] === 'string' && next[key].startsWith('data:')) next[key] = '';
+    }
+    for (const [key, child] of Object.entries(next)) {
+      if (child && typeof child === 'object') next[key] = stripLargePreviewPayload(child);
+    }
+    return next;
+  };
+
+  const setLocalStorageJson = (key, value, fallbackValue = null) => {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+      return true;
+    } catch (error) {
+      if (fallbackValue === null) {
+        console.warn(`Failed to save ${key}:`, error);
+        return false;
+      }
+      try {
+        localStorage.setItem(key, JSON.stringify(fallbackValue));
+        return true;
+      } catch (fallbackError) {
+        console.warn(`Failed to save ${key}:`, fallbackError);
+        return false;
+      }
+    }
+  };
+
 
   // 三种触发符 → 对应资产类型的元数据，统一驱动下拉与插入
   const TRIGGERS = {
@@ -815,6 +1191,18 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   const toLocalVideoUrl = toLocalVideoUrlValue;
   const toLocalImageUrl = toLocalImageUrlValue;
   const toPlayableUrl = toPlayableVideoUrlValue;
+  const toDisplayImageUrl = (value = '', fallbackPath = '') => {
+    const raw = String(value || '').trim();
+    if (/^(data:image\/|blob:|https?:\/\/)/i.test(raw)) return raw;
+    if (raw.startsWith('/local/image')) return `${WIZSTAR_API}${raw}`;
+    const localPath = localFilePathFromUrl(raw) || localFilePathFromUrl(fallbackPath);
+    if (localPath) return toLocalImageUrl(localPath);
+    return raw || String(fallbackPath || '').trim();
+  };
+  const displayAvatarUrlForAsset = (asset = {}) => toDisplayImageUrl(
+    asset?.avatar || '',
+    asset?.avatarPath || asset?.localPath || ''
+  );
   const originalLocalVideoPathFromPlayable = (filePath = '') => {
     const raw = String(filePath || '').trim();
     if (!/\.playable\.[^.]+$/i.test(raw)) return '';
@@ -881,6 +1269,14 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     alert('当前环境不支持文件选择，请在桌面客户端中使用此功能。');
     return [];
   };
+  const persistLocalImagePath = async (filePath) => {
+    const value = String(filePath || '').trim();
+    if (!value) return { ok: false, error: '参考图路径为空' };
+    if (window.electronAPI?.persistLocalImage) {
+      return await window.electronAPI.persistLocalImage(value);
+    }
+    return { ok: true, path: value };
+  };
   const selectLocalImageDirectory = async () => {
     if (window.electronAPI && window.electronAPI.selectImageDirectory) {
       return await window.electronAPI.selectImageDirectory();
@@ -890,18 +1286,21 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   };
   const getReferenceDisplayUrl = (seg) => {
     if (seg?.referenceImage && typeof seg.referenceImage === 'object') {
+      if (seg.referenceImage.source === 'role') return '';
       return seg.referenceImage.displayUrl || seg.referenceImage.dataUrl || seg.referenceImage.remoteUrl || seg.referenceImage.uploadUrl || '';
     }
     return seg?.referenceImage || '';
   };
   const getReferenceLocalPath = (seg) => {
     if (seg?.referenceImage && typeof seg.referenceImage === 'object') {
+      if (seg.referenceImage.source === 'role') return '';
       return seg.referenceImage.localPath || '';
     }
     return seg?.referenceImagePath || '';
   };
   const getReferenceDataUrl = (seg) => {
     if (seg?.referenceImage && typeof seg.referenceImage === 'object') {
+      if (seg.referenceImage.source === 'role') return '';
       return seg.referenceImage.dataUrl || '';
     }
     const legacyRef = seg?.referenceImage || '';
@@ -909,6 +1308,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   };
   const getReferenceRemoteUrl = (seg) => {
     if (seg?.referenceImage && typeof seg.referenceImage === 'object') {
+      if (seg.referenceImage.source === 'role') return '';
       return seg.referenceImage.uploadUrl || seg.referenceImage.remoteUrl || '';
     }
     const legacyRef = seg?.referenceImage || '';
@@ -962,6 +1362,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     associatedCharacters: [],
     referenceImage: '',
     referenceImagePath: '',
+    oreateaiAssets: [],
     materialsVideo: [],
     materialsImage: [],
     currentMaterialVideo: createEmptyMaterial('video'),
@@ -969,6 +1370,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     generating: false,
     generateStatus: null,
     generateProgress: null,
+    queuePosition: null,
+    elapsedSeconds: null,
+    remainingSeconds: null,
+    timeoutSeconds: null,
+    estimatedWaitSeconds: null,
     generationError: '',
     pendingTaskId: null,
     pendingTaskIds: [],
@@ -1013,13 +1419,22 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       ...seg,
       associatedCharacters: asArray(seg.associatedCharacters).map((char) => (
         char && typeof char === 'object'
-          ? { ...char }
-          : { name: String(char || ''), role: '', avatar: '', avatarPath: '' }
+          ? { ...char, sendImage: char.sendImage !== false }
+          : { name: String(char || ''), role: '', avatar: '', avatarPath: '', sendImage: true }
       )),
       referenceImage: seg.referenceImage && typeof seg.referenceImage === 'object'
         ? seg.referenceImage
         : (localPath ? makeLocalReferenceImage(localPath) : (dataUrl ? makeDataUrlReferenceImage(dataUrl) : (remoteUrl ? makeRemoteReferenceImage(remoteUrl) : displayUrl))),
       referenceImagePath: localPath,
+      oreateaiAssets: asArray(seg.oreateaiAssets).filter((asset) => (
+        asset && typeof asset === 'object' && typeof asset.path === 'string' && (asset.kind === 'image' || asset.kind === 'video')
+      )).map((asset) => ({
+        path: asset.path,
+        name: String(asset.name || asset.path.split(/[\\/]/).pop() || '素材'),
+        kind: asset.kind,
+        size: Number(asset.size || 0),
+        durationSec: Number(asset.durationSec || 0),
+      })),
       materialsVideo: normalizeMediaList(seg.materialsVideo, 'video'),
       materialsImage: normalizeMediaList(seg.materialsImage, 'image'),
       currentMaterialVideo: seg.currentMaterialVideo && typeof seg.currentMaterialVideo === 'object'
@@ -1164,20 +1579,20 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     const associatedChars = Array.isArray(seg?.associatedCharacters) ? seg.associatedCharacters : [];
     const associatedByName = new Map(
       associatedChars
-        .map(char => [String(char?.name || '').trim(), char])
+        .map(char => [cleanAssetName(char?.name, '@'), char])
         .filter(([name]) => name)
     );
     const assetByName = new Map(
       (characterAssets || [])
-        .map(char => [String(char?.name || '').trim(), char])
+        .map(char => [cleanAssetName(char?.name, '@'), char])
         .filter(([name]) => name)
     );
-    const orderedNames = textNames.length > 0
-      ? textNames
-      : associatedChars.map(char => String(char?.name || '').trim()).filter(Boolean);
 
-    return orderedNames.map((name) => {
-      const char = associatedByName.get(name) || assetByName.get(name);
+    return textNames.map((name) => {
+      const association = associatedByName.get(name);
+      if (association?.sendImage === false) return null;
+      const char = assetByName.get(name);
+      if (!char) return null;
       const ref = getCharacterImageRef(char);
       if (!ref) return null;
       return { ref, alias: name };
@@ -1189,6 +1604,56 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
   const getSegmentCharacterAliases = (seg, promptText = '') =>
     getSegmentCharacterImageBindings(seg, promptText).map(item => item.alias).filter(Boolean);
+
+  const getReferencedCharacterDisplayItems = (seg, promptText = '') => {
+    const associatedByName = new Map(
+      asArray(seg?.associatedCharacters)
+        .map(char => [cleanAssetName(char?.name, '@'), char])
+        .filter(([name]) => name)
+    );
+    const assetByName = new Map(
+      asArray(characterAssets)
+        .map(char => [cleanAssetName(char?.name, '@'), char])
+        .filter(([name]) => name)
+    );
+    return parseReferencedCharacterNames(promptText || seg?.text || '').map((name) => {
+      const association = associatedByName.get(name);
+      const currentAsset = assetByName.get(name) || null;
+      const asset = currentAsset || association || null;
+      const imageRef = getCharacterImageRef(currentAsset);
+      return {
+        name,
+        asset,
+        hasAsset: Boolean(currentAsset),
+        hasImage: Boolean(imageRef),
+        sendImage: Boolean(imageRef) && association?.sendImage !== false,
+      };
+    });
+  };
+
+  const setCharacterImagePreference = (rowId, characterName, sendImage) => {
+    const normalizedName = cleanAssetName(characterName, '@');
+    const sourceAsset = characterAssets.find(
+      char => cleanAssetName(char?.name, '@') === normalizedName
+    );
+    setSegments(prev => prev.map(seg => {
+      if (seg.id !== rowId) return seg;
+      const associated = asArray(seg.associatedCharacters);
+      const existingIndex = associated.findIndex(
+        char => cleanAssetName(char?.name, '@') === normalizedName
+      );
+      const nextCharacter = {
+        ...(existingIndex >= 0 ? associated[existingIndex] : {}),
+        ...(sourceAsset || {}),
+        name: normalizedName,
+        sendImage: Boolean(sendImage),
+      };
+      const nextAssociated = existingIndex >= 0
+        ? associated.map((char, index) => index === existingIndex ? nextCharacter : char)
+        : [...associated, nextCharacter];
+      return { ...seg, associatedCharacters: nextAssociated };
+    }));
+  };
 
   const getSegmentSceneImageRefs = (promptText = '') => {
     const sceneNames = parseReferencedSceneNames(promptText);
@@ -1210,8 +1675,6 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   };
 
   const imageRefToReference = (ref) => ref?.file_path || ref?.data_url || ref?.image || '';
-
-  const getSegmentCharacterImageRef = (seg, promptText = '') => getSegmentCharacterImageRefs(seg, promptText)[0] || null;
 
   // ---- 图片合并：把"角色 / 场景 / 物品 / 垫图"统一转成 ImageMergeModal 需要的 item ----
   const parseReferencedItemNames = (text = '') => {
@@ -1272,12 +1735,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
     const promptText = buildPromptWithSuffix(promptDraftsRef.current[row.id] ?? row.text ?? '');
 
-    const characterByName = new Map(
-      (characterAssets || []).map((c) => [String(c?.name || '').trim(), c]).filter(([n]) => n)
-    );
-    parseReferencedCharacterNames(promptText).forEach((name) => {
-      const asset = characterByName.get(name)
-        || (row.associatedCharacters || []).find((c) => String(c?.name || '').trim() === name);
+    getReferencedCharacterDisplayItems(row, promptText).forEach(({ name, asset, sendImage }) => {
+      if (!sendImage) return;
       const src = assetToMergeSrc(asset);
       if (src) push({ ...src, label: name, labelPrefix: '@' });
     });
@@ -1756,6 +2215,63 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     return Array.from(clipboardData?.files || []).find((file) => /^image\//i.test(file.type || '')) || null;
   };
 
+  // Convert prompt text to a white-background image and set as reference image (垫图)
+  const handleTextToReferenceImage = (rowId) => {
+    const seg = segments.find(s => s.id === rowId);
+    const promptText = buildPromptWithSuffix(promptDraftsRef.current[rowId] ?? seg?.text ?? '');
+    if (!promptText || promptText.trim().length === 0) {
+      alert('请先填写描述词，再点击「描述词转垫图」');
+      return;
+    }
+    try {
+      const padding = 40;
+      const maxWidth = 1024;
+      const fontSize = 28;
+      const lineHeight = fontSize * 1.6;
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      ctx.font = `${fontSize}px "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", sans-serif`;
+      // Word-wrap the text
+      const lines = [];
+      for (const paragraph of promptText.split('\n')) {
+        if (paragraph.trim() === '') { lines.push(''); continue; }
+        let current = '';
+        for (const char of paragraph) {
+          const testLine = current + char;
+          if (ctx.measureText(testLine).width > maxWidth - padding * 2 && current) {
+            lines.push(current);
+            current = char;
+          } else {
+            current = testLine;
+          }
+        }
+        if (current) lines.push(current);
+      }
+      const totalHeight = padding * 2 + lines.length * lineHeight;
+      canvas.width = maxWidth;
+      canvas.height = Math.max(totalHeight, 200);
+      // White background
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      // Draw text
+      ctx.fillStyle = '#000000';
+      ctx.font = `${fontSize}px "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB", sans-serif`;
+      ctx.textBaseline = 'top';
+      lines.forEach((line, i) => {
+        ctx.fillText(line, padding, padding + i * lineHeight);
+      });
+      const dataUrl = canvas.toDataURL('image/png');
+      setSegments(prev => prev.map(s => s.id === rowId ? {
+        ...s,
+        referenceImage: makeDataUrlReferenceImage(dataUrl),
+        referenceImagePath: '',
+      } : s));
+    } catch (e) {
+      console.warn('Text to reference image failed:', e);
+      alert(`描述词转垫图失败：${e.message || e}`);
+    }
+  };
+
   const handlePasteReferenceImage = async (rowId, event) => {
     const imageFile = getClipboardImageFile(event.clipboardData);
     if (!imageFile) return;
@@ -2173,7 +2689,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     };
   };
 
-  const imageDragKey = (payload = {}) => [payload.localPath || '', payload.src || '', payload.name || ''].join('|');
+  const imageDragKey = (payload = {}) => [payload.localPath || '', payload.fallbackLocalPath || '', payload.src || '', payload.name || ''].join('|');
 
   const prepareExternalImageDrag = async (material = {}) => {
     if (!material?.thumbnail || material.mediaType === 'video' || isVideoUrl(material.thumbnail)) return null;
@@ -2211,10 +2727,72 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     });
   };
 
+  const getVideoDragPayload = (material = {}) => {
+    const rawLocalPath = material.localPath || '';
+    const originalLocalPath = originalLocalVideoPathFromPlayable(rawLocalPath);
+    const dragLocalPath = originalLocalPath || rawLocalPath;
+    const fallbackLocalPath = originalLocalPath && originalLocalPath !== rawLocalPath ? rawLocalPath : '';
+    const src = material.sourceUrl
+      || material.remoteUrl
+      || (dragLocalPath ? makeLocalFileUrl(dragLocalPath) : '')
+      || (fallbackLocalPath ? makeLocalFileUrl(fallbackLocalPath) : '')
+      || material.thumbnail
+      || '';
+    return {
+      src,
+      localPath: dragLocalPath,
+      fallbackLocalPath,
+      name: material.name || 'video',
+    };
+  };
+
+  const prepareExternalVideoDrag = async (material = {}) => {
+    if (!material?.thumbnail || material.mediaType !== 'video' && !isVideoUrl(material.thumbnail)) return null;
+    if (!window.electronAPI?.prepareVideoDrag) return null;
+    const payload = getVideoDragPayload(material);
+    const key = imageDragKey(payload);
+    const cached = imageDragPrepareRef.current.get(key);
+    if (cached?.ok) return cached;
+    if (cached?.pending) return cached.promise;
+
+    const promise = window.electronAPI.prepareVideoDrag(payload).then((res) => {
+      const next = res?.ok ? { ok: true, file: res.file } : { ok: false, error: res?.error || '准备视频失败' };
+      imageDragPrepareRef.current.set(key, next);
+      return next;
+    }).catch((e) => {
+      const next = { ok: false, error: e.message || String(e) };
+      imageDragPrepareRef.current.set(key, next);
+      return next;
+    });
+    imageDragPrepareRef.current.set(key, { pending: true, promise });
+    return promise;
+  };
+
+  const startExternalVideoDrag = (event, material = {}) => {
+    if (!material?.thumbnail) return;
+    if (!window.electronAPI?.startVideoDrag) return;
+    event.preventDefault();
+    const payload = getVideoDragPayload(material);
+    const cached = imageDragPrepareRef.current.get(imageDragKey(payload));
+    event.dataTransfer.effectAllowed = 'copy';
+    event.dataTransfer.setData('text/plain', payload.src);
+    window.electronAPI.startVideoDrag({
+      ...payload,
+      preparedFile: cached?.ok ? cached.file : '',
+    });
+  };
+
   useEffect(() => {
     if (!window.electronAPI?.onImageDragError) return undefined;
     return window.electronAPI.onImageDragError((message) => {
       alert(`图片拖出失败：${message || '未知错误'}`);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!window.electronAPI?.onVideoDragError) return undefined;
+    return window.electronAPI.onVideoDragError((message) => {
+      alert(`视频拖出失败：${message || '未知错误'}`);
     });
   }, []);
 
@@ -2603,6 +3181,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   const [segments, setSegments] = useState([]);
 
   useEffect(() => {
+    archiveInterruptedOreateaiTasks();
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     const loadProjectPayload = async () => {
       isLoadingProjectRef.current = true;
@@ -2617,6 +3199,21 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
             ? { ...asset }
             : { id: String(asset || ''), name: String(asset || ''), role: '', avatar: '', avatarPath: '' }
         ));
+        const backendScenes = normalizeAssetNames(asArray(data.data?.scene_assets), '$');
+        const backendItems = normalizeAssetNames(asArray(data.data?.item_assets), '#');
+        let cachedScenes = [];
+        let cachedItems = [];
+        try {
+          cachedScenes = normalizeAssetNames(parseArrayFromStorage(STORAGE_KEY_SCENES), '$');
+          cachedItems = normalizeAssetNames(parseArrayFromStorage(STORAGE_KEY_ITEMS), '#');
+        } catch (_) {}
+        // Existing users may still have scene/item assets only in localStorage.
+        // Prefer MySQL once populated, otherwise migrate the local cache forward.
+        const loadedScenes = backendScenes.length > 0 ? backendScenes : cachedScenes;
+        const loadedItems = backendItems.length > 0 ? backendItems : cachedItems;
+        const shouldMigrateLocalAssets =
+          (backendScenes.length === 0 && cachedScenes.length > 0)
+          || (backendItems.length === 0 && cachedItems.length > 0);
         // Backfill pendingAccounts from the backend Dola task list for segments that
         // have pendingTaskIds but no pendingAccounts yet. This recovers the "generating
         // placeholder cell" state right after refresh, even for older tasks.
@@ -2660,8 +3257,9 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     conversationId: t.conversation_id || '',
                     localConversationId: t.local_conversation_id || '',
                     pageUrl: t.page_url || '',
-                    sendMode: t.send_mode || '',
-                    sendModeLabel: t.send_mode_label || '',
+                    sendMode: 'api',
+                    sendModeLabel: t.send_mode_label || '纯 API（默认）',
+                    browserHeadless: false,
                     status: t.status || 'processing',
                     startedAt: Date.now(),
                   };
@@ -2715,8 +3313,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
           });
           if (regChanged) writeGenerationTaskRegistry(reg);
         } catch (_) {}
-        // Merge back referenceImage from localStorage cache for segments where
-        // backend data lost the referenceImage (e.g. unmount flush failed).
+        // Merge back referenceImage AND materialsVideo/materialsImage from localStorage cache
+        // for segments where backend data lost them (e.g. unmount flush failed or fetch was cancelled).
         try {
           const rawLocal = localStorage.getItem(STORAGE_KEY_SEGMENTS);
           if (rawLocal) {
@@ -2728,18 +3326,72 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 if (!local) return s;
                 const hasRefRemote = !!(s.referenceImage && typeof s.referenceImage === 'object' && (s.referenceImage.displayUrl || s.referenceImage.dataUrl || s.referenceImage.remoteUrl || s.referenceImage.localPath));
                 const hasRefLocal = !!(local.referenceImage && typeof local.referenceImage === 'object' && (local.referenceImage.displayUrl || local.referenceImage.dataUrl || local.referenceImage.remoteUrl || local.referenceImage.localPath));
+                let merged = s;
                 if (!hasRefRemote && hasRefLocal) {
-                  return { ...s, referenceImage: local.referenceImage, referenceImagePath: local.referenceImagePath || s.referenceImagePath };
+                  merged = { ...merged, referenceImage: local.referenceImage, referenceImagePath: local.referenceImagePath || merged.referenceImagePath };
                 }
-                return s;
+                // Recover materialsVideo if backend lost them but localStorage has them
+                const localVidCount = (local.materialsVideo || []).length;
+                const remoteVidCount = (merged.materialsVideo || []).length;
+                if (localVidCount > remoteVidCount) {
+                  merged = { ...merged, materialsVideo: local.materialsVideo };
+                  // Also recover currentMaterialVideo if it points to a valid material
+                  const localCurVid = local.currentMaterialVideo;
+                  if (localCurVid && typeof localCurVid === 'object' && localCurVid.thumbnail) {
+                    merged = { ...merged, currentMaterialVideo: localCurVid };
+                  }
+                }
+                // Recover materialsImage if backend lost them but localStorage has them
+                const localImgCount = (local.materialsImage || []).length;
+                const remoteImgCount = (merged.materialsImage || []).length;
+                if (localImgCount > remoteImgCount) {
+                  merged = { ...merged, materialsImage: local.materialsImage };
+                  const localCurImg = local.currentMaterialImage;
+                  if (localCurImg && typeof localCurImg === 'object' && localCurImg.thumbnail) {
+                    merged = { ...merged, currentMaterialImage: localCurImg };
+                  }
+                }
+                return merged;
               });
             }
           }
         } catch (_) {}
         setSegments(loadedSegments);
         setCharacterAssets(loadedChars);
-        localStorage.setItem(STORAGE_KEY_SEGMENTS, JSON.stringify(loadedSegments));
-        localStorage.setItem(STORAGE_KEY_CHARS, JSON.stringify(loadedChars));
+        setSceneAssets(loadedScenes);
+        setItemAssets(loadedItems);
+        // Only update localStorage cache if the merged data is richer than what's already cached.
+        // This prevents overwriting a richer localStorage cache with stale backend data.
+        try {
+          const rawLocal = localStorage.getItem(STORAGE_KEY_SEGMENTS);
+          const localSegs = rawLocal ? JSON.parse(rawLocal) : [];
+          const localById = new Map((Array.isArray(localSegs) ? localSegs : []).map(s => [String(s.id), s]));
+          const isRicher = loadedSegments.some(s => {
+            const local = localById.get(String(s.id));
+            if (!local) return true; // new segment in backend
+            const localVids = (local.materialsVideo || []).length;
+            const remoteVids = (s.materialsVideo || []).length;
+            return remoteVids > localVids;
+          });
+          if (isRicher || !rawLocal) {
+            setLocalStorageJson(STORAGE_KEY_SEGMENTS, loadedSegments, stripLargePreviewPayload(loadedSegments));
+          }
+        } catch (_) {
+          setLocalStorageJson(STORAGE_KEY_SEGMENTS, loadedSegments, stripLargePreviewPayload(loadedSegments));
+        }
+        setLocalStorageJson(STORAGE_KEY_CHARS, loadedChars, stripLargePreviewPayload(loadedChars));
+        setLocalStorageJson(STORAGE_KEY_SCENES, loadedScenes, stripLargePreviewPayload(loadedScenes));
+        setLocalStorageJson(STORAGE_KEY_ITEMS, loadedItems, stripLargePreviewPayload(loadedItems));
+        if (shouldMigrateLocalAssets) {
+          fetch(`${WIZSTAR_API}/projects/${encodeURIComponent(draftId)}/payload`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              scene_assets: loadedScenes,
+              item_assets: loadedItems,
+            }),
+          }).catch((error) => console.warn('迁移场景/物品资产到 MySQL 失败:', error));
+        }
       } catch (e) {
         console.warn('读取后端项目内容失败，临时回退到浏览器本地缓存:', e);
         if (cancelled) return;
@@ -2762,9 +3414,16 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     };
     loadProjectPayload();
     return () => { cancelled = true; };
-  }, [draftId, STORAGE_KEY_SEGMENTS, STORAGE_KEY_CHARS, WIZSTAR_API]);
+  }, [
+    draftId,
+    STORAGE_KEY_SEGMENTS,
+    STORAGE_KEY_CHARS,
+    STORAGE_KEY_SCENES,
+    STORAGE_KEY_ITEMS,
+    WIZSTAR_API,
+  ]);
 
-  // Auto-save segments and characterAssets to backend SQLite, with localStorage as a fallback cache
+  // Auto-save all project assets to backend MySQL, with localStorage as a fallback cache.
   useEffect(() => {
     if (isLoadingProjectRef.current) return;
     const toSave = segments.map(s => ({
@@ -2773,51 +3432,77 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       generateStatus: null,
       generateProgress: null,
       queuePosition: null,
+      elapsedSeconds: null,
+      remainingSeconds: null,
+      timeoutSeconds: null,
+      estimatedWaitSeconds: null,
     }));
-    // Strip base64 data URLs from character avatars to avoid huge persist payloads.
+    // Strip base64 data URLs from asset avatars to avoid huge persist payloads.
     // If avatarPath exists, the avatar can be reconstructed via file:// URL on load.
-    const charsToSave = characterAssets.map(c => {
-      if (c.avatar && c.avatar.startsWith('data:image/') && c.avatarPath) {
-        return { ...c, avatar: makeLocalFileUrl(c.avatarPath) };
+    const serializeAssets = (assets) => assets.map((asset) => {
+      if (asset.avatar && asset.avatar.startsWith('data:image/') && asset.avatarPath) {
+        return { ...asset, avatar: makeLocalFileUrl(asset.avatarPath) };
       }
-      return c;
+      return asset;
     });
-    const persistKey = JSON.stringify({ segments: toSave, character_assets: charsToSave });
+    const charsToSave = serializeAssets(characterAssets);
+    const scenesToSave = serializeAssets(sceneAssets);
+    const itemsToSave = serializeAssets(itemAssets);
+    const payloadToSave = {
+      segments: toSave,
+      character_assets: charsToSave,
+      scene_assets: scenesToSave,
+      item_assets: itemsToSave,
+    };
+    const persistKey = JSON.stringify(payloadToSave);
     if (persistKey === lastPersistKeyRef.current) return;
     lastPersistKeyRef.current = persistKey;
-    try {
-      localStorage.setItem(STORAGE_KEY_SEGMENTS, JSON.stringify(toSave));
-    } catch (e) { console.warn('Failed to save segments cache:', e); }
+    setLocalStorageJson(STORAGE_KEY_SEGMENTS, toSave, stripLargePreviewPayload(toSave));
+    setLocalStorageJson(STORAGE_KEY_CHARS, charsToSave, stripLargePreviewPayload(charsToSave));
+    setLocalStorageJson(STORAGE_KEY_SCENES, scenesToSave, stripLargePreviewPayload(scenesToSave));
+    setLocalStorageJson(STORAGE_KEY_ITEMS, itemsToSave, stripLargePreviewPayload(itemsToSave));
 
     const timer = setTimeout(async () => {
       try {
         const res = await fetch(`${WIZSTAR_API}/projects/${encodeURIComponent(draftId)}/payload`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ segments: toSave, character_assets: charsToSave }),
+          body: JSON.stringify(payloadToSave),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         onProjectChanged?.();
       } catch (e) {
         console.warn('Failed to save project payload:', e);
       }
-    }, 1200);
+    }, 500);
 
     return () => {
       clearTimeout(timer);
       // Flush current pending save to backend so changes are not lost when
-      // switching tabs quickly. Use the current closure's toSave/charsToSave
-      // (not lastPersistKeyRef) to avoid flushing a stale state that could
-      // overwrite a newer save.
+      // switching tabs quickly or closing the app. Use keepalive so the fetch
+      // completes even if the Electron process is exiting.
       try {
         fetch(`${WIZSTAR_API}/projects/${encodeURIComponent(draftId)}/payload`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ segments: toSave, character_assets: charsToSave }),
+          body: JSON.stringify(payloadToSave),
+          keepalive: true,
         }).catch(() => {});
       } catch (_) {}
     };
-  }, [segments, characterAssets, draftId, STORAGE_KEY_SEGMENTS, WIZSTAR_API, onProjectChanged]);
+  }, [
+    segments,
+    characterAssets,
+    sceneAssets,
+    itemAssets,
+    draftId,
+    STORAGE_KEY_SEGMENTS,
+    STORAGE_KEY_CHARS,
+    STORAGE_KEY_SCENES,
+    STORAGE_KEY_ITEMS,
+    WIZSTAR_API,
+    onProjectChanged,
+  ]);
 
   // Sync project-level progress/status back to the projects table so the Dashboard
   // cards reflect real generation progress instead of staying stuck at 0/0.
@@ -2864,23 +3549,17 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
   useEffect(() => {
     if (isLoadingProjectRef.current) return;
-    try {
-      localStorage.setItem(STORAGE_KEY_CHARS, JSON.stringify(characterAssets));
-    } catch (e) { console.warn('Failed to save characterAssets cache:', e); }
+    setLocalStorageJson(STORAGE_KEY_CHARS, characterAssets, stripLargePreviewPayload(characterAssets));
   }, [characterAssets, STORAGE_KEY_CHARS]);
 
   useEffect(() => {
     if (isLoadingProjectRef.current) return;
-    try {
-      localStorage.setItem(STORAGE_KEY_SCENES, JSON.stringify(sceneAssets));
-    } catch (e) { console.warn('Failed to save sceneAssets cache:', e); }
+    setLocalStorageJson(STORAGE_KEY_SCENES, sceneAssets, stripLargePreviewPayload(sceneAssets));
   }, [sceneAssets, STORAGE_KEY_SCENES]);
 
   useEffect(() => {
     if (isLoadingProjectRef.current) return;
-    try {
-      localStorage.setItem(STORAGE_KEY_ITEMS, JSON.stringify(itemAssets));
-    } catch (e) { console.warn('Failed to save itemAssets cache:', e); }
+    setLocalStorageJson(STORAGE_KEY_ITEMS, itemAssets, stripLargePreviewPayload(itemAssets));
   }, [itemAssets, STORAGE_KEY_ITEMS]);
 
   // Reload scene/item assets from local cache when switching drafts
@@ -2966,7 +3645,39 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
   const selectGenerationModel = (modelName, channel) => {
     const nextChannel = channel === 'quickframe' ? 'wizstar' : channel;
+    if (nextChannel === 'oreateai') {
+      const capability = getOreateaiCapability(modelName, oreateaiScene)
+        || oreateaiCapabilities?.capabilities?.find((item) => item.modelName === modelName);
+      if (capability) {
+        setOreateaiScene(capability.scene);
+        const combination = getOreateaiCombination(capability) || capability.combinations[0];
+        const ratio = capability.ratios.includes(globalAspectRatio) ? globalAspectRatio : capability.ratios[0];
+        setGlobalModel(modelName);
+        setGenerateChannel(nextChannel);
+        setModelPopoverTab('video');
+        setGlobalAspectRatio(ratio);
+        setGlobalDuration(`${combination.duration}秒`);
+        setGlobalResolution(combination.resolution);
+        setSegments((prev) => prev.map((segment) => ({
+          ...segment,
+          type: 'video',
+          model: modelName,
+          aspectRatio: ratio,
+          duration: `${combination.duration}秒`,
+          quality: combination.resolution,
+          resolution: combination.resolution,
+        })));
+        setActivePopover(null);
+        return;
+      }
+    }
     const nextType = getModelMediaType(modelName);
+    const tensorartDurationSeconds = Math.min(
+      10,
+      Math.max(4, Math.round(parseDurationSeconds(globalDuration, 4))),
+    );
+    const nextDuration = nextChannel === 'tensorart' ? `${tensorartDurationSeconds}秒` : globalDuration;
+    const nextResolution = nextChannel === 'tensorart' ? '480p' : globalResolution;
     const nextAspectRatio = normalizeAspectRatio(globalAspectRatio, {
       channel: nextChannel,
       modelName,
@@ -2976,13 +3687,18 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     setGenerateChannel(nextChannel);
     setModelPopoverTab(nextType);
     setGlobalAspectRatio(nextAspectRatio);
+    if (nextChannel === 'tensorart') {
+      setGlobalDuration(nextDuration);
+      setGlobalResolution(nextResolution);
+    }
     setSegments(prev => prev.map(seg => ({
       ...seg,
       model: modelName,
       type: nextType,
       aspectRatio: nextAspectRatio,
-      duration: globalDuration,
-      quality: globalResolution,
+      duration: nextDuration,
+      quality: nextResolution,
+      resolution: nextResolution,
     })));
     setActivePopover(null);
   };
@@ -3008,6 +3724,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       status: meta.status || 'processing',
       progress: typeof meta.progress === 'number' ? meta.progress : 0,
       queuePosition: meta.queuePosition ?? null,
+      elapsedSeconds: meta.elapsedSeconds ?? null,
+      remainingSeconds: meta.remainingSeconds ?? null,
+      timeoutSeconds: meta.timeoutSeconds ?? null,
+      estimatedWaitSeconds: meta.estimatedWaitSeconds ?? null,
+      startedAtSeconds: meta.startedAtSeconds ?? null,
       accountId: meta.accountId || 0,
       accountName: meta.accountName || '',
       conversationId: meta.conversationId || '',
@@ -3015,6 +3736,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       pageUrl: meta.pageUrl || '',
       sendMode: meta.sendMode || '',
       sendModeLabel: meta.sendModeLabel || '',
+      browserHeadless: !!meta.browserHeadless,
       requestId: meta.requestId || '',
       createdAt: now,
       updatedAt: now,
@@ -3026,11 +3748,18 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         ...nextTask,
         accountId: nextTask.accountId || t.accountId || 0,
         accountName: nextTask.accountName || t.accountName || '',
+        queuePosition: nextTask.queuePosition ?? t.queuePosition ?? null,
+        elapsedSeconds: nextTask.elapsedSeconds ?? t.elapsedSeconds ?? null,
+        remainingSeconds: nextTask.remainingSeconds ?? t.remainingSeconds ?? null,
+        timeoutSeconds: nextTask.timeoutSeconds ?? t.timeoutSeconds ?? null,
+        estimatedWaitSeconds: nextTask.estimatedWaitSeconds ?? t.estimatedWaitSeconds ?? null,
+        startedAtSeconds: nextTask.startedAtSeconds ?? t.startedAtSeconds ?? null,
         conversationId: nextTask.conversationId || t.conversationId || '',
         localConversationId: nextTask.localConversationId || t.localConversationId || '',
         pageUrl: nextTask.pageUrl || t.pageUrl || '',
         sendMode: nextTask.sendMode || t.sendMode || '',
         sendModeLabel: nextTask.sendModeLabel || t.sendModeLabel || '',
+        browserHeadless: nextTask.browserHeadless ?? t.browserHeadless ?? false,
         createdAt: (nextTask.status === 'collecting' || nextTask.status === 'collectable') ? now : (t.createdAt || now),
       } : t)
       : [...registry, nextTask]);
@@ -3039,6 +3768,54 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   useEffect(() => {
     startGlobalGenerationPolling();
   }, []);
+
+  useEffect(() => {
+    if (isLoadingProjectRef.current) return;
+    const registry = readGenerationTaskRegistry();
+    const registeredIds = new Set(registry.map(task => task.taskId).filter(Boolean));
+    const now = Date.now();
+    const recoveredTasks = [];
+
+    segments.forEach((seg) => {
+      const pendingIds = [...new Set([seg.pendingTaskId, ...(seg.pendingTaskIds || [])].filter(Boolean))];
+      pendingIds.forEach((taskId) => {
+        if (registeredIds.has(taskId)) return;
+        const pendingAccount = (seg.pendingAccounts || []).find(item => item?.taskId === taskId) || {};
+        recoveredTasks.push({
+          draftId,
+          segId: seg.id,
+          taskId,
+          channel: seg.pendingChannel || pendingAccount.channel || 'wizstar',
+          mediaType: seg.type || 'video',
+          status: seg.generateStatus || pendingAccount.status || 'processing',
+          progress: typeof seg.generateProgress === 'number' ? seg.generateProgress : 0,
+          queuePosition: seg.queuePosition ?? null,
+          elapsedSeconds: seg.elapsedSeconds ?? null,
+          remainingSeconds: seg.remainingSeconds ?? null,
+          timeoutSeconds: seg.timeoutSeconds ?? null,
+          estimatedWaitSeconds: seg.estimatedWaitSeconds ?? null,
+          startedAtSeconds: seg.startedAtSeconds ?? null,
+          accountId: pendingAccount.accountId || seg.pendingAccountId || 0,
+          accountName: pendingAccount.accountName || seg.pendingAccountName || '',
+          conversationId: pendingAccount.conversationId || seg.pendingConversationId || '',
+          localConversationId: pendingAccount.localConversationId || seg.pendingLocalConversationId || '',
+          pageUrl: pendingAccount.pageUrl || seg.pendingDolaPageUrl || '',
+          sendMode: pendingAccount.sendMode || seg.pendingDolaSendMode || '',
+          sendModeLabel: pendingAccount.sendModeLabel || seg.pendingDolaSendModeLabel || '',
+          browserHeadless: pendingAccount.browserHeadless ?? seg.pendingDolaHeadless ?? false,
+          requestId: seg.pendingRequestId || '',
+          recoveredFromSegment: true,
+          createdAt: pendingAccount.startedAt || now,
+          updatedAt: now,
+        });
+      });
+    });
+
+    if (recoveredTasks.length > 0) {
+      writeGenerationTaskRegistry([...registry, ...recoveredTasks]);
+      startGlobalGenerationPolling();
+    }
+  }, [segments, draftId]);
 
   // Keep only the currently visible project's rows in sync. Polling itself is global and survives project close/switch.
   useEffect(() => {
@@ -3181,6 +3958,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               pendingDolaPageUrl: displayTask.pageUrl || nextSeg.pendingDolaPageUrl || '',
               pendingDolaSendMode: displayTask.sendMode || nextSeg.pendingDolaSendMode || '',
               pendingDolaSendModeLabel: displayTask.sendModeLabel || nextSeg.pendingDolaSendModeLabel || '',
+              pendingDolaHeadless: displayTask.browserHeadless ?? nextSeg.pendingDolaHeadless ?? false,
               pendingAccounts: activeTasks.map(t => {
                 const existing = (nextSeg.pendingAccounts || []).find(a => a.taskId === t.taskId);
                 return {
@@ -3192,6 +3970,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   pageUrl: t.pageUrl || (existing && existing.pageUrl) || '',
                   sendMode: t.sendMode || (existing && existing.sendMode) || '',
                   sendModeLabel: t.sendModeLabel || (existing && existing.sendModeLabel) || '',
+                  browserHeadless: t.browserHeadless ?? existing?.browserHeadless ?? false,
                   status: t.status || (existing && existing.status) || 'processing',
                   startedAt: (existing && existing.startedAt) || Date.now(),
                 };
@@ -3199,6 +3978,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               generateStatus: nextStatus,
               queuePosition: displayTask.queuePosition,
               generateProgress: nextProgress,
+              elapsedSeconds: displayTask.elapsedSeconds ?? nextSeg.elapsedSeconds ?? null,
+              remainingSeconds: displayTask.remainingSeconds ?? nextSeg.remainingSeconds ?? null,
+              timeoutSeconds: displayTask.timeoutSeconds ?? nextSeg.timeoutSeconds ?? null,
+              estimatedWaitSeconds: displayTask.estimatedWaitSeconds ?? nextSeg.estimatedWaitSeconds ?? null,
               activeTaskCount: activeTasks.length,
             };
           } else if (rowChanged || nextSeg.generating || nextSeg.pendingTaskId) {
@@ -3218,9 +4001,14 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
               pendingDolaPageUrl: '',
               pendingDolaSendMode: '',
               pendingDolaSendModeLabel: '',
+              pendingDolaHeadless: false,
               generateStatus: null,
               queuePosition: null,
               generateProgress: null,
+              elapsedSeconds: null,
+              remainingSeconds: null,
+              timeoutSeconds: null,
+              estimatedWaitSeconds: null,
               activeTaskCount: 0,
             };
           }
@@ -3233,6 +4021,30 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
       if (doneIds.size > 0) {
         writeGenerationTaskRegistry(readGenerationTaskRegistry().filter(t => !doneIds.has(t.taskId)));
+      }
+      // When segments changed (e.g. a video was just added), immediately flush to
+      // both localStorage and backend instead of waiting for the debounced auto-save.
+      // This prevents data loss if the app exits before the 500ms debounce fires.
+      if (changed) {
+        try {
+          setSegments(prev => {
+            const toSave = prev.map(s => ({
+              ...s,
+              generating: false,
+              generateStatus: null,
+              generateProgress: null,
+              queuePosition: null,
+            }));
+            setLocalStorageJson(STORAGE_KEY_SEGMENTS, toSave, stripLargePreviewPayload(toSave));
+            fetch(`${WIZSTAR_API}/projects/${encodeURIComponent(draftId)}/payload`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ segments: toSave, character_assets: characterAssets }),
+              keepalive: true,
+            }).catch(() => {});
+            return prev;
+          });
+        } catch (_) {}
       }
     }, 1500);
     return () => window.clearInterval(timer);
@@ -3254,6 +4066,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
           sendModeLabel: seg.pendingDolaSendModeLabel || '',
           status: seg.generateStatus || 'processing',
           progress: typeof seg.generateProgress === 'number' ? seg.generateProgress : 0,
+          queuePosition: seg.queuePosition ?? null,
+          elapsedSeconds: seg.elapsedSeconds ?? null,
+          remainingSeconds: seg.remainingSeconds ?? null,
+          timeoutSeconds: seg.timeoutSeconds ?? null,
+          estimatedWaitSeconds: seg.estimatedWaitSeconds ?? null,
         });
       });
     });
@@ -3297,19 +4114,30 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       } : s));
       return picUrl;
     }
-    const roleImageRef = getSegmentCharacterImageRef(seg, promptText);
+    const roleBinding = getSegmentCharacterImageBindings(seg, promptText)[0] || null;
+    const roleImageRef = roleBinding?.ref || null;
     if (roleImageRef) {
+      const roleSource = roleImageRef.file_path
+        || roleImageRef.image
+        || (roleImageRef.data_url
+          ? `data:${roleImageRef.data_url.length}:${roleImageRef.data_url.slice(0, 48)}:${roleImageRef.data_url.slice(-48)}`
+          : '');
+      const cachedRoleUpload = seg?.roleImageUploadCache;
+      if (
+        cachedRoleUpload?.alias === roleBinding.alias
+        && cachedRoleUpload?.source === roleSource
+        && cachedRoleUpload?.url
+      ) {
+        return cachedRoleUpload.url;
+      }
       const picUrl = await uploadImageRefForWizstar(roleImageRef, account);
       setSegments(prev => prev.map(s => s.id === id ? {
         ...s,
-        referenceImage: {
-          source: 'role',
-          displayUrl: roleImageRef.image || roleImageRef.data_url || (roleImageRef.file_path ? makeLocalFileUrl(roleImageRef.file_path) : ''),
-          localPath: roleImageRef.file_path || '',
-          remoteUrl: roleImageRef.image || '',
-          uploadUrl: picUrl,
+        roleImageUploadCache: {
+          alias: roleBinding.alias,
+          source: roleSource,
+          url: picUrl,
         },
-        referenceImagePath: roleImageRef.file_path || s.referenceImagePath || '',
       } : s));
       return picUrl;
     }
@@ -3322,6 +4150,172 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   const hasActiveGenerationTask = (seg) => !!(seg?.generating || seg?.pendingTaskId || (seg?.pendingTaskIds || []).length > 0);
 
   const buildGenerationRequestId = (segId, channel = 'wizstar') => `${draftId}:${segId}:${channel}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+
+  const selectOreateaiAssetsForRow = async (rowId) => {
+    const capability = getOreateaiCapability();
+    if (!capability) {
+      alert('渠道八动态能力尚未加载，请先刷新配置。');
+      return;
+    }
+    if (!window.electronAPI?.oreateaiSelectAssets) {
+      alert('渠道八仅支持 Electron 桌面端。');
+      return;
+    }
+    const response = await window.electronAPI.oreateaiSelectAssets({ allowVideos: capability.scene === 'reference' });
+    if (!response?.ok) {
+      alert(`选择素材失败：${response?.error || '未知错误'}`);
+      return;
+    }
+    if (response.canceled) return;
+    const selected = Array.isArray(response.assets) ? response.assets : [];
+    const row = segments.find((segment) => segment.id === rowId);
+    const nextAssets = [...(row?.oreateaiAssets || []), ...selected].map((asset) => ({
+      path: asset.path,
+      name: asset.name || String(asset.path || '').split(/[\\/]/).pop() || '素材',
+      kind: asset.kind,
+      size: Number(asset.size || 0),
+      durationSec: Number(asset.durationSec || 0),
+    }));
+    const error = validateOreateaiAssetSelection(capability, nextAssets);
+    if (error) {
+      alert(`无法添加素材：${error}`);
+      return;
+    }
+    setSegments((prev) => prev.map((segment) => segment.id === rowId ? { ...segment, oreateaiAssets: nextAssets } : segment));
+  };
+
+  const removeOreateaiAssetFromRow = (rowId, index) => {
+    setSegments((prev) => prev.map((segment) => segment.id === rowId ? {
+      ...segment,
+      oreateaiAssets: (segment.oreateaiAssets || []).filter((_, assetIndex) => assetIndex !== index),
+    } : segment));
+  };
+
+  useEffect(() => {
+    if (!window.electronAPI?.onOreateaiVideoProgress) return undefined;
+    return window.electronAPI.onOreateaiVideoProgress((progress = {}) => {
+      const requestId = String(progress.requestId || '');
+      if (!requestId) return;
+      const task = readGenerationTaskRegistry().find((item) => item.taskId === requestId && item.channel === 'oreateai');
+      if (!task || task.draftId !== draftId) return;
+      const patch = oreateaiProgressPatch(progress);
+      updateGenerationTaskRegistry(requestId, patch);
+      setSegments((prev) => prev.map((segment) => segment.id === task.segId ? {
+        ...segment,
+        generating: patch.status !== 'failed',
+        generateStatus: patch.status,
+        generateProgress: patch.progress,
+      } : segment));
+    });
+  }, [draftId]);
+
+  const handleGenerateOreateai = async (id, options = {}) => {
+    const silent = !!options.silent;
+    const segment = segments.find((item) => item.id === id);
+    const prompt = buildPromptWithSuffix(promptDraftsRef.current[id] ?? segment?.text).trim();
+    const capability = getOreateaiCapability(globalModel, oreateaiScene);
+    if (!prompt) {
+      if (!silent) alert('请先填写该分镜的描述词再生成');
+      resetRowGenerationState(id);
+      return false;
+    }
+    if (!capability) {
+      if (!silent) alert('渠道八动态能力尚未加载，请先刷新配置。');
+      resetRowGenerationState(id);
+      return false;
+    }
+    const assets = segment?.oreateaiAssets || [];
+    const assetError = validateOreateaiAssetSelection(capability, assets, { requireMinimum: true });
+    if (assetError) {
+      if (!silent) alert(`渠道八素材不符合当前场景：${assetError}`);
+      resetRowGenerationState(id);
+      return false;
+    }
+    if (capability.promptMaxChars && prompt.length > capability.promptMaxChars) {
+      if (!silent) alert(`渠道八提示词最多 ${capability.promptMaxChars} 个字符。`);
+      resetRowGenerationState(id);
+      return false;
+    }
+    const duration = Number(String(globalDuration).replace(/\D/g, ''));
+    const combination = getOreateaiCombination(capability, { duration, resolution: globalResolution, audio: oreateaiAudio });
+    if (!combination || combination.duration !== duration || combination.resolution !== globalResolution) {
+      if (!silent) alert('当前渠道八参数组合不在实时配置中，请重新选择模型或参数。');
+      resetRowGenerationState(id);
+      return false;
+    }
+    if (!window.electronAPI?.oreateaiGenerateVideo || !window.electronAPI?.oreateaiDownloadVideo) {
+      if (!silent) alert('渠道八仅支持 Electron 桌面端。');
+      resetRowGenerationState(id);
+      return false;
+    }
+
+    const requestId = buildGenerationRequestId(id, 'oreateai');
+    registerGenerationTask(id, requestId, 'oreateai', 'video', { requestId, status: 'processing', progress: 2 });
+    setSegments((prev) => prev.map((item) => item.id === id ? {
+      ...item,
+      type: 'video',
+      model: capability.modelName,
+      pendingTaskId: requestId,
+      pendingTaskIds: [...new Set([...(item.pendingTaskIds || []), requestId])],
+      pendingPrimaryTaskId: requestId,
+      pendingChannel: 'oreateai',
+      generating: true,
+      generateStatus: 'processing',
+      generateProgress: 2,
+      generationError: '',
+      activeTaskCount: Math.max(1, [...new Set([...(item.pendingTaskIds || []), requestId])].length),
+    } : item));
+
+    try {
+      const generated = await window.electronAPI.oreateaiGenerateVideo({
+        requestId,
+        modelName: capability.modelName,
+        scene: capability.scene,
+        prompt,
+        ratio: globalAspectRatio,
+        resolution: globalResolution,
+        duration,
+        audio: oreateaiAudio,
+        assetPaths: assets.map((asset) => asset.path),
+      });
+      if (!generated?.ok || !generated.result?.url) throw new Error(generated?.error || '渠道八未返回视频结果');
+      updateGenerationTaskRegistry(requestId, { status: 'processing', progress: 97, videoUrl: generated.result.url });
+      const downloaded = await window.electronAPI.oreateaiDownloadVideo({
+        url: generated.result.url,
+        fileName: `OreateAI-${id}-${Date.now()}.mp4`,
+        autoSave: true,
+      });
+      if (!downloaded?.ok || downloaded.canceled || !downloaded.result?.path) {
+        throw new Error(downloaded?.error || '渠道八视频下载或 MP4 校验失败');
+      }
+      updateGenerationTaskRegistry(requestId, {
+        status: 'completed',
+        progress: 100,
+        mediaType: 'video',
+        videoUrl: generated.result.url,
+        mediaUrl: generated.result.url,
+        localPath: downloaded.result.path,
+      });
+      return true;
+    } catch (error) {
+      const message = error.message || String(error);
+      updateGenerationTaskRegistry(requestId, { status: 'failed', error: message, progress: 0 });
+      setSegments((prev) => prev.map((item) => item.id === id ? {
+        ...item,
+        generating: false,
+        pendingTaskId: null,
+        pendingTaskIds: (item.pendingTaskIds || []).filter((taskId) => taskId !== requestId),
+        pendingPrimaryTaskId: '',
+        pendingChannel: null,
+        generateStatus: null,
+        generateProgress: null,
+        activeTaskCount: 0,
+        generationError: message,
+      } : item));
+      if (!silent) alert(`渠道八生成失败：${message}`);
+      return false;
+    }
+  };
 
   const clearRowGenerationPlaceholder = (id) => {
     setSegments(prev => prev.map(seg => {
@@ -3353,6 +4347,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         generateStatus: null,
         queuePosition: null,
         generateProgress: null,
+        elapsedSeconds: null,
+        remainingSeconds: null,
+        timeoutSeconds: null,
+        estimatedWaitSeconds: null,
         activeTaskCount: 0,
       };
     }));
@@ -3413,19 +4411,42 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     if (generateChannel === 'dola') {
       return handleGenerateDola(id, options);
     }
+    if (generateChannel === 'lovart') {
+      return handleGenerateLovart(id, options);
+    }
+    if (generateChannel === 'oreateai') {
+      return handleGenerateOreateai(id, options);
+    }
+    if (generateChannel === 'framia') {
+      return handleGenerateFramia(id, options);
+    }
+    if (generateChannel === 'tensorart') {
+      return handleGenerateTensorArt(id, options);
+    }
 
     try {
+      const segForQuota = segments.find(s => s.id === id);
+      const requestedDurationSec = resolveDurationSeconds(segForQuota?.duration, globalDuration, 5);
       const accRes = await fetch(`${WIZSTAR_API}/accounts`);
       const accData = await accRes.json();
       const allAccounts = accData.data || [];
       const dailyLimited = allAccounts.filter(a => a.status === 'daily_limit');
-      const accounts = allAccounts.filter(a => a.status !== 'forbidden' && a.status !== 'daily_limit');
-      const availableAccounts = accounts.filter(a => (a.active_task_count || 0) < (a.max_concurrency || 1));
+      const unavailableStatuses = new Set(['forbidden', 'auth_expired', 'daily_limit']);
+      const accounts = allAccounts.filter(a => !unavailableStatuses.has(a.status));
+      const quotaAccounts = requestedDurationSec >= 15
+        ? accounts.filter(a => (a.remaining_15s_task_quota ?? 1) > 0 && (a.used_15s_task_count || 0) < 1)
+        : accounts;
+      const availableAccounts = quotaAccounts.filter(a => (a.active_task_count || 0) < (a.max_concurrency || 1));
       if (accounts.length === 0) {
         const msg = dailyLimited.length > 0
           ? `渠道一账号今日生成次数已达上限（${dailyLimited.length} 个账号被限制），明天自动恢复，请切换其他渠道或添加更多账号`
-          : '没有可用的渠道一账号：账号库为空或账号都已被平台禁用，请注册/切换账号';
+          : '没有可用的渠道一账号：账号库为空或账号都已被平台禁用/过期/额度耗尽，请注册/切换账号';
         alert(msg);
+        resetRowGenerationState(id);
+        return false;
+      }
+      if (quotaAccounts.length === 0) {
+        alert('渠道一 15s 视频账号额度已用完：一个账号只能提交一个 15s 视频，请添加新账号或改用其他渠道。');
         resetRowGenerationState(id);
         return false;
       }
@@ -3439,8 +4460,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       const cursor = wizstarAccountCursorRef.current % rotationPool.length;
       const account = rotationPool[cursor];
       wizstarAccountCursorRef.current = (cursor + 1) % rotationPool.length;
-
-      const seg = segments.find(s => s.id === id);
+      const seg = segForQuota;
       const promptText = buildPromptWithSuffix(promptDraftsRef.current[id] ?? seg?.text);
 
       if (!promptText || promptText.trim().length === 0) {
@@ -3451,7 +4471,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
       const prompt = promptText;
       const modelMap = { 'Seedance 2.0': 'seedance2.0', 'Seedance 1.5': 'seedance1.5', 'Kling': 'kling' };
-      const durationSec = resolveDurationSeconds(seg?.duration, globalDuration, 5);
+      const durationSec = requestedDurationSec;
       const videoRatio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
         channel: 'wizstar',
         modelName: seg?.model || globalModel,
@@ -3566,7 +4586,351 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     oiioii: '渠道四',
     chatgpt2api: '渠道五',
     dola: '渠道六 Dola',
+    lovart: '渠道七 Lovart',
+    oreateai: '渠道八 OreateAI',
+    framia: '渠道九 Framia',
+    tensorart: '渠道十 Tensor.Art',
   }[channel] || '当前通道');
+
+  const handleGenerateLovart = async (id, options = {}) => {
+    const silent = !!options.silent;
+    try {
+      const seg = segments.find(s => s.id === id);
+      const promptText = buildPromptWithSuffix(promptDraftsRef.current[id] ?? seg?.text);
+
+      if (!promptText || promptText.trim().length === 0) {
+        alert('请先填写该分镜的描述词再生成');
+        resetRowGenerationState(id);
+        return false;
+      }
+
+      if (seg?.type !== 'image') {
+        alert('渠道七 Lovart 是生图通道，请先切换该分镜为「图片」。');
+        resetRowGenerationState(id);
+        return false;
+      }
+
+      const localImagePath = getReferenceLocalPath(seg);
+      const remoteImageUrl = getReferenceRemoteUrl(seg);
+      const dataImageUrl = getReferenceDataUrl(seg);
+      const currentImageUrl = seg?.currentMaterialImage && !isVideoUrl(seg.currentMaterialImage.thumbnail)
+        ? (seg.currentMaterialImage.sourceUrl || seg.currentMaterialImage.remoteUrl || seg.currentMaterialImage.thumbnail || '')
+        : '';
+      const referenceImageUrl = remoteImageUrl || dataImageUrl || (/^https?:\/\//i.test(currentImageUrl) ? currentImageUrl : '');
+      const aspectRatio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
+        channel: 'lovart',
+        modelName: '渠道七 Lovart',
+        mediaType: 'image',
+      });
+      const qualitySource = String(seg?.quality || globalResolution || '').toLowerCase();
+      const quality = qualitySource === '4k' || qualitySource === 'high'
+        ? 'high'
+        : qualitySource === 'low'
+          ? 'low'
+          : 'medium';
+      const referenceImages = [
+        ...getSegmentCharacterImageRefs(seg, promptText).map(imageRefToReference),
+        ...getSegmentSceneImageRefs(promptText).map(imageRefToReference),
+      ].filter(Boolean);
+      let projectId = '';
+      try {
+        projectId = localStorage.getItem('maocanju_lovart_project_id') || localStorage.getItem('lovart_project_id') || '';
+      } catch (_) {}
+
+      const body = {
+        prompt: promptText,
+        model: 'openai/gpt-image-2',
+        aspect_ratio: aspectRatio,
+        resolution: seg?.quality || globalResolution || '2K',
+        quality,
+        reference_images: [...new Set(referenceImages)],
+      };
+      if (localImagePath) body.image_path = localImagePath;
+      if (referenceImageUrl) body.image_url = referenceImageUrl;
+      if (projectId) body.project_id = projectId;
+
+      const createRes = await fetch(`${WIZSTAR_API}/lovart/tasks/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!createRes.ok) {
+        let errMsg = `HTTP ${createRes.status}`;
+        try { const err = await createRes.json(); errMsg = err.detail || errMsg; } catch (_) {}
+        throw new Error(errMsg);
+      }
+
+      const taskData = await createRes.json();
+      const payload = taskData.data || {};
+      const taskId = payload.task_id;
+      if (!taskId) throw new Error('渠道七未返回 task_id');
+      const accountId = payload.account_id || 0;
+      const accountName = payload.account_name || (accountId ? `Lovart账号 #${accountId}` : '');
+      registerGenerationTask(id, taskId, 'lovart', 'image', {
+        accountId,
+        accountName,
+        status: payload.status || 'processing',
+        queuePosition: payload.queue_position ?? null,
+        remainingSeconds: payload.remaining_seconds ?? null,
+        estimatedWaitSeconds: payload.estimated_wait_seconds ?? payload.remaining_seconds ?? null,
+      });
+
+      setSegments(prev => prev.map(s => s.id === id ? {
+        ...s,
+        type: 'image',
+        model: '渠道七 Lovart',
+        pendingTaskId: taskId,
+        pendingTaskIds: [...new Set([...(s.pendingTaskIds || []), taskId])],
+        pendingPrimaryTaskId: taskId,
+        pendingChannel: 'lovart',
+        pendingAccountId: accountId,
+        pendingAccountName: accountName,
+        generating: true,
+        generateStatus: payload.status || 'processing',
+        queuePosition: payload.queue_position ?? null,
+        remainingSeconds: payload.remaining_seconds ?? null,
+        estimatedWaitSeconds: payload.estimated_wait_seconds ?? payload.remaining_seconds ?? null,
+        generationError: '',
+        activeTaskCount: Math.max(1, [...new Set([...(s.pendingTaskIds || []), taskId])].length),
+      } : s));
+      return true;
+    } catch (e) {
+      console.error('[lovart] generate failed:', e);
+      if (!silent) alert(`生成失败: ${e.message || e}`);
+      clearRowGenerationPlaceholder(id);
+      return false;
+    }
+  };
+
+  const handleGenerateFramia = async (id, options = {}) => {
+    const silent = !!options.silent;
+    try {
+      const seg = segments.find(s => s.id === id);
+      const promptText = buildPromptWithSuffix(promptDraftsRef.current[id] ?? seg?.text);
+
+      if (!promptText || promptText.trim().length === 0) {
+        alert('请先填写该分镜的描述词再生成');
+        resetRowGenerationState(id);
+        return false;
+      }
+
+      const localImagePath = getReferenceLocalPath(seg);
+      const remoteImageUrl = getReferenceRemoteUrl(seg);
+      const dataImageUrl = getReferenceDataUrl(seg);
+
+      const framiaModelMap = {
+        '渠道九 Seedance 2.0 Mini': 'Seedance 2.0 Mini',
+        '渠道九 Kling 3.0': 'Kling 3.0',
+        'Seedance 2.0 Mini': 'Seedance 2.0 Mini',
+        'Kling 3.0': 'Kling 3.0',
+      };
+      const selectedModelName = framiaModelMap[seg?.model]
+        ? seg.model
+        : (framiaModelMap[globalModel] ? globalModel : '渠道九 Seedance 2.0 Mini');
+      const model = framiaModelMap[selectedModelName] || 'Seedance 2.0 Mini';
+
+      const aspectRatio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
+        channel: 'framia',
+        modelName: selectedModelName,
+        mediaType: 'video',
+      });
+      const durationSec = resolveDurationSeconds(globalDuration, seg?.duration, 4);
+      const resolution = seg?.quality || globalResolution || '720p';
+
+      const body = {
+        prompt: promptText,
+        model,
+        aspect_ratio: aspectRatio,
+        resolution,
+        duration: durationSec,
+      };
+
+      const allImagePaths = [
+        localImagePath,
+        ...getSegmentCharacterImageRefs(seg, promptText).map(imageRefToReference),
+        ...getSegmentSceneImageRefs(promptText).map(imageRefToReference),
+      ].filter(Boolean);
+      const imagePaths = [...new Set(allImagePaths)];
+      if (imagePaths.length > 0) body.image_paths = imagePaths;
+      if (remoteImageUrl) body.image_url = remoteImageUrl;
+      else if (dataImageUrl) body.image_url = dataImageUrl;
+
+      const createRes = await fetch(`${WIZSTAR_API}/framia/tasks/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!createRes.ok) {
+        let errMsg = `HTTP ${createRes.status}`;
+        try { const err = await createRes.json(); errMsg = err.detail || errMsg; } catch (_) {}
+        throw new Error(errMsg);
+      }
+
+      const taskData = await createRes.json();
+      const payload = taskData.data || {};
+      const taskId = payload.task_id;
+      if (!taskId) throw new Error('渠道九未返回 task_id');
+      const accountId = payload.account_id || 0;
+      const accountName = payload.account_name || (accountId ? `Framia账号 #${accountId}` : '');
+      registerGenerationTask(id, taskId, 'framia', 'video', {
+        accountId,
+        accountName,
+        status: payload.status || 'processing',
+      });
+
+      setSegments(prev => prev.map(s => s.id === id ? {
+        ...s,
+        type: 'video',
+        model: selectedModelName,
+        pendingTaskId: taskId,
+        pendingTaskIds: [...new Set([...(s.pendingTaskIds || []), taskId])],
+        pendingPrimaryTaskId: taskId,
+        pendingChannel: 'framia',
+        pendingAccountId: accountId,
+        pendingAccountName: accountName,
+        generating: true,
+        generateStatus: payload.status || 'processing',
+        generationError: '',
+        activeTaskCount: Math.max(1, [...new Set([...(s.pendingTaskIds || []), taskId])].length),
+      } : s));
+      return true;
+    } catch (e) {
+      console.error('[framia] generate failed:', e);
+      if (!silent) alert(`生成失败: ${e.message || e}`);
+      clearRowGenerationPlaceholder(id);
+      return false;
+    }
+  };
+
+  const handleGenerateTensorArt = async (id, options = {}) => {
+    const silent = !!options.silent;
+    try {
+      const seg = segments.find(s => s.id === id);
+      const promptText = buildPromptWithSuffix(promptDraftsRef.current[id] ?? seg?.text);
+      if (!promptText || promptText.trim().length === 0) {
+        alert('请先填写该分镜的描述词再生成');
+        resetRowGenerationState(id);
+        return false;
+      }
+      if (seg?.type === 'image') {
+        alert('渠道十 Tensor.Art 是图生视频通道，请先切换该分镜为「视频」。');
+        resetRowGenerationState(id);
+        return false;
+      }
+
+      const primaryLocalPath = getReferenceLocalPath(seg);
+      const primaryDataUrl = getReferenceDataUrl(seg);
+      const primaryRemoteUrl = getReferenceRemoteUrl(seg);
+      let stablePrimaryPath = '';
+      if (primaryLocalPath) {
+        const persisted = await persistLocalImagePath(primaryLocalPath);
+        if (persisted?.ok && persisted.path) {
+          stablePrimaryPath = persisted.path;
+          if (stablePrimaryPath !== primaryLocalPath) {
+            setSegments(prev => prev.map(s => s.id === id ? {
+              ...s,
+              referenceImage: makeLocalReferenceImage(stablePrimaryPath),
+              referenceImagePath: stablePrimaryPath,
+            } : s));
+          }
+        } else if (!primaryDataUrl && !primaryRemoteUrl) {
+          throw new Error('垫图文件已失效（常见于微信 RWTemp 临时目录），请点击垫图重新选择图片后再生成。');
+        }
+      }
+      const rawImageSources = [
+        stablePrimaryPath || primaryDataUrl || primaryRemoteUrl,
+        ...getSegmentCharacterImageRefs(seg, promptText).map(imageRefToReference),
+        ...getSegmentSceneImageRefs(promptText).map(imageRefToReference),
+      ].filter(Boolean);
+      const imageSources = [];
+      for (const source of rawImageSources) {
+        if (isLocalFilePathValue(source) || /^file:\/\//i.test(source)) {
+          const localPath = localFilePathFromUrlValue(source) || source;
+          const persisted = await persistLocalImagePath(localPath);
+          if (!persisted?.ok || !persisted.path) {
+            throw new Error('引用的角色或场景图片已失效，请重新选择该图片后再生成。');
+          }
+          imageSources.push(persisted.path);
+        } else {
+          imageSources.push(source);
+        }
+      }
+      const uniqueImageSources = [...new Set(imageSources)].slice(0, 2);
+      if (uniqueImageSources.length === 0) {
+        alert('渠道十当前按已抓取协议仅支持图生视频，请先添加垫图、@角色或 $场景参考图。');
+        resetRowGenerationState(id);
+        return false;
+      }
+
+      const selectedModelName = '渠道十 Tensor.Art 视频';
+      const duration = Math.min(
+        10,
+        Math.max(4, Math.round(resolveDurationSeconds(seg?.duration, globalDuration, 4))),
+      );
+      const aspectRatio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
+        channel: 'tensorart',
+        modelName: selectedModelName,
+        mediaType: 'video',
+      });
+      const createRes = await fetch(`${WIZSTAR_API}/tensorart/tasks/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: promptText,
+          model: 'tensorart-default',
+          aspect_ratio: aspectRatio,
+          resolution: '480p',
+          duration,
+          image_paths: uniqueImageSources,
+        }),
+      });
+      if (!createRes.ok) {
+        let errMsg = `HTTP ${createRes.status}`;
+        try { const err = await createRes.json(); errMsg = err.detail || errMsg; } catch (_) {}
+        throw new Error(errMsg);
+      }
+
+      const taskData = await createRes.json();
+      const payload = taskData.data || taskData || {};
+      const taskId = payload.task_id || payload.taskId;
+      if (!taskId) {
+        throw new Error(taskData.detail || taskData.message || '渠道十未返回 task_id');
+      }
+      const accountId = payload.account_id || 0;
+      const accountName = payload.account_name || (accountId ? `Tensor.Art账号 #${accountId}` : '');
+      registerGenerationTask(id, taskId, 'tensorart', 'video', {
+        accountId,
+        accountName,
+        duration: payload.duration || duration,
+        credits: payload.credits || TENSORART_DURATION_CREDITS[duration],
+        status: payload.status || 'processing',
+      });
+
+      setSegments(prev => prev.map(s => s.id === id ? {
+        ...s,
+        type: 'video',
+        model: selectedModelName,
+        pendingTaskId: taskId,
+        pendingTaskIds: [...new Set([...(s.pendingTaskIds || []), taskId])],
+        pendingPrimaryTaskId: taskId,
+        pendingChannel: 'tensorart',
+        pendingAccountId: accountId,
+        pendingAccountName: accountName,
+        generating: true,
+        generateStatus: payload.status || 'processing',
+        generationError: '',
+        activeTaskCount: Math.max(1, [...new Set([...(s.pendingTaskIds || []), taskId])].length),
+      } : s));
+      return true;
+    } catch (e) {
+      console.error('[tensorart] generate failed:', e);
+      if (!silent) alert(`生成失败: ${e.message || e}`);
+      clearRowGenerationPlaceholder(id);
+      return false;
+    }
+  };
 
   const handleGenerateDola = async (id, options = {}) => {
     const silent = !!options.silent;
@@ -3651,8 +5015,9 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         conversationId: payload.conversation_id || '',
         localConversationId: payload.local_conversation_id || '',
         pageUrl: payload.page_url || '',
-        sendMode: payload.send_mode || dolaSendMode,
+        sendMode: 'api',
         sendModeLabel: payload.send_mode_label || dolaSendModeLabel,
+        browserHeadless: false,
         status: payload.status || 'processing',
         progress: typeof payload.progress === 'number' ? payload.progress : 0,
       });
@@ -3670,8 +5035,9 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         pendingConversationId: payload.conversation_id || '',
         pendingLocalConversationId: payload.local_conversation_id || '',
         pendingDolaPageUrl: payload.page_url || '',
-        pendingDolaSendMode: payload.send_mode || dolaSendMode,
+        pendingDolaSendMode: 'api',
         pendingDolaSendModeLabel: payload.send_mode_label || dolaSendModeLabel,
+        pendingDolaHeadless: false,
         pendingAccounts: [...(s.pendingAccounts || []).filter(a => a.taskId !== taskId), {
           taskId,
           accountId,
@@ -3679,8 +5045,9 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
           conversationId: payload.conversation_id || '',
           localConversationId: payload.local_conversation_id || '',
           pageUrl: payload.page_url || '',
-          sendMode: payload.send_mode || dolaSendMode,
+          sendMode: 'api',
           sendModeLabel: payload.send_mode_label || dolaSendModeLabel,
+          browserHeadless: false,
           status: payload.status || 'processing',
           startedAt: Date.now(),
         }],
@@ -3735,6 +5102,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   };
 
   const handleOpenDolaAccountBrowser = async (row) => {
+    if (!window.confirm('将打开 Dola 浏览器，仅用于手动授权、登录或诊断；普通生成和采集不会使用浏览器。是否继续？')) return;
     const accountId = row?.pendingAccountId || 0;
     const taskId = row?.pendingTaskId || (row?.pendingTaskIds || [])[0] || row?.lastFailedTaskId || '';
     const conversationId = row?.pendingConversationId || row?.lastConversationId || '';
@@ -3766,8 +5134,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       return;
     }
     if (!conversationId) {
-      alert('这个任务还没有拿到 conversation_id，无法直接采集。请先打开对应渠道六账号浏览器，确认 Dola 页面里该任务是否还在生成或已有结果。');
-      if (row?.pendingAccountId) handleOpenDolaAccountBrowser(row);
+      alert('这个任务还没有拿到 conversation_id，当前无法通过 API 采集。请等待生成接口返回会话 ID；如需排查登录态或页面任务，可由用户单独点击“授权/诊断”。');
       return;
     }
     try {
@@ -4091,6 +5458,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       const oiiVideoModelMap = {
         '渠道四 Gemini': 'gemini',
         '渠道四 Grok': 'grok',
+        '渠道四 Grok 1.5': 'grok-imagine-1.5',
       };
       const oiiImageModelMap = {
         '渠道四 GPT-Image2': 'gpt-image2',
@@ -4100,6 +5468,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         '渠道四 Seedream 4.5': 'seedream45',
         '渠道四 Midjourney niji7': 'midjourney-niji7',
         '渠道四 Midjourney niji6': 'midjourney-niji6',
+        '渠道四 Midjourney v8': 'midjourney8',
         '渠道四 NovelAI': 'novelai',
         '渠道四 GPT-4o': 'gpt4o',
       };
@@ -4131,6 +5500,9 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
       if (!isImageRow) {
         body.duration = durationSec;
+        if (model === 'grok-imagine-1.5') {
+          body.generateMode = 'firstframe2Video';
+        }
       }
 
       const isGptImage2OiiImage = isImageRow && model === 'gpt-image2';
@@ -4169,9 +5541,17 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       }
 
       const taskData = await createRes.json();
-      const taskId = taskData.data?.task_id;
+      const payload = taskData.data || {};
+      const taskId = payload.task_id;
       if (!taskId) throw new Error('渠道四未返回 task_id');
-      registerGenerationTask(id, taskId, 'oiioii', isImageRow ? 'image' : 'video');
+      const timeoutSeconds = payload.timeout_seconds ?? null;
+      registerGenerationTask(id, taskId, 'oiioii', isImageRow ? 'image' : 'video', {
+        timeoutSeconds,
+        remainingSeconds: payload.remaining_seconds ?? timeoutSeconds,
+        estimatedWaitSeconds: payload.estimated_wait_seconds ?? payload.remaining_seconds ?? timeoutSeconds,
+        elapsedSeconds: payload.elapsed_seconds ?? 0,
+        queuePosition: payload.queue_position ?? null,
+      });
 
       setSegments(prev => prev.map(s => s.id === id ? {
         ...s,
@@ -4181,6 +5561,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
         pendingChannel: 'oiioii',
         generating: true,
         generateStatus: 'processing',
+        queuePosition: payload.queue_position ?? null,
+        elapsedSeconds: payload.elapsed_seconds ?? 0,
+        remainingSeconds: payload.remaining_seconds ?? timeoutSeconds,
+        timeoutSeconds,
+        estimatedWaitSeconds: payload.estimated_wait_seconds ?? payload.remaining_seconds ?? timeoutSeconds,
         activeTaskCount: Math.max(1, [...new Set([...(s.pendingTaskIds || []), taskId])].length),
       } : s));
       return true;
@@ -4382,9 +5767,16 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   };
 
   const startEditingPrompt = (row) => {
-    promptDraftsRef.current[row.id] = row.text || '';
+    promptDraftsRef.current[row.id] = promptDraftsRef.current[row.id] ?? row.text ?? '';
     setEditingRowId(row.id);
-    resizePromptTextareaById(row.id);
+    requestAnimationFrame(() => {
+      const textarea = promptTextareaRefs.current[row.id];
+      if (!textarea) return;
+      textarea.focus();
+      const cursorPosition = textarea.value.length;
+      try { textarea.setSelectionRange(cursorPosition, cursorPosition); } catch (_) {}
+      resizePromptTextarea(textarea);
+    });
   };
 
   const resetAtState = () => {
@@ -4408,6 +5800,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
   // Handle live textarea change with '@' / '$' / '#' autocomplete detection
   const handleTextareaChange = (rowId, text, e) => {
     promptDraftsRef.current[rowId] = text;
+    // Immediately sync text to segments state so auto-save persists it,
+    // instead of waiting for onBlur which may never fire if the user
+    // switches projects or closes the app while still editing.
+    setSegments(prev => prev.map(seg => seg.id === rowId && seg.text !== text ? { ...seg, text } : seg));
     resizePromptTextarea(e.target);
 
     const selectionStart = e.target.selectionStart;
@@ -4489,10 +5885,12 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 : [
                     ...seg.associatedCharacters,
                     {
+                      id: fullChar?.id || '',
                       name: assetName,
-                      avatar: fullChar ? fullChar.avatar : 'https://images.unsplash.com/photo-1578632767115-351597cf2477?auto=format&fit=crop&q=80&w=80',
+                      avatar: fullChar?.avatar || '',
                       avatarPath: fullChar?.avatarPath || '',
                       role: fullChar?.role || '',
+                      sendImage: true,
                       val: 1
                     }
                   ]
@@ -4751,6 +6149,30 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   className={`px-1.5 py-0.5 text-[8px] font-bold transition-all ${generateChannel === 'dola' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
                   title="渠道六（Dola · Seedance 视频生成）"
                 >渠道六</button>
+                <button
+                  type="button"
+                  onClick={() => selectGenerationModel('渠道七 Lovart', 'lovart')}
+                  className={`px-1.5 py-0.5 text-[8px] font-bold transition-all ${generateChannel === 'lovart' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+                  title="渠道七（Lovart · GPT-Image2 生图）"
+                >渠道七</button>
+                <button
+                  type="button"
+                  onClick={() => selectGenerationModel('Seedance 2.0 Mini', 'oreateai')}
+                  className={`px-1.5 py-0.5 text-[8px] font-bold transition-all ${generateChannel === 'oreateai' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+                  title="渠道八（OreateAI · Seedance 视频生成）"
+                >渠道八</button>
+                <button
+                  type="button"
+                  onClick={() => selectGenerationModel('渠道九 Seedance 2.0 Mini', 'framia')}
+                  className={`px-1.5 py-0.5 text-[8px] font-bold transition-all ${generateChannel === 'framia' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+                  title="渠道九（Framia · Seedance 视频生成）"
+                >渠道九</button>
+                <button
+                  type="button"
+                  onClick={() => selectGenerationModel('渠道十 Tensor.Art 视频', 'tensorart')}
+                  className={`px-1.5 py-0.5 text-[8px] font-bold transition-all ${generateChannel === 'tensorart' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+                  title="渠道十（Tensor.Art · 图生视频）"
+                >渠道十</button>
               </div>
             </div>
           </div>
@@ -4761,7 +6183,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
           )}
           {generateChannel === 'oiioii' && (
             <div className="mb-1.5 px-2 py-1 rounded-md bg-purple-500/10 border border-purple-500/30 text-[8px] text-purple-300 leading-snug">
-              渠道四多模型视频：需先在「设置 → 渠道四」配置代理并注册账号。支持 Gemini、Seedance、Sora2 等模型，可带参考图。
+              渠道四多模型：需先在「设置 → 渠道四」配置代理并注册账号。生图最长等待 30 分钟，任务卡片会显示已等多久 / 最多还剩多久。
             </div>
           )}
           {generateChannel === 'chatgpt2api' && (
@@ -4772,16 +6194,49 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
           {generateChannel === 'dola' && (
             <div className="mb-1.5 px-2 py-1 rounded-md bg-orange-500/10 border border-orange-500/30 text-[8px] text-orange-300 leading-snug flex items-center justify-between gap-2">
               <span>
-                渠道六 Dola 视频：当前使用「{dolaSendModeLabel}」。浏览器发送会打开真实页面提交，API发送会走后端直发链路。
+                渠道六 Dola 视频：当前使用「{dolaSendModeLabel}」。生成、轮询、URL 解析、下载和采集均走后端 API；浏览器只用于用户手动授权或诊断。
               </span>
+              <div className="shrink-0 flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={refreshDolaConfig}
+                  className="px-1.5 py-0.5 rounded bg-black/20 border border-orange-400/20 hover:border-orange-300/50 text-[8px] font-bold"
+                  title="重新读取设置页保存的 Dola 发送方式"
+                >
+                  刷新
+                </button>
+              </div>
+            </div>
+          )}
+          {generateChannel === 'lovart' && (
+            <div className="mb-1.5 px-2 py-1 rounded-md bg-blue-500/10 border border-blue-500/30 text-[8px] text-blue-300 leading-snug">
+              渠道七 Lovart：需先在「设置 → 渠道七」采集 Lovart 登录态。支持文生图，也可用垫图 / @角色 / $场景作为参考图。
+            </div>
+          )}
+          {generateChannel === 'framia' && (
+            <div className="mb-1.5 px-2 py-1 rounded-md bg-teal-500/10 border border-teal-500/30 text-[8px] text-teal-300 leading-snug">
+              渠道九 Framia：需先在「设置 → 渠道九」通过 Google OAuth 登录采集账号。支持文生视频和图生视频，使用 Seedance / Kling 模型。
+            </div>
+          )}
+          {generateChannel === 'tensorart' && (
+            <div className="mb-1.5 px-2 py-1 rounded-md bg-violet-500/10 border border-violet-500/30 text-[8px] text-violet-300 leading-snug">
+              渠道十 Tensor.Art：支持 4–10 秒图生视频；4 秒 19 积分，10 秒 47 积分。完成后直接使用任务返回的 downloadUrl 下载。
+            </div>
+          )}
+          {generateChannel === 'oreateai' && (
+            <div className="mb-1.5 px-2 py-1 rounded-md bg-cyan-500/10 border border-cyan-500/30 text-[8px] text-cyan-200 leading-snug flex items-center justify-between gap-2">
+              <span>渠道八 OreateAI：能力、积分和素材限制由当前账号实时配置决定；仅上传桌面端选择的本地文件。</span>
               <button
                 type="button"
-                onClick={refreshDolaConfig}
-                className="shrink-0 px-1.5 py-0.5 rounded bg-black/20 border border-orange-400/20 hover:border-orange-300/50 text-[8px] font-bold"
-                title="重新读取设置页保存的 Dola 发送方式"
-              >
-                刷新
-              </button>
+                onClick={refreshOreateaiCapabilities}
+                disabled={oreateaiCapabilitiesLoading}
+                className="shrink-0 px-1.5 py-0.5 rounded bg-black/20 border border-cyan-300/20 hover:border-cyan-200/50 disabled:opacity-50 text-[8px] font-bold"
+              >{oreateaiCapabilitiesLoading ? '读取中' : '刷新'}</button>
+            </div>
+          )}
+          {oreateaiCapabilitiesError && generateChannel === 'oreateai' && (
+            <div className="mb-1.5 px-2 py-1 rounded-md bg-red-500/10 border border-red-500/30 text-[8px] text-red-200 leading-snug">
+              渠道八配置不可用：{oreateaiCapabilitiesError}
             </div>
           )}
           <div className="grid grid-cols-5 gap-1.5 flex-1 items-stretch">
@@ -4803,7 +6258,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 activePopover === 'params' ? 'border-brand shadow-[0_0_8px_rgba(16,185,129,0.25)]' : 'border-dark-border hover:border-brand/40'
               }`}
             >
-              <span className="text-[9px] font-extrabold text-white leading-none block">{globalAspectRatio}</span>
+              <span className="text-[9px] font-extrabold text-white leading-none block">
+                {globalAspectRatio}
+                {generateChannel === 'oreateai' ? ` · ${String(globalResolution).replace(/p$/i, '')}P` : ''}
+              </span>
               <span className="text-[8px] text-dark-muted mt-0.5 scale-90 block">{globalDuration}</span>
               <span className="text-[7px] text-dark-subtle block scale-75 mt-0.5">生成参数</span>
             </div>
@@ -4935,6 +6393,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     {generateChannel === 'oiioii' && [
                       '渠道四 Gemini',
                       '渠道四 Grok',
+                      '渠道四 Grok 1.5',
                     ].includes(globalModel) && (
                       <span className="text-[8px] text-brand font-bold px-1.5 py-0.5 rounded bg-brand/10 border border-brand/30">当前通道</span>
                     )}
@@ -4943,6 +6402,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     {[
                       { name: '渠道四 Gemini', desc: 'Gemini Omni' },
                       { name: '渠道四 Grok', desc: 'Grok Imagine' },
+                      { name: '渠道四 Grok 1.5', desc: 'Grok Imagine 1.5' },
                     ].map(p => (
                       <button
                         key={p.name}
@@ -4995,6 +6455,91 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     ))}
                   </div>
                 </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] text-dark-muted font-bold uppercase tracking-wider">渠道八（OreateAI 视频）</p>
+                    {generateChannel === 'oreateai' && (
+                      <span className="text-[8px] text-brand font-bold px-1.5 py-0.5 rounded bg-brand/10 border border-brand/30">当前通道</span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(oreateaiCapabilities?.models || []).map((modelName) => (
+                      <button
+                        key={modelName}
+                        type="button"
+                        onClick={() => selectGenerationModel(modelName, 'oreateai')}
+                        className={`py-2.5 px-1 rounded-lg border text-center flex flex-col items-center justify-center relative transition-all ${
+                          globalModel === modelName && generateChannel === 'oreateai'
+                            ? 'border-brand bg-brand/10 text-brand font-bold shadow-[0_0_8px_rgba(16,185,129,0.15)]'
+                            : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'
+                        }`}
+                      >
+                        <span className="absolute top-0.5 right-0.5 scale-75 origin-top-right text-cyan-300 text-[6px] font-bold">O8</span>
+                        <span className="text-[9px] leading-tight font-semibold text-center">{modelName.replace('Seedance ', '')}</span>
+                        <span className="text-[7px] text-dark-muted mt-0.5 scale-90">视频 · 动态配置</span>
+                      </button>
+                    ))}
+                    {!oreateaiCapabilities?.models?.length && (
+                      <button type="button" onClick={refreshOreateaiCapabilities} className="col-span-3 py-2 rounded-lg border border-dashed border-cyan-500/40 text-cyan-200 text-[9px] font-bold hover:bg-cyan-500/10">
+                        {oreateaiCapabilitiesLoading ? '正在读取渠道八模型…' : '读取渠道八模型'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] text-dark-muted font-bold uppercase tracking-wider">渠道九（Framia 视频）</p>
+                    {generateChannel === 'framia' && (
+                      <span className="text-[8px] text-brand font-bold px-1.5 py-0.5 rounded bg-brand/10 border border-brand/30">当前通道</span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {[
+                      { name: '渠道九 Seedance 2.0 Mini', desc: 'Seedance · 默认' },
+                      { name: '渠道九 Kling 3.0', desc: 'Kling · 高质量' },
+                    ].map(p => (
+                      <button
+                        key={p.name}
+                        type="button"
+                        onClick={() => selectGenerationModel(p.name, 'framia')}
+                        className={`py-2.5 px-1 rounded-lg border text-center flex flex-col items-center justify-center relative transition-all ${
+                          globalModel === p.name && generateChannel === 'framia'
+                            ? 'border-brand bg-brand/10 text-brand font-bold shadow-[0_0_8px_rgba(16,185,129,0.15)]'
+                            : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'
+                        }`}
+                      >
+                        <span className="absolute top-0.5 right-0.5 scale-75 origin-top-right text-teal-300 text-[6px] font-bold">F9</span>
+                        <span className="text-[9px] leading-tight font-semibold text-center">{p.name.replace('渠道九 ', '')}</span>
+                        <span className="text-[7px] text-dark-muted mt-0.5 scale-90">视频 · {p.desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] text-dark-muted font-bold uppercase tracking-wider">渠道十（Tensor.Art 视频）</p>
+                    {generateChannel === 'tensorart' && (
+                      <span className="text-[8px] text-brand font-bold px-1.5 py-0.5 rounded bg-brand/10 border border-brand/30">当前通道</span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => selectGenerationModel('渠道十 Tensor.Art 视频', 'tensorart')}
+                      className={`py-2.5 px-1 rounded-lg border text-center flex flex-col items-center justify-center relative transition-all ${
+                        globalModel === '渠道十 Tensor.Art 视频' && generateChannel === 'tensorart'
+                          ? 'border-brand bg-brand/10 text-brand font-bold shadow-[0_0_8px_rgba(16,185,129,0.15)]'
+                          : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'
+                      }`}
+                    >
+                      <span className="absolute top-0.5 right-0.5 scale-75 origin-top-right text-violet-300 text-[6px] font-bold">T10</span>
+                      <span className="text-[9px] leading-tight font-semibold text-center">Tensor.Art 默认视频</span>
+                      <span className="text-[7px] text-dark-muted mt-0.5 scale-90">图生视频 · 4–10s / 480p</span>
+                    </button>
+                  </div>
+                </div>
                 </>}
 
                 {modelPopoverTab === 'image' && <>
@@ -5023,6 +6568,31 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   </div>
                 </div>
 
+                {/* Category 7: Lovart · 设计智能体 */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] text-dark-muted font-bold uppercase tracking-wider">渠道七（Lovart 设计智能体）</p>
+                    {generateChannel === 'lovart' && globalModel === '渠道七 Lovart' && (
+                      <span className="text-[8px] text-brand font-bold px-1.5 py-0.5 rounded bg-brand/10 border border-brand/30">当前通道</span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => selectGenerationModel('渠道七 Lovart', 'lovart')}
+                      className={`py-2.5 px-1 rounded-lg border text-center flex flex-col items-center justify-center relative transition-all ${
+                        globalModel === '渠道七 Lovart'
+                          ? 'border-brand bg-brand/10 text-brand font-bold shadow-[0_0_8px_rgba(16,185,129,0.15)]'
+                          : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'
+                      }`}
+                    >
+                      <span className="absolute top-0.5 right-0.5 scale-75 origin-top-right text-blue-300 text-[6px] font-bold">L7</span>
+                      <span className="text-[9px] leading-tight font-semibold text-center">Lovart</span>
+                      <span className="text-[7px] text-dark-muted mt-0.5 scale-90">图片 · GPT-Image2</span>
+                    </button>
+                  </div>
+                </div>
+
                 {/* Category 5: 渠道四（OiiOii · 图片模型） */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
@@ -5035,6 +6605,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       '渠道四 Seedream 4.5',
                       '渠道四 Midjourney niji7',
                       '渠道四 Midjourney niji6',
+                      '渠道四 Midjourney v8',
                       '渠道四 NovelAI',
                       '渠道四 GPT-4o',
                     ].includes(globalModel) && (
@@ -5050,6 +6621,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       { name: '渠道四 Seedream 4.5', desc: 'Seedream 4.5' },
                       { name: '渠道四 Midjourney niji7', desc: '动漫 niji7' },
                       { name: '渠道四 Midjourney niji6', desc: '动漫 niji6' },
+                      { name: '渠道四 Midjourney v8', desc: '写实 v8' },
                       { name: '渠道四 NovelAI', desc: '插画' },
                       { name: '渠道四 GPT-4o', desc: '理解强' },
                     ].map(p => (
@@ -5425,13 +6997,72 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
           {/* POPOVER 2: 属性参数 Modal matching Image 3 */}
           {activePopover === 'params' && (
-            <div className="absolute top-[102%] left-[45px] w-[310px] bg-[#1a1b1f] border border-dark-border p-4 rounded-xl shadow-[0_12px_30px_rgba(0,0,0,0.6)] z-50 text-xs text-dark-text animate-in fade-in slide-in-from-top-2 duration-150">
+            <div className="absolute bottom-2 left-[45px] w-[310px] max-h-[70vh] overflow-y-auto bg-[#1a1b1f] border border-dark-border p-4 rounded-xl shadow-[0_12px_30px_rgba(0,0,0,0.6)] z-50 text-xs text-dark-text animate-in fade-in slide-in-from-bottom-2 duration-150">
               <div className="flex justify-between items-center pb-2 border-b border-dark-border/40 mb-3.5">
                 <span className="font-extrabold text-white text-[12px] tracking-wide">{globalModel} 参数</span>
                 <button onClick={() => setActivePopover(null)} className="text-dark-subtle hover:text-white text-sm font-bold">✕</button>
               </div>
 
               <div className="space-y-4">
+                {generateChannel === 'oreateai' && (() => {
+                  const capability = getOreateaiCapability();
+                  const combination = getOreateaiCombination(capability);
+                  const sceneOptions = oreateaiCapabilities?.scenes || [];
+                  const durationOptions = [...new Set((capability?.combinations || []).map((item) => item.duration))].sort((a, b) => a - b);
+                  const resolutionOptions = [...new Set((capability?.combinations || []).filter((item) => item.duration === Number(String(globalDuration).replace(/\D/g, ''))).map((item) => item.resolution))];
+                  const point = combination?.point;
+                  return (
+                    <>
+                      <div>
+                        <p className="text-[10px] text-dark-muted font-bold mb-2 uppercase tracking-wider">生成场景</p>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {sceneOptions.map((scene) => {
+                            const sceneCapability = getOreateaiCapability(globalModel, scene.id);
+                            return <button key={scene.id} type="button" disabled={!sceneCapability} onClick={() => {
+                              setOreateaiScene(scene.id);
+                              const next = getOreateaiCombination(sceneCapability) || sceneCapability.combinations[0];
+                              setGlobalDuration(`${next.duration}秒`);
+                              setGlobalResolution(next.resolution);
+                            }} className={`py-1.5 rounded-lg border text-[10px] font-bold disabled:opacity-35 ${oreateaiScene === scene.id ? 'border-brand bg-brand/10 text-brand' : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'}`}>
+                              {scene.name}
+                            </button>;
+                          })}
+                        </div>
+                      </div>
+                      {capability && <>
+                        <div>
+                          <p className="text-[10px] text-dark-muted font-bold mb-2 uppercase tracking-wider">视频时长</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {durationOptions.map((duration) => <button key={duration} type="button" onClick={() => {
+                              const next = capability.combinations.find((item) => item.duration === duration && (capability.scene === 'reference' || item.audio === null || item.audio === oreateaiAudio))
+                                || capability.combinations.find((item) => item.duration === duration);
+                              setGlobalDuration(`${next.duration}秒`);
+                              setGlobalResolution(next.resolution);
+                            }} className={`px-3 py-1.5 rounded-lg border text-[10px] font-bold ${Number(String(globalDuration).replace(/\D/g, '')) === duration ? 'border-brand bg-brand/10 text-brand' : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'}`}>{duration}秒</button>)}
+                          </div>
+                        </div>
+                        <div>
+                          <p className="text-[10px] text-dark-muted font-bold mb-2 uppercase tracking-wider">分辨率</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {resolutionOptions.map((resolution) => <button key={resolution} type="button" onClick={() => {
+                              const next = capability.combinations.find((item) => item.resolution === resolution && (capability.scene === 'reference' || item.audio === null || item.audio === oreateaiAudio))
+                                || capability.combinations.find((item) => item.resolution === resolution);
+                              setGlobalDuration(`${next.duration}秒`);
+                              setGlobalResolution(next.resolution);
+                            }} className={`px-3 py-1.5 rounded-lg border text-[10px] font-bold ${globalResolution === resolution ? 'border-brand bg-brand/10 text-brand' : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'}`}>{resolution}P</button>)}
+                          </div>
+                        </div>
+                        <div>
+                          <p className="text-[10px] text-dark-muted font-bold mb-2 uppercase tracking-wider">生成音频</p>
+                          <div className="grid grid-cols-2 gap-1.5">
+                            {capability.audioValues.map((value) => <button key={String(value)} type="button" onClick={() => setOreateaiAudio(value)} className={`py-1.5 rounded-lg border text-[10px] font-bold ${oreateaiAudio === value ? 'border-brand bg-brand/10 text-brand' : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'}`}>{value ? '开启音频' : '关闭音频'}</button>)}
+                          </div>
+                        </div>
+                        <p className="-mt-2 text-[9px] text-cyan-200 leading-relaxed">{point != null ? `当前组合预计消耗 ${point} 积分。` : '当前组合由服务端配置校验。'} {capability.promptMaxChars ? `提示词最多 ${capability.promptMaxChars} 字。` : ''}</p>
+                      </>}
+                    </>
+                  );
+                })()}
                 {/* Section 1: 宽高比 */}
                 <div>
                   <p className="text-[10px] text-dark-muted font-bold mb-2 uppercase tracking-wider">宽高比 ①</p>
@@ -5482,11 +7113,14 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 )}
 
                 {/* Section 3: 视频时长 */}
-                {getModelMediaType(globalModel) === 'video' && (
+                {getModelMediaType(globalModel) === 'video' && generateChannel !== 'oreateai' && (
                 <div>
                   <p className="text-[10px] text-dark-muted font-bold mb-2 uppercase tracking-wider">视频时长 ①</p>
                   <div className="grid grid-cols-7 gap-1">
-                    {['2秒', '3秒', '4秒', '5秒', '6秒', '7秒', '8秒', '9秒', '10秒', '11秒', '12秒', '13秒', '14秒', '15秒'].map(d => (
+                    {(generateChannel === 'tensorart'
+                      ? TENSORART_DURATION_OPTIONS
+                      : ['2秒', '3秒', '4秒', '5秒', '6秒', '7秒', '8秒', '9秒', '10秒', '11秒', '12秒', '13秒', '14秒', '15秒']
+                    ).map(d => (
                       <button
                         key={d}
                         type="button"
@@ -5497,7 +7131,12 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                             : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'
                         }`}
                       >
-                        {d}
+                        <span className="block">{d}</span>
+                        {generateChannel === 'tensorart' && (
+                          <span className="block text-[7px] opacity-70">
+                            {TENSORART_DURATION_CREDITS[Number.parseInt(d, 10)]}积分
+                          </span>
+                        )}
                       </button>
                     ))}
                   </div>
@@ -5633,7 +7272,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   className="flex flex-col items-center justify-center shrink-0 cursor-pointer group"
                   title={`点击编辑: ${c.name} (${c.role})`}
                 >
-                  <img src={c.avatar} alt={c.name} className="w-7 h-7 rounded-full border border-dark-border group-hover:border-brand/50 transition-all object-cover" />
+                  <img src={displayAvatarUrlForAsset(c)} alt={c.name} className="w-7 h-7 rounded-full border border-dark-border group-hover:border-brand/50 transition-all object-cover" />
                   <span className="text-[8px] text-dark-muted group-hover:text-white mt-0.5 truncate max-w-[40px] scale-90">{c.name}</span>
                 </div>
               ))}
@@ -5692,8 +7331,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       className="flex flex-col items-center justify-center"
                     >
                       <span className="w-7 h-7 rounded-full border border-dark-border group-hover:border-brand/50 transition-all bg-[#18191c] flex items-center justify-center overflow-hidden">
-                        {a.avatar ? (
-                          <img src={a.avatar} alt={a.name} className="w-full h-full object-cover" />
+                        {displayAvatarUrlForAsset(a) ? (
+                          <img src={displayAvatarUrlForAsset(a)} alt={a.name} className="w-full h-full object-cover" />
                         ) : (
                           <AssetIcon className="w-3.5 h-3.5 text-dark-muted group-hover:text-brand" />
                         )}
@@ -5857,7 +7496,19 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         <button 
                           onClick={() => {
                             const nextModel = IMAGE_MODEL_NAMES.has(globalModel) ? '渠道四 Gemini' : globalModel;
-                            const nextChannel = generateChannel === 'pixmax' ? 'pixmax' : (nextModel.startsWith('渠道四') ? 'oiioii' : nextModel.startsWith('渠道六') ? 'dola' : 'wizstar');
+                            const nextChannel = generateChannel === 'oreateai'
+                              ? 'oreateai'
+                              : generateChannel === 'pixmax'
+                                ? 'pixmax'
+                                : nextModel.startsWith('渠道四')
+                                  ? 'oiioii'
+                                  : nextModel.startsWith('渠道六')
+                                    ? 'dola'
+                                    : nextModel.startsWith('渠道九')
+                                      ? 'framia'
+                                      : nextModel.startsWith('渠道十')
+                                        ? 'tensorart'
+                                        : 'wizstar';
                             const nextAspectRatio = normalizeAspectRatio(globalAspectRatio, {
                               channel: nextChannel,
                               modelName: nextModel,
@@ -5877,14 +7528,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         </button>
                         <button 
                           onClick={() => {
-                            const nextModel = IMAGE_MODEL_NAMES.has(globalModel) ? globalModel : '渠道四 GPT-Image2';
+                            const nextModel = IMAGE_MODEL_NAMES.has(globalModel) && globalModel !== '渠道七 Lovart' ? globalModel : '渠道四 GPT-Image2';
+                            const nextChannel = nextModel.startsWith('渠道五') ? 'chatgpt2api' : 'oiioii';
                             const nextAspectRatio = normalizeAspectRatio(globalAspectRatio, {
-                              channel: 'oiioii',
+                              channel: nextChannel,
                               modelName: nextModel,
                               mediaType: 'image',
                             });
                             setGlobalModel(nextModel);
-                            setGenerateChannel('oiioii');
+                            setGenerateChannel(nextChannel);
                             setGlobalAspectRatio(nextAspectRatio);
                             setSegments(prev => prev.map(s => s.id === row.id ? { ...s, type: 'image', model: nextModel, aspectRatio: nextAspectRatio } : s));
                           }}
@@ -5898,7 +7550,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       </div>
                     </div>
 
-                    <span className="text-[9px] text-dark-subtle font-semibold">支持输入 @ 角色 · $ 场景 · # 物品 · 直接粘贴图片垫图</span>
+                    <span className="text-[9px] text-dark-subtle font-semibold">支持输入 @ 角色 · $ 场景 · # 物品 · @角色可切换仅发送文本</span>
                   </div>
 
                   {/* Single Big Text Bubble with Embedded Inline Badges matching Screenshot 2 */}
@@ -5956,9 +7608,19 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                               }
                             }}
                             className="inline-flex items-center space-x-1 cursor-pointer"
-                            title="点击更换垫图"
+                            title="点击更换垫图，双击放大预览"
                           >
-                            <img src={getReferenceDisplayUrl(row)} alt="ref" className="w-3.5 h-3.5 object-cover rounded-sm" />
+                            <img
+                              src={getReferenceDisplayUrl(row)}
+                              alt="ref"
+                              className="w-3.5 h-3.5 object-cover rounded-sm"
+                              onClick={(e) => { e.stopPropagation(); }}
+                              onDoubleClick={(e) => {
+                                e.stopPropagation();
+                                e.preventDefault();
+                                setFullscreenVideo({ src: getReferenceDisplayUrl(row), mediaType: 'image', materialName: '垫图' });
+                              }}
+                            />
                             <span className="text-[9px]">垫图</span>
                           </span>
                           <button
@@ -5994,33 +7656,118 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       )}
                     </div>
 
-                    <textarea
-                      ref={(el) => {
-                        if (el) {
-                          promptTextareaRefs.current[row.id] = el;
-                          if (editingRowId === row.id) requestAnimationFrame(() => resizePromptTextarea(el));
-                        } else delete promptTextareaRefs.current[row.id];
-                      }}
-                      defaultValue={promptDraftsRef.current[row.id] ?? row.text}
-                      onChange={(e) => handleTextareaChange(row.id, e.target.value, e)}
-                      onKeyDown={(e) => handleTextareaKeyDown(row.id, e)}
-                      onFocus={() => {
-                        if (editingRowId !== row.id) {
-                          promptDraftsRef.current[row.id] = promptDraftsRef.current[row.id] ?? row.text ?? '';
-                          setEditingRowId(row.id);
-                          resizePromptTextareaById(row.id);
-                        }
-                      }}
-                      onBlur={() => {
-                        commitPromptDraft(row.id);
-                        setTimeout(() => {
-                          setEditingRowId(null);
-                          resetAtState();
-                        }, 150);
-                      }}
-                      placeholder="请输入描述词，输入 @ 选择角色、$ 选择场景、# 选择物品..."
-                      className="w-full min-h-[72px] max-h-[260px] bg-transparent text-xs leading-relaxed text-dark-text placeholder-dark-subtle resize-none overflow-y-auto border-none outline-none focus:ring-0 p-0 cursor-text"
-                    />
+                    {editingRowId === row.id ? (
+                      <textarea
+                        ref={(el) => {
+                          if (el) {
+                            promptTextareaRefs.current[row.id] = el;
+                            requestAnimationFrame(() => resizePromptTextarea(el));
+                          } else delete promptTextareaRefs.current[row.id];
+                        }}
+                        defaultValue={promptDraftsRef.current[row.id] ?? row.text}
+                        onChange={(e) => handleTextareaChange(row.id, e.target.value, e)}
+                        onKeyDown={(e) => handleTextareaKeyDown(row.id, e)}
+                        onBlur={() => {
+                          commitPromptDraft(row.id);
+                          setTimeout(() => {
+                            setEditingRowId((current) => current === row.id ? null : current);
+                            resetAtState();
+                          }, 150);
+                        }}
+                        placeholder="请输入描述词，输入 @ 选择角色、$ 选择场景、# 选择物品..."
+                        className="w-full min-h-[72px] max-h-[260px] bg-transparent text-xs leading-relaxed text-dark-text placeholder-dark-subtle resize-none overflow-y-auto border-none outline-none focus:ring-0 p-0 cursor-text"
+                      />
+                    ) : (
+                      <div
+                        role="textbox"
+                        tabIndex={0}
+                        onClick={() => startEditingPrompt(row)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                            startEditingPrompt(row);
+                          }
+                        }}
+                        className="w-full min-h-[72px] max-h-[260px] overflow-y-auto whitespace-pre-wrap break-words bg-transparent text-xs leading-relaxed text-dark-text border-none outline-none focus:ring-0 p-0 cursor-text"
+                        title="点击编辑；引用会以小标签显示，提交时仍使用原始文本"
+                      >
+                        {renderPromptPreviewText(promptDraftsRef.current[row.id] ?? row.text)}
+                      </div>
+                    )}
+
+                    {(() => {
+                      const mentionedCharacters = getReferencedCharacterDisplayItems(
+                        row,
+                        promptDraftsRef.current[row.id] ?? row.text ?? ''
+                      );
+                      if (mentionedCharacters.length === 0) return null;
+                      return (
+                        <div className="mt-2 pt-2 border-t border-dark-border/40">
+                          <div className="mb-1.5 text-[8px] font-bold tracking-wide text-dark-subtle">
+                            已识别角色引用
+                          </div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {mentionedCharacters.map(({ name, asset, hasAsset, hasImage, sendImage }) => {
+                              const avatarUrl = displayAvatarUrlForAsset(asset || {});
+                              const statusText = !hasAsset
+                                ? '未找到资产 · 仅文本'
+                                : !hasImage
+                                  ? '无角色图片 · 仅文本'
+                                  : sendImage
+                                    ? '发送图片'
+                                    : '不发送图片';
+                              return (
+                                <div
+                                  key={name}
+                                  className={`inline-flex items-center gap-1.5 rounded-md border px-1.5 py-1 text-[9px] ${
+                                    sendImage
+                                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-100'
+                                      : hasImage
+                                        ? 'border-amber-500/35 bg-amber-500/10 text-amber-100'
+                                        : 'border-dark-border bg-black/15 text-dark-muted'
+                                  }`}
+                                  title={`已识别 @${name}；提示词始终发送，角色图片可单独控制`}
+                                >
+                                  {avatarUrl ? (
+                                    <img src={avatarUrl} alt={name} className="h-4 w-4 rounded object-cover" />
+                                  ) : (
+                                    <span className="flex h-4 w-4 items-center justify-center rounded bg-black/25 font-black">@</span>
+                                  )}
+                                  <span className="max-w-[120px] truncate font-bold">@{name}</span>
+                                  {hasImage ? (
+                                    <button
+                                      type="button"
+                                      aria-pressed={sendImage}
+                                      onMouseDown={(e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                      }}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setCharacterImagePreference(row.id, name, !sendImage);
+                                      }}
+                                      className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-bold transition-colors ${
+                                        sendImage
+                                          ? 'bg-emerald-400/20 hover:bg-emerald-400/30'
+                                          : 'bg-amber-400/15 hover:bg-amber-400/25'
+                                      }`}
+                                      title={sendImage ? '点击后仅发送 @角色 文本，不附带角色图片' : '点击后恢复附带角色图片'}
+                                    >
+                                      <span>{statusText}</span>
+                                      <span className={`relative h-3 w-5 rounded-full ${sendImage ? 'bg-emerald-400' : 'bg-dark-border'}`}>
+                                        <span className={`absolute top-0.5 h-2 w-2 rounded-full bg-white transition-all ${sendImage ? 'left-2.5' : 'left-0.5'}`} />
+                                      </span>
+                                    </button>
+                                  ) : (
+                                    <span className="rounded bg-black/20 px-1.5 py-0.5">{statusText}</span>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })()}
 
                     {/* Autocomplete @ / $ / # asset choice popover */}
                     {atState.isOpen && atState.rowId === row.id && (() => {
@@ -6061,8 +7808,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                                   </span>
                                   
                                   {/* Small avatar or icon fallback */}
-                                  {asset.avatar ? (
-                                    <img src={asset.avatar} alt={asset.name} className="w-6 h-6 rounded-full object-cover border border-dark-border/20 shrink-0" />
+                                  {displayAvatarUrlForAsset(asset) ? (
+                                    <img src={displayAvatarUrlForAsset(asset)} alt={asset.name} className="w-6 h-6 rounded-full object-cover border border-dark-border/20 shrink-0" />
                                   ) : (
                                     <span className="w-6 h-6 rounded-full bg-[#18191c] border border-dark-border/20 flex items-center justify-center shrink-0">
                                       {TriggerIcon ? <TriggerIcon className="w-3 h-3 text-dark-muted" /> : <span className="text-[10px] text-dark-muted">{activeTrigger}</span>}
@@ -6087,8 +7834,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                           return activeChar ? (
                             <div className="flex-1 bg-black/15 p-3 flex items-stretch space-x-3 relative">
                               <div className="w-[125px] h-full rounded-lg overflow-hidden border border-dark-border/30 relative shrink-0">
-                                {activeChar.avatar ? (
-                                  <img src={activeChar.avatar} alt="preview" className="w-full h-full object-cover" />
+                                {displayAvatarUrlForAsset(activeChar) ? (
+                                  <img src={displayAvatarUrlForAsset(activeChar)} alt="preview" className="w-full h-full object-cover" />
                                 ) : (
                                   <div className="w-full h-full bg-[#18191c] flex items-center justify-center">
                                     {TriggerIcon ? <TriggerIcon className="w-8 h-8 text-dark-muted" /> : <span className="text-2xl text-dark-muted">{activeTrigger}</span>}
@@ -6101,12 +7848,47 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                               <div className="flex-1 flex flex-col justify-center text-left">
                                 <div className="text-xs font-bold text-white text-base">{activeChar.name}</div>
                                 <div className="text-[10px] text-[#10b981] mt-1 font-semibold">{triggerMeta.label}就绪</div>
-                                <div className="text-[9px] text-dark-subtle mt-1.5 leading-relaxed">点击自动将其转化为描述词标签，并同步添加至本分镜。</div>
+                                <div className="text-[9px] text-dark-subtle mt-1.5 leading-relaxed">
+                                  点击插入描述词标签。角色引用插入后，可单独选择是否附带角色图片。
+                                </div>
                               </div>
                             </div>
                           ) : null;
                         })()}
                       </div>
+                      );
+                    })()}
+
+                    {generateChannel === 'oreateai' && (() => {
+                      const capability = getOreateaiCapability();
+                      const assets = row.oreateaiAssets || [];
+                      const limits = capability ? getOreateaiEffectiveSlots(capability, assets) : null;
+                      const selectionError = capability ? validateOreateaiAssetSelection(capability, assets) : '动态能力尚未加载';
+                      const summary = limits ? [
+                        limits.slots.image && `图片 ${limits.counts.image}/${limits.slots.image.max ?? '∞'}`,
+                        limits.slots.video && `视频 ${limits.counts.video}/${limits.slots.video.max ?? '∞'}`,
+                      ].filter(Boolean).join(' · ') : '';
+                      return (
+                        <div className="rounded-lg border border-cyan-500/25 bg-cyan-500/5 px-2.5 py-2 space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <span className="text-[9px] font-extrabold text-cyan-100">OreateAI 本地参考素材</span>
+                              <span className="ml-1.5 text-[8px] text-cyan-200/70">{summary || '按实时配置限制'}</span>
+                            </div>
+                            <button type="button" onClick={() => selectOreateaiAssetsForRow(row.id)} disabled={!capability} className="shrink-0 rounded border border-cyan-400/40 px-1.5 py-0.5 text-[8px] font-bold text-cyan-100 hover:bg-cyan-500/15 disabled:opacity-40">
+                              + 选择本地素材
+                            </button>
+                          </div>
+                          {assets.length > 0 && <div className="flex flex-wrap gap-1">
+                            {assets.map((asset, index) => <span key={`${asset.path}-${index}`} className="inline-flex max-w-full items-center gap-1 rounded bg-black/20 px-1.5 py-0.5 text-[8px] text-cyan-50">
+                              <span className="shrink-0">{asset.kind === 'video' ? '视频' : '图片'}</span>
+                              <span className="max-w-[150px] truncate">{asset.name}</span>
+                              <button type="button" onClick={() => removeOreateaiAssetFromRow(row.id, index)} className="text-cyan-100/60 hover:text-white" title="移除素材">×</button>
+                            </span>)}
+                          </div>}
+                          {selectionError && <p className="text-[8px] text-amber-200">{selectionError}</p>}
+                          {capability?.scene === 'reference' && <p className="text-[8px] text-cyan-100/65">保留选择顺序；视频时长由主进程重新探测并校验。</p>}
+                        </div>
                       );
                     })()}
 
@@ -6140,17 +7922,29 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       <span className="scale-75 text-[8px] text-dark-subtle">▼</span>
                     </div>
 
-                    {/* Aspect Ratio and Duration Badge */}
+                    {/* Aspect Ratio, Duration and OreateAI Resolution Badge */}
                     <div 
                       onClick={() => setActivePopover('params')}
                       className="bg-[#222328] hover:bg-dark-bg border border-dark-border hover:border-brand/40 px-2.5 py-1.5 rounded-lg text-dark-muted font-medium cursor-pointer transition-colors scale-95"
+                      title={generateChannel === 'oreateai' ? '点击选择比例、时长和分辨率' : '点击选择比例和时长'}
                     >
                       {globalAspectRatio} · {globalDuration}
+                      {generateChannel === 'oreateai' ? ` · ${String(globalResolution).replace(/p$/i, '')}P` : ''}
                     </div>
                   </div>
 
                   {/* Right Side: Merge / Reasoning / Generate buttons */}
                   <div className="flex items-center space-x-2">
+                    {/* Text to reference image button: render prompt text onto white background as 垫图 */}
+                    <button
+                      type="button"
+                      onClick={() => handleTextToReferenceImage(row.id)}
+                      className="flex items-center space-x-1 px-2.5 py-1.5 bg-[#1a2a1d] hover:bg-[#243a28] border border-[#1e3d28] text-[#5fd4a0] font-bold rounded-lg text-[11px] transition-colors"
+                      title="把当前描述词文字渲染到白色背景板上，生成一张图片作为垫图"
+                    >
+                      <Type className="w-3 h-3" />
+                      <span>描述词转垫图</span>
+                    </button>
                     {/* Merge images button: pull @角色 / $场景 / #物品 / 垫图 into a single reference */}
                     <button
                       type="button"
@@ -6161,15 +7955,17 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       <Combine className="w-3 h-3" />
                       <span>合并图片</span>
                     </button>
-                    {/* Browser collect button */}
-                    <button 
-                      type="button"
-                      onClick={() => handleCollectDolaTask(row)}
-                      className="px-3 py-1.5 bg-[#162923] hover:bg-[#1f3a2f] border border-[#1a3d31] text-[#10b981] font-bold rounded-lg text-[11px] transition-colors"
-                      title="打开浏览器采集 Dola 视频结果（浏览器优先，API 回退）"
-                    >
-                      浏览器采集
-                    </button>
+                    {/* API collect button */}
+                    {generateChannel === 'dola' && (
+                      <button
+                        type="button"
+                        onClick={() => handleCollectDolaTask(row)}
+                        className="px-3 py-1.5 bg-[#162923] hover:bg-[#1f3a2f] border border-[#1a3d31] text-[#10b981] font-bold rounded-lg text-[11px] transition-colors"
+                        title="通过 Dola API 采集视频结果，不会打开浏览器"
+                      >
+                        API 采集
+                      </button>
+                    )}
 
                     {/* Generate button */}
                     <button 
@@ -6192,7 +7988,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         type="button"
                         onClick={() => handleCollectDolaTask(row)}
                         className="px-2.5 py-1.5 rounded-lg bg-orange-500/10 border border-orange-500/30 text-orange-300 hover:bg-orange-500/20 hover:text-orange-200 text-[11px] font-bold transition-all"
-                        title="主动轮询渠道六结果，避免自动采集漏掉视频"
+                        title="通过 Dola API 主动轮询结果，不会打开浏览器"
                       >
                         {row.generateStatus === 'collecting' ? '采集中...' : '手动采集'}
                       </button>
@@ -6255,6 +8051,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 {/* Canvas viewport container */}
                 <div
                   className="w-full h-[156px] rounded-xl bg-zinc-950 border border-dark-border overflow-hidden relative flex items-center justify-center group/viewport shrink-0"
+                  draggable={isVid && hasPreview}
+                  onMouseEnter={() => { if (isVid && hasPreview) prepareExternalVideoDrag(currentMaterial); }}
+                  onMouseDown={(e) => { if (e.button === 0 && isVid && hasPreview) prepareExternalVideoDrag(currentMaterial); }}
+                  onDragStart={(e) => { if (isVid && hasPreview) startExternalVideoDrag(e, currentMaterial); }}
                   onDoubleClick={() => {
                     if (hasPreview) {
                       const previewSrc = isVid
@@ -6271,7 +8071,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       });
                     }
                   }}
-                  title={hasPreview ? '双击放大预览' : undefined}
+                  title={hasPreview ? (isVid ? '双击放大预览，可拖出到剪映' : '双击放大预览，可拖出到其他软件') : undefined}
                 >
                   {hasPreview ? (
                     currentMaterial.mediaType === 'video' || isVideoUrl(previewUrl) ? (
@@ -6284,6 +8084,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                         key={playableUrlForMaterial(currentMaterial)}
                         src={isCurrentPlaying ? playableUrlForMaterial(currentMaterial) : undefined}
                         className={`w-full h-full object-contain bg-zinc-950 ${isCurrentPlaying ? 'scale-105 brightness-110' : ''} transition-all duration-700`}
+                        draggable={false}
                         muted
                         playsInline
                         loop
@@ -6328,6 +8129,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                               ? `生成中 ${row.generateProgress}%`
                               : row.generateStatus === 'processing' ? '生成中...' : '等待中...')}
                       </span>
+                      {generationWaitLabel(row) && (
+                        <span className="text-[8px] font-semibold text-brand/90 text-center leading-tight">
+                          {generationWaitLabel(row)}
+                        </span>
+                      )}
                       <div className="w-full max-w-[180px] h-1.5 rounded-full bg-dark-border/60 overflow-hidden">
                         {typeof row.generateProgress === 'number' && row.generateProgress > 0 ? (
                           <div
@@ -6367,8 +8173,13 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   {/* Play Action center overlay (Only when there's actual content) */}
                   {isVid && currentMaterial.thumbnail && (
                     <button 
+                      type="button"
+                      draggable={true}
+                      onMouseDown={(e) => { if (e.button === 0) prepareExternalVideoDrag(currentMaterial); }}
+                      onDragStart={(e) => startExternalVideoDrag(e, currentMaterial)}
                       onClick={() => togglePlayCurrent(row.id)}
-                      className={`absolute inset-0 m-auto w-10 h-10 rounded-full bg-brand hover:scale-110 shadow-lg shadow-brand/25 flex items-center justify-center text-black font-bold transition-all ${isCurrentPlaying ? 'opacity-0 group-hover/viewport:opacity-90' : 'opacity-90'}`}
+                      className={`absolute inset-0 m-auto w-10 h-10 rounded-full bg-brand hover:scale-110 shadow-lg shadow-brand/25 flex items-center justify-center text-black font-bold transition-all cursor-grab active:cursor-grabbing ${isCurrentPlaying ? 'opacity-0 group-hover/viewport:opacity-90' : 'opacity-90'}`}
+                      title="点击播放/暂停，左键按住可拖到剪映"
                     >
                       {isCurrentPlaying ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current ml-0.5" />}
                     </button>
@@ -6520,7 +8331,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                 {/* Materials grid container - 2x2 forcing height */}
                 <div className="grid grid-cols-2 gap-1.5 h-[156px] overflow-y-auto no-scrollbar pb-1 relative">
                   
-                  {/* Generating placeholder cells: one per pending Dola account, with "open browser" button */}
+                  {/* Pending Dola tasks expose browser access only as an explicit authorization or diagnostic action. */}
                   {(row.pendingAccounts || []).filter(a => a.accountId || a.accountName).map((acc) => (
                     <div
                       key={`gen-${acc.taskId}`}
@@ -6541,12 +8352,13 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                           });
                         }}
                         className="relative z-10 max-w-full truncate rounded-full border border-brand/50 bg-brand/15 px-1.5 py-0.5 text-[8px] font-extrabold text-brand hover:bg-brand hover:text-black transition-all"
-                        title={`点击打开账号 ${acc.accountName || '#' + acc.accountId} 的 Dola 浏览器`}
+                        title={`手动打开账号 ${acc.accountName || '#' + acc.accountId} 的 Dola 浏览器进行授权或诊断`}
                       >
                         {(() => {
                           const name = acc.accountName || '';
                           const match = name.match(/#(\d+)/);
-                          return match ? `#${match[1]}` : (name || `#${acc.accountId}`);
+                          const accountLabel = match ? `#${match[1]}` : (name || `#${acc.accountId}`);
+                          return `授权/诊断 ${accountLabel}`;
                         })()}
                       </button>
                     </div>
@@ -6570,6 +8382,11 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                               ? `生成中 ${row.generateProgress}%`
                               : '生成中...')}
                       </span>
+                      {generationWaitLabel(row) && (
+                        <span className="relative z-10 text-[7px] font-semibold text-brand/80 mb-1 truncate max-w-full px-1">
+                          {generationWaitLabel(row)}
+                        </span>
+                      )}
                       <div className="relative z-10 w-[80%] h-1 rounded-full bg-dark-border/60 overflow-hidden">
                         {typeof row.generateProgress === 'number' && row.generateProgress > 0 ? (
                           <div
@@ -6592,10 +8409,24 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     return (
                       <div 
                         key={mat.id}
-                        draggable={!isVideoMat && !!matThumb}
-                        onMouseEnter={() => prepareExternalImageDrag(mat)}
-                        onMouseDown={() => prepareExternalImageDrag(mat)}
-                        onDragStart={(e) => startExternalImageDrag(e, mat)}
+                        draggable={!!matThumb}
+                        onMouseEnter={(e) => {
+                          if (isVideoMat) {
+                            prepareExternalVideoDrag(mat);
+                            e.currentTarget.querySelector('video')?.play().catch(() => {});
+                          } else {
+                            prepareExternalImageDrag(mat);
+                          }
+                        }}
+                        onMouseLeave={(e) => {
+                          if (!isVideoMat) return;
+                          const preview = e.currentTarget.querySelector('video');
+                          if (!preview) return;
+                          preview.pause();
+                          preview.currentTime = 0;
+                        }}
+                        onMouseDown={(e) => { if (e.button === 0) { isVideoMat ? prepareExternalVideoDrag(mat) : prepareExternalImageDrag(mat); } }}
+                        onDragStart={(e) => isVideoMat ? startExternalVideoDrag(e, mat) : startExternalImageDrag(e, mat)}
                         onClick={() => handleSelectCandidateMaterial(row.id, mat)}
                         onDoubleClick={(e) => {
                           e.stopPropagation();
@@ -6617,7 +8448,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                             ? 'border-brand bg-brand/5 shadow-[0_0_8px_rgba(16,185,129,0.15)]' 
                             : 'border-dark-border bg-dark-card/40 hover:bg-dark-card hover:border-dark-subtle'
                         }`}
-                        title={isActive ? '当前已选中；双击放大预览，可拖出到其他软件' : '点击选为当前画面；双击放大预览，可拖出到其他软件'}
+                        title={isActive ? '当前已选中；双击放大预览，可拖出到剪映' : '点击选为当前画面；双击放大预览，可拖出到剪映'}
                       >
                         {/* Badges Overlay */}
                         <div className="absolute top-1 left-1 z-10 flex items-center justify-between w-[85%] pointer-events-none">
@@ -6648,7 +8479,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                             <video
                               key={toPlayableUrl(matThumb)}
                               src={toPlayableUrl(matThumb)}
-                              className="w-full h-full object-cover bg-zinc-950"
+                              className="w-full h-full object-cover bg-zinc-950 pointer-events-none"
+                              draggable={false}
                               muted
                               playsInline
                               loop
@@ -6662,7 +8494,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                           <img 
                             src={matThumb} 
                             alt={mat.name} 
-                            className="w-full h-full object-cover" 
+                            className="w-full h-full object-cover pointer-events-none"
+                            draggable={false}
                           />
                         ) : (
                           <div className="w-full h-full flex items-center justify-center bg-zinc-900 text-dark-subtle text-[8px]">无预览</div>
@@ -6865,6 +8698,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   <div className="space-y-1 mt-2 flex-1 overflow-y-auto no-scrollbar">
                     {characterAssets.map((char) => {
                       const isActive = editingCharId === char.id;
+                      const charAvatarSrc = displayAvatarUrlForAsset(char);
                       return (
                         <div
                           key={char.id}
@@ -6881,12 +8715,12 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                           }`}
                         >
                           <img
-                            src={char.avatar}
+                            src={charAvatarSrc}
                             alt={char.name}
                             className="w-7 h-7 rounded-full object-cover border border-dark-border/20 shrink-0"
                             onDoubleClick={(e) => {
                               e.stopPropagation();
-                              if (char.avatar) setFullscreenVideo({ src: char.avatar, mediaType: 'image', materialName: char.name, assetType: 'character', assetId: char.id });
+                              if (charAvatarSrc) setFullscreenVideo({ src: charAvatarSrc, mediaType: 'image', materialName: char.name, assetType: 'character', assetId: char.id });
                             }}
                           />
                           <div className="flex-1 min-w-0">
@@ -6927,15 +8761,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     <div className="space-y-1.5 flex flex-col items-center">
                       <label className="text-[10px] text-dark-muted self-start font-bold">角色图片/特征头像</label>
                       <div className="w-32 h-32 relative rounded-xl border border-dashed border-dark-border/80 hover:border-brand/40 bg-dark-input/20 flex flex-col items-center justify-center overflow-hidden cursor-pointer group transition-colors shrink-0">
-                        {newCharAvatar ? (
+                        {toDisplayImageUrl(newCharAvatar, newCharAvatarPath) ? (
                           <div className="w-full h-full relative">
                             <img
-                              src={newCharAvatar}
+                              src={toDisplayImageUrl(newCharAvatar, newCharAvatarPath)}
                               alt="upload preview"
                               className="w-full h-full object-cover"
                               onDoubleClick={(e) => {
                                 e.stopPropagation();
-                                setFullscreenVideo({ src: newCharAvatar, mediaType: 'image', materialName: newCharName, assetType: 'character', assetId: editingCharId });
+                                setFullscreenVideo({ src: toDisplayImageUrl(newCharAvatar, newCharAvatarPath), mediaType: 'image', materialName: newCharName, assetType: 'character', assetId: editingCharId });
                               }}
                             />
                             {charGridOverlay && (
@@ -7117,6 +8951,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   <div className="space-y-1 mt-2 flex-1 overflow-y-auto no-scrollbar">
                     {assets.map((a) => {
                       const isActive = editingAssetId === a.id;
+                      const assetAvatarSrc = displayAvatarUrlForAsset(a);
                       return (
                         <div
                           key={a.id}
@@ -7130,14 +8965,14 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                             isActive ? 'bg-[#323338]/30 border-[#10b981]/40 text-brand' : 'hover:bg-[#1c1d22]/40 border-transparent text-dark-text'
                           }`}
                         >
-                          {a.avatar ? (
+                          {assetAvatarSrc ? (
                             <img
-                              src={a.avatar}
+                              src={assetAvatarSrc}
                               alt={a.name}
                               className="w-7 h-7 rounded-full object-cover border border-dark-border/20 shrink-0"
                               onDoubleClick={(e) => {
                                 e.stopPropagation();
-                                setFullscreenVideo({ src: a.avatar, mediaType: 'image', materialName: a.name, assetType: editingAssetType, assetId: a.id });
+                                setFullscreenVideo({ src: assetAvatarSrc, mediaType: 'image', materialName: a.name, assetType: editingAssetType, assetId: a.id });
                               }}
                             />
                           ) : (
@@ -7180,15 +9015,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                     <div className="space-y-1.5 flex flex-col items-center">
                       <label className="text-[10px] text-dark-muted self-start font-bold">{label}图片</label>
                       <div className="w-32 h-32 relative rounded-xl border border-dashed border-dark-border/80 hover:border-brand/40 bg-dark-input/20 flex flex-col items-center justify-center overflow-hidden cursor-pointer group transition-colors shrink-0">
-                        {newAssetAvatar ? (
+                        {toDisplayImageUrl(newAssetAvatar, newAssetAvatarPath) ? (
                           <div className="w-full h-full relative">
                             <img
-                              src={newAssetAvatar}
+                              src={toDisplayImageUrl(newAssetAvatar, newAssetAvatarPath)}
                               alt="upload preview"
                               className="w-full h-full object-cover"
                               onDoubleClick={(e) => {
                                 e.stopPropagation();
-                                setFullscreenVideo({ src: newAssetAvatar, mediaType: 'image', materialName: newAssetName, assetType: editingAssetType, assetId: editingAssetId });
+                                setFullscreenVideo({ src: toDisplayImageUrl(newAssetAvatar, newAssetAvatarPath), mediaType: 'image', materialName: newAssetName, assetType: editingAssetType, assetId: editingAssetId });
                               }}
                             />
                             <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex flex-col items-center justify-center space-y-1 text-[9px] text-white transition-opacity">
@@ -7273,7 +9108,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       {/* 手动打码弹窗 */}
       <FaceCensorModal
         open={manualCensorOpen}
-        src={newCharAvatarOriginal || newCharAvatar}
+        src={toDisplayImageUrl(newCharAvatarOriginal || newCharAvatar, newCharAvatarPath)}
         onApply={handleApplyManualCensor}
         onClose={() => setManualCensorOpen(false)}
       />
@@ -7281,7 +9116,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       {/* 网格遮罩弹窗 */}
       <GridMaskModal
         open={gridMaskOpen}
-        src={newCharAvatarOriginal || newCharAvatar}
+        src={toDisplayImageUrl(newCharAvatarOriginal || newCharAvatar, newCharAvatarPath)}
         onApply={handleApplyManualCensor}
         onClose={() => setGridMaskOpen(false)}
       />

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import json
+import hmac
 import mimetypes
+import re
 import threading
 import time
 import traceback
@@ -19,7 +22,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
 
-from .database import init_db, MailboxDB, AccountDB, TaskDB, ProjectDB, QfAccountDB, DolaAccountDB
+from .database import init_db, MailboxDB, AccountDB, TaskDB, ProjectDB, QfAccountDB, DolaAccountDB, LovartAccountDB, OreateAIAccountDB, FramiaAccountDB, TensorArtAccountDB
 from .client import WizstarClient, WizstarCredentials
 from .mailbox import OutlookMailbox
 from .enums import TaskType, Model, Ratio, Resolution
@@ -28,7 +31,10 @@ from . import quickframe_bridge as qf
 from . import pixmax as px
 from . import oiioii as oi
 from . import dola as dl
+from . import lovart as lv
 from . import chatgpt2api as cg
+from . import framia as fm
+from . import tensorart as ta
 
 
 @asynccontextmanager
@@ -39,6 +45,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Wizstar Local API", version="1.0.0", lifespan=lifespan)
 _dola_task_create_lock = threading.Lock()
+_wizstar_task_create_lock = threading.Lock()
+_tensorart_task_create_lock = threading.Lock()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,28 +60,107 @@ app.add_middleware(
 
 class MailboxCreate(BaseModel):
     email: str
-    client_id: str
-    refresh_token: str
+    password: str = ""
+    client_id: str = ""
+    refresh_token: str = ""
+    google_password: str = ""
+    provider: str = ""
 
 
 class MailboxBatchImport(BaseModel):
-    """批量导入格式：每行 email----password----client_id----refresh_token"""
+    """兼容 Google 登录与 Microsoft OAuth 邮箱格式。"""
     raw_text: str
 
 
-class AccountRegister(BaseModel):
-    mailbox_id: int
-    password: str = "Wz@2024secure"
+class MailboxClaimRequest(BaseModel):
+    """由各渠道从全局邮箱库原子领取邮箱。"""
+    channel: str
+    count: int = 1
+    mailbox_ids: list[int] = []
+    credential_type: str = "any"
+    provider: str = "any"
+    lease_seconds: int = 900
 
 
-class AccountBatchRegister(BaseModel):
-    mailbox_ids: list[int]
-    password: str = "Wz@2024secure"
-    concurrency: int = 2
+class MailboxUsageUpdate(BaseModel):
+    """记录邮箱在指定渠道中的注册结果。"""
+    channel: str
+    status: str
+    account_email: str = ""
+    error: str = ""
+
+
+class GoogleAccountLogin(BaseModel):
+    """接收 Electron 授权窗口提取的 Wizstar 浏览器会话。"""
+    mailbox_id: int = 0
+    email: str = ""
+    auth_token: str = ""
+    cookies: dict[str, str] = {}
+    user_info: dict = {}
 
 
 class AccountConcurrencyUpdate(BaseModel):
     max_concurrency: int = 1
+
+
+def _account_credentials(account: dict) -> WizstarCredentials:
+    """把持久化账号恢复成可复用的 Wizstar 浏览器会话。"""
+    raw_cookies = account.get("cookies_json") or {}
+    if isinstance(raw_cookies, str):
+        try:
+            raw_cookies = json.loads(raw_cookies)
+        except (TypeError, ValueError):
+            raw_cookies = {}
+    cookies = raw_cookies if isinstance(raw_cookies, dict) else {}
+    return WizstarCredentials(
+        email=account.get("email", ""),
+        password=account.get("password", ""),
+        uid=account.get("uid", 0),
+        display_name=account.get("display_name", ""),
+        osduss=account.get("osduss", ""),
+        refresh_token=account.get("refresh_token", ""),
+        pass_os_refresh_tk=account.get("pass_os_refresh_tk", ""),
+        auth_token=account.get("auth_token", ""),
+        cookies=cookies,
+    )
+
+
+def _session_failure_status(error: object) -> str:
+    text = str(error or "").lower()
+    if "user forbidden" in text or "forbidden" in text:
+        return "forbidden"
+    expired_markers = (
+        "unauthorized",
+        "unauthenticated",
+        "token expired",
+        "invalid token",
+        "login required",
+        "not logged in",
+        "user not login",
+        "登录失效",
+        "未登录",
+        "请登录",
+    )
+    return "auth_expired" if any(marker in text for marker in expired_markers) else "error"
+
+
+def _record_session_failure(account_id: int, error: object, *, include_generic: bool = True) -> str:
+    status = _session_failure_status(error)
+    if include_generic or status != "error":
+        AccountDB.update_session_status(account_id, status, str(error or ""))
+    return status
+
+
+def _require_internal_session_access(request: Request) -> None:
+    expected = os.getenv("WIZSTAR_INTERNAL_TOKEN", "").strip()
+    supplied = request.headers.get("X-Wizstar-Internal-Token", "").strip()
+    if expected:
+        if not supplied or not hmac.compare_digest(expected, supplied):
+            raise HTTPException(status_code=403, detail="internal session access denied")
+        return
+    client_host = request.client.host if request.client else ""
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(status_code=403, detail="internal session access denied")
 
 
 class TaskCreate(BaseModel):
@@ -138,10 +225,11 @@ class QuickFrameConfigUpdate(BaseModel):
 
 
 class QuickFrameRegister(BaseModel):
-    """注册 QuickFrame 账号：自动生成临时邮箱并注册"""
+    """使用全局邮箱库注册 QuickFrame 账号。"""
     count: int = 1
     concurrency: int = 3
-    domain: str = ""          # 留空表示从可用域名随机选
+    domain: str = ""          # 兼容旧临时邮箱流程
+    mailbox_ids: list[int] = []
 
 
 class PixmaxTaskCreate(BaseModel):
@@ -172,10 +260,11 @@ class QuickFrameTaskCreate(BaseModel):
 
 
 class OiiOiiConfigUpdate(BaseModel):
-    """保存 OiiOii 通道配置（代理设置）"""
+    """保存 OiiOii 通道配置（代理设置 / 注册邮箱来源）"""
     use_proxy: bool | None = None
     proxy_host: str | None = None
     proxy_port: int | None = None
+    mail_provider: str | None = None
     test: bool = False
 
 
@@ -183,6 +272,8 @@ class OiiOiiBatchRegister(BaseModel):
     """OiiOii 批量注册参数"""
     count: int = 1
     concurrency: int = 2
+    mail_provider: str | None = None
+    mailbox_ids: list[int] = []
 
 
 class OiiOiiAccountImport(BaseModel):
@@ -202,6 +293,8 @@ class OiiOiiTaskCreate(BaseModel):
     duration: int = 10
     aspect_ratio: str = "16:9"
     resolution: str = "720p"
+    generate_mode: str = ""
+    generateMode: str = ""
 
 
 class OiiOiiImageCreate(BaseModel):
@@ -233,6 +326,7 @@ class DolaConfigUpdate(BaseModel):
     env_file: str | None = None
     profile_dir: str | None = None
     send_mode: str | None = None
+    browser_headless: bool | None = None
 
 
 class DolaAccountGrab(BaseModel):
@@ -252,12 +346,141 @@ class DolaAccountGrab(BaseModel):
 
 
 class DolaAccountImport(BaseModel):
-    """把已有 Dola 登录态加入账号库。"""
+    """把已有 Dola API 凭证加入账号库。"""
     name: str = ""
     cookie: str = ""
+    ms_token: str = ""
+    msToken: str = ""
     env_file: str = ""
     profile_dir: str = ""
     note: str = ""
+
+
+class LovartAccountImport(BaseModel):
+    """把 Lovart 登录态加入渠道七账号库。"""
+    email: str
+    cookie: str = ""
+    cookies: list[dict] = []
+    user_agent: str = ""
+    location: str = ""
+    local_storage: dict = {}
+    session_storage: dict = {}
+    indexed_db: list[dict] = []
+    status: str = "active"
+    note: str = ""
+
+
+class FramiaAccountImport(BaseModel):
+    """把 Framia Google OAuth 登录态加入渠道九账号库。"""
+    email: str
+    password: str = ""
+    access_token: str = ""
+    expires_at: int = 0
+    cookie: str = ""
+    user_agent: str = ""
+    user_id: str = ""
+    location: str = ""
+    status: str = "active"
+    note: str = ""
+
+
+class FramiaAccountLogin(BaseModel):
+    """通过 Google OAuth 自动登录 Framia 并采集账号。"""
+    email: str
+    password: str
+    visible: bool = True
+    proxy: str = ""
+    keep_open: bool = False
+
+
+class FramiaMailboxBatchLogin(BaseModel):
+    """从全局邮箱库领取账号并批量登录 Framia。"""
+    count: int = 1
+    concurrency: int = 1
+    mailbox_ids: list[int] = []
+    visible: bool = True
+    proxy: str = ""
+    keep_open: bool = False
+
+
+class FramiaTaskCreate(BaseModel):
+    """Framia 视频生成提交参数（渠道九）。"""
+    account_id: int = 0
+    prompt: str = ""
+    image_path: str = ""
+    image_url: str = ""
+    model: str = "Seedance 2.0 Mini"
+    aspect_ratio: str = "16:9"
+    resolution: str = "720p"
+    duration: float = 4
+    image_paths: list[str] = []
+
+
+class TensorArtAccountImport(BaseModel):
+    """手动导入 Tensor.Art 登录 token。"""
+    email: str
+    access_token: str
+    expires_at: int = 0
+    device_id: str = ""
+    user_agent: str = ""
+    user_id: str = ""
+    status: str = "active"
+    note: str = ""
+
+
+class TensorArtMailboxRegister(BaseModel):
+    """从全局 Microsoft OAuth 邮箱库注册 Tensor.Art。"""
+    count: int = 1
+    concurrency: int = 1
+    mailbox_ids: list[int] = []
+    max_wait: int = 210
+
+
+class TensorArtTaskCreate(BaseModel):
+    """Tensor.Art 图生视频提交参数（渠道十）。"""
+    account_id: int = 0
+    prompt: str = ""
+    image_path: str = ""
+    image_url: str = ""
+    image_paths: list[str] = []
+    model: str = "tensorart-default"
+    aspect_ratio: str = "16:9"
+    resolution: str = "480p"
+    duration: int = 4
+
+
+class OreateAIAccountImport(BaseModel):
+    """保存真实 Chromium 注册并登录后的 OreateAI 渠道八会话。"""
+    email: str
+    password: str
+    cookie: str = ""
+    cookies: list[dict] = []
+    user_agent: str = ""
+    location: str = ""
+    status: str = "active"
+    note: str = ""
+
+
+class LovartImageCreate(BaseModel):
+    """Lovart 图片生成提交参数（渠道七）。"""
+    account_id: int = 0
+    prompt: str = ""
+    image: str = ""
+    image_path: str = ""
+    image_url: str = ""
+    data_url: str = ""
+    reference_images: list[str] = []
+    images: list[str] = []
+    model: str = "openai/gpt-image-2"
+    aspect_ratio: str = "16:9"
+    aspectRatio: str = ""
+    resolution: str = "2K"
+    size: str = ""
+    quality: str = "medium"
+    project_id: str = ""
+    projectId: str = ""
+    cid: str = ""
+    with_pricing: bool = False
 
 
 class DolaTaskCreate(BaseModel):
@@ -270,6 +493,7 @@ class DolaTaskCreate(BaseModel):
     model: str = "seedance-2.0"
     ratio: str = "16:9"
     duration: int = 15
+    headless: bool | None = None
     exclude_account_ids: list[int] = []
 
 
@@ -311,11 +535,13 @@ class ProjectUpdate(BaseModel):
 
 
 class ProjectPayload(BaseModel):
-    segments: list = []
-    character_assets: list = []
-    scene_assets: list = []
-    item_assets: list = []
-    generation_tasks: list = []
+    # None means "leave the existing MySQL column unchanged". This keeps
+    # lightweight segment-only flushes from erasing other project assets.
+    segments: list | None = None
+    character_assets: list | None = None
+    scene_assets: list | None = None
+    item_assets: list | None = None
+    generation_tasks: list | None = None
 
 
 # ==================== 项目库 ====================
@@ -366,12 +592,12 @@ def save_project_payload(project_id: str, body: ProjectPayload):
     if not ProjectDB.get(project_id):
         raise HTTPException(status_code=404, detail="project not found")
     ProjectDB.save_payload(
-        project_id,
-        body.segments,
-        body.character_assets,
-        body.scene_assets,
-        body.item_assets,
-        body.generation_tasks,
+        project_id=project_id,
+        segments=body.segments,
+        character_assets=body.character_assets,
+        scene_assets=body.scene_assets,
+        item_assets=body.item_assets,
+        generation_tasks=body.generation_tasks,
     )
     return {"message": "saved"}
 
@@ -386,8 +612,15 @@ def list_mailboxes():
 @app.post("/mailboxes")
 def add_mailbox(body: MailboxCreate):
     try:
-        mailbox = MailboxDB.add(body.email, body.client_id, body.refresh_token)
-        return {"data": mailbox}
+        mailbox = MailboxDB.add(
+            body.email,
+            body.client_id,
+            body.refresh_token,
+            body.google_password,
+            password=body.password,
+            provider=body.provider,
+        )
+        return {"data": MailboxDB.public(mailbox)}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -398,24 +631,129 @@ def delete_mailbox(mailbox_id: int):
     return {"message": "deleted"}
 
 
+@app.get("/mailboxes/{mailbox_id}")
+def get_mailbox(mailbox_id: int):
+    mailbox = MailboxDB.get(mailbox_id)
+    if not mailbox:
+        raise HTTPException(status_code=404, detail="mailbox not found")
+    return {"data": MailboxDB.public(mailbox)}
+
+
+@app.get("/internal/mailboxes/{mailbox_id}")
+def get_mailbox_credentials(mailbox_id: int, request: Request):
+    _require_internal_session_access(request)
+    mailbox = MailboxDB.get(mailbox_id)
+    if not mailbox:
+        raise HTTPException(status_code=404, detail="mailbox not found")
+    mailbox["password"] = mailbox.get("password") or mailbox.get("google_password") or ""
+    mailbox["google_password"] = mailbox["password"]
+    return {"data": mailbox}
+
+
+@app.post("/internal/mailboxes/claim")
+def claim_mailboxes(body: MailboxClaimRequest, request: Request):
+    _require_internal_session_access(request)
+    try:
+        mailboxes = MailboxDB.claim_for_channel(
+            body.channel,
+            count=body.count,
+            mailbox_ids=body.mailbox_ids,
+            credential_type=body.credential_type,
+            provider=body.provider,
+            lease_seconds=body.lease_seconds,
+        )
+        return {"data": mailboxes}
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
+@app.post("/internal/mailboxes/{mailbox_id}/usage")
+def update_mailbox_usage(mailbox_id: int, body: MailboxUsageUpdate, request: Request):
+    _require_internal_session_access(request)
+    if not MailboxDB.get(mailbox_id):
+        raise HTTPException(status_code=404, detail="mailbox not found")
+    try:
+        usage = MailboxDB.mark_channel_usage(
+            mailbox_id,
+            body.channel,
+            body.status,
+            account_email=body.account_email,
+            error=body.error,
+        )
+        return {"data": usage}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@app.delete("/mailboxes/{mailbox_id}/usage/{channel}")
+def clear_mailbox_channel_failure(mailbox_id: int, channel: str):
+    """手动解除某邮箱在指定渠道的失败冷却；已注册和使用中的记录不可清除。"""
+    if not MailboxDB.get(mailbox_id):
+        raise HTTPException(status_code=404, detail="mailbox not found")
+    try:
+        cleared = MailboxDB.clear_channel_failure(mailbox_id, channel)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not cleared:
+        raise HTTPException(status_code=409, detail="只有失败或已释放的渠道记录可以解除")
+    return {"data": {"cleared": True}}
+
+
 @app.post("/mailboxes/batch")
 def batch_import_mailboxes(body: MailboxBatchImport):
-    """批量导入邮箱，格式：每行 email----password----client_id----refresh_token"""
-    lines = [l.strip() for l in body.raw_text.strip().splitlines() if l.strip()]
+    """批量导入 Google 账号或供渠道八取件的 Microsoft OAuth 邮箱。"""
+    lines = [line.strip() for line in body.raw_text.strip().splitlines() if line.strip()]
     imported = []
     errors = []
     for line in lines:
-        parts = line.split("----")
-        if len(parts) < 4:
-            errors.append({"line": line[:50], "error": "格式错误，需要4段用----分隔"})
-            continue
-        email = parts[0].strip()
-        # parts[1] is password (not needed for mailbox, but we store it for registration)
-        client_id = parts[2].strip()
-        refresh_token = parts[3].strip()
+        if "----" in line:
+            parts = [part.strip() for part in line.split("----", 3)]
+            if len(parts) == 4:
+                email, password, third, fourth = parts
+                third_is_client_id = bool(re.fullmatch(
+                    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                    third,
+                ))
+                fourth_is_client_id = bool(re.fullmatch(
+                    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                    fourth,
+                ))
+                if fourth_is_client_id and not third_is_client_id:
+                    refresh_token, client_id = third, fourth
+                else:
+                    client_id, refresh_token = third, fourth
+            elif len(parts) == 3:
+                email, second, third = parts
+                password = ""
+                second_is_client_id = bool(re.fullmatch(
+                    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                    second,
+                ))
+                third_is_client_id = bool(re.fullmatch(
+                    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+                    third,
+                ))
+                if third_is_client_id and not second_is_client_id:
+                    refresh_token, client_id = second, third
+                else:
+                    client_id, refresh_token = second, third
+            else:
+                errors.append({"line": line[:50], "error": "格式错误，需要 邮箱----client_id----refresh_token，或四字段兼容格式"})
+                continue
+            if not email or not client_id or not refresh_token:
+                errors.append({"line": line[:50], "error": "邮箱、client_id、refresh_token 不能为空"})
+                continue
+        else:
+            parts = [part.strip() for part in line.split("|", 1)]
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                errors.append({"line": line[:50], "error": "格式错误，请使用 邮箱|密码"})
+                continue
+            email, password = parts
+            client_id = ""
+            refresh_token = ""
         try:
-            mailbox = MailboxDB.add(email, client_id, refresh_token)
-            imported.append(mailbox)
+            mailbox = MailboxDB.add(email, client_id, refresh_token, password)
+            imported.append(MailboxDB.public(mailbox))
         except Exception as e:
             errors.append({"line": email, "error": str(e)})
     return {"data": {"imported": imported, "errors": errors, "total": len(lines)}}
@@ -436,18 +774,71 @@ def test_mailbox(mailbox_id: int):
         return {"status": "error", "message": str(e)}
 
 
+def _mark_mailbox_channel_by_email(
+    email: str,
+    channel: str,
+    status: str = "registered",
+    error: str = "",
+) -> None:
+    """Best-effort usage tracking for account import/login endpoints."""
+    mailbox = MailboxDB.get_by_email(str(email or "").strip())
+    if not mailbox:
+        return
+    try:
+        MailboxDB.mark_channel_usage(
+            mailbox["id"],
+            channel,
+            status,
+            account_email=email,
+            error=error,
+        )
+    except Exception:
+        pass
+
+
+def _release_mailbox_channel_by_email(email: str, channel: str) -> None:
+    """Account deletion makes the mailbox reusable for that channel."""
+    mailbox = MailboxDB.get_by_email(str(email or "").strip())
+    if not mailbox:
+        return
+    try:
+        MailboxDB.mark_channel_usage(
+            mailbox["id"],
+            channel,
+            "released",
+            account_email=email,
+        )
+    except Exception:
+        pass
+
+
 # ==================== 账号库 ====================
 
 @app.get("/accounts")
 def list_accounts():
     accounts = AccountDB.list_all()
+    result = []
     for account in accounts:
-        account["active_task_count"] = TaskDB.active_count_for_account(account["id"])
-    return {"data": accounts}
+        public_account = AccountDB.public(account)
+        public_account["active_task_count"] = TaskDB.active_count_for_account(account["id"])
+        used_15s_count = TaskDB.used_15s_count_for_account(account["id"])
+        public_account["used_15s_task_count"] = used_15s_count
+        public_account["remaining_15s_task_quota"] = max(0, 1 - used_15s_count)
+        result.append(public_account)
+    return {"data": result}
 
 
 @app.get("/accounts/{account_id}")
 def get_account(account_id: int):
+    account = AccountDB.get(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="account not found")
+    return {"data": AccountDB.public(account)}
+
+
+@app.get("/internal/accounts/{account_id}/session")
+def get_account_session(account_id: int, request: Request):
+    _require_internal_session_access(request)
     account = AccountDB.get(account_id)
     if not account:
         raise HTTPException(status_code=404, detail="account not found")
@@ -462,100 +853,79 @@ def update_account_concurrency(account_id: int, body: AccountConcurrencyUpdate):
     max_concurrency = max(1, min(int(body.max_concurrency or 1), 10))
     AccountDB.update_concurrency(account_id, max_concurrency)
     updated = AccountDB.get(account_id)
-    return {"data": updated}
+    return {"data": AccountDB.public(updated)}
 
 
-@app.post("/accounts/register")
-def register_account(body: AccountRegister):
-    """用指定邮箱自动注册 wizstar 账号（同步阻塞，耗时约 30-120 秒）"""
-    mailbox = MailboxDB.get(body.mailbox_id)
+@app.post("/accounts/google-login")
+def google_login_account(body: GoogleAccountLogin):
+    """校验浏览器会话后保存 Google 登录账号。"""
+    mailbox = MailboxDB.get(body.mailbox_id) if body.mailbox_id else MailboxDB.get_by_email(body.email)
+    if not mailbox and body.email:
+        mailbox = MailboxDB.add(body.email, provider="google")
     if not mailbox:
         raise HTTPException(status_code=404, detail="mailbox not found")
+    if not body.auth_token and not body.cookies:
+        raise HTTPException(status_code=400, detail="Google 登录会话为空")
 
     try:
-        mb = OutlookMailbox(mailbox["email"], mailbox["client_id"], mailbox["refresh_token"])
-        client = WizstarClient()
-        creds = client.register_auto(mb, body.password)
-
-        # 获取积分
-        points = 0
+        supplied_info = body.user_info or {}
+        client = WizstarClient(
+            WizstarCredentials(
+                email=body.email or mailbox["email"],
+                auth_token=body.auth_token,
+                cookies=body.cookies,
+            )
+        )
+        info_response = client.user_info()
+        if info_response.get("errno") != 0:
+            raise RuntimeError(f"user info failed: {info_response}")
+        user = info_response.get("data") or supplied_info
+        email = user.get("email") or body.email or mailbox["email"]
+        if not email:
+            raise RuntimeError("Google 登录成功但未取得邮箱")
+        uid = user.get("uid") or user.get("user_id") or user.get("userId") or 0
+        try:
+            uid = int(uid)
+        except (TypeError, ValueError):
+            uid = 0
+        points = user.get("point_number", 0) or 0
         try:
             balance = client.points_balance()
             if balance.get("errno") == 0:
-                points = balance.get("data", {}).get("total_points", 0)
+                points = (balance.get("data") or {}).get("total_points", points)
         except Exception:
             pass
-
         account = AccountDB.add(
-            email=creds.email,
-            password=creds.password,
-            uid=creds.uid,
-            display_name=creds.display_name,
-            osduss=creds.osduss,
-            refresh_token=creds.refresh_token,
-            pass_os_refresh_tk=creds.pass_os_refresh_tk,
+            email=email,
+            uid=uid,
+            display_name=user.get("display_name") or user.get("user_name") or "",
+            osduss=body.cookies.get("osduss", ""),
+            refresh_token=body.auth_token,
+            auth_token=body.auth_token,
+            pass_os_refresh_tk=body.cookies.get("passOsRefreshTk", ""),
+            cookies=body.cookies,
             points_balance=points,
         )
-        MailboxDB.update_status(body.mailbox_id, "registered")
-        return {"data": account}
+        MailboxDB.update_status(mailbox["id"], "logged_in")
+        MailboxDB.mark_channel_usage(
+            mailbox["id"],
+            "wizstar",
+            "registered",
+            account_email=email,
+        )
+        return {"data": AccountDB.public(account)}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"registration failed: {str(e)}")
-
-
-@app.post("/accounts/batch-register")
-def batch_register_accounts(body: AccountBatchRegister):
-    """批量并发注册 wizstar 账号"""
-    import concurrent.futures
-
-    mailbox_ids = body.mailbox_ids
-    password = body.password
-    concurrency = min(body.concurrency, 10)
-
-    results = {"success": [], "failed": []}
-
-    def register_one(mailbox_id: int) -> dict:
-        mailbox = MailboxDB.get(mailbox_id)
-        if not mailbox:
-            return {"mailbox_id": mailbox_id, "error": "mailbox not found"}
-        try:
-            mb = OutlookMailbox(mailbox["email"], mailbox["client_id"], mailbox["refresh_token"])
-            client = WizstarClient()
-            creds = client.register_auto(mb, password)
-            points = 0
-            try:
-                balance = client.points_balance()
-                if balance.get("errno") == 0:
-                    points = balance.get("data", {}).get("total_points", 0)
-            except Exception:
-                pass
-            account = AccountDB.add(
-                email=creds.email,
-                password=creds.password,
-                uid=creds.uid,
-                display_name=creds.display_name,
-                osduss=creds.osduss,
-                refresh_token=creds.refresh_token,
-                pass_os_refresh_tk=creds.pass_os_refresh_tk,
-                points_balance=points,
-            )
-            MailboxDB.update_status(mailbox_id, "registered")
-            return {"mailbox_id": mailbox_id, "email": creds.email, "success": True, "account": account}
-        except Exception as e:
-            err_msg = str(e)
-            if "has been bound" in err_msg or "200503" in err_msg:
-                MailboxDB.update_status(mailbox_id, "registered")
-            return {"mailbox_id": mailbox_id, "error": err_msg}
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {executor.submit(register_one, mid): mid for mid in mailbox_ids}
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result.get("success"):
-                results["success"].append(result)
-            else:
-                results["failed"].append(result)
-
-    return {"data": results}
+        MailboxDB.update_status(mailbox["id"], "error")
+        MailboxDB.mark_channel_usage(
+            mailbox["id"],
+            "wizstar",
+            "failed",
+            account_email=body.email or mailbox.get("email", ""),
+            error=str(e),
+        )
+        raise HTTPException(status_code=502, detail=f"Google 登录失败: {str(e)}")
 
 
 @app.post("/accounts/batch-refresh")
@@ -568,26 +938,19 @@ def batch_refresh_accounts():
 
     def refresh_one(account: dict) -> dict:
         try:
-            creds = WizstarCredentials(
-                email=account["email"],
-                password=account["password"],
-                uid=account["uid"],
-                osduss=account["osduss"],
-                refresh_token=account["refresh_token"],
-                pass_os_refresh_tk=account["pass_os_refresh_tk"],
-            )
+            creds = _account_credentials(account)
             client = WizstarClient(credentials=creds)
             info = client.user_info()
             if info.get("errno") == 0:
                 points = info.get("data", {}).get("point_number", 0)
                 AccountDB.update_points(account["id"], points)
-                return {"id": account["id"], "email": account["email"], "points": points}
-            err_text = str(info)
-            if "user forbidden" in err_text.lower():
-                AccountDB.update_status(account["id"], "forbidden")
-            return {"id": account["id"], "email": account["email"], "error": f"API error: {info}"}
+                return {"id": account["id"], "email": account["email"], "points": points, "status": "active"}
+            error = f"API error: {info}"
+            status = _record_session_failure(account["id"], error)
+            return {"id": account["id"], "email": account["email"], "status": status, "error": error}
         except Exception as e:
-            return {"id": account["id"], "email": account["email"], "error": str(e)}
+            status = _record_session_failure(account["id"], e)
+            return {"id": account["id"], "email": account["email"], "status": status, "error": str(e)}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(refresh_one, acc) for acc in accounts]
@@ -603,7 +966,10 @@ def batch_refresh_accounts():
 
 @app.delete("/accounts/{account_id}")
 def delete_account(account_id: int):
+    account = AccountDB.get(account_id)
     AccountDB.delete(account_id)
+    if account:
+        _release_mailbox_channel_by_email(account.get("email", ""), "wizstar")
     return {"message": "deleted"}
 
 
@@ -615,26 +981,23 @@ def refresh_account(account_id: int):
         raise HTTPException(status_code=404, detail="account not found")
 
     try:
-        creds = WizstarCredentials(
-            email=account["email"],
-            password=account["password"],
-            uid=account["uid"],
-            osduss=account["osduss"],
-            refresh_token=account["refresh_token"],
-            pass_os_refresh_tk=account["pass_os_refresh_tk"],
-        )
+        creds = _account_credentials(account)
         client = WizstarClient(credentials=creds)
         info = client.user_info()
         if info.get("errno") == 0:
             points = info.get("data", {}).get("point_number", 0)
             AccountDB.update_points(account_id, points)
-            return {"data": {"points_balance": points}}
-        err_text = str(info)
-        if "user forbidden" in err_text.lower():
-            AccountDB.update_status(account_id, "forbidden")
-        raise RuntimeError(f"API error: {info}")
+            return {"data": {"points_balance": points, "status": "active", "last_verified_at": time.time()}}
+        error = f"API error: {info}"
+        status = _record_session_failure(account_id, error)
+        status_code = 401 if status == "auth_expired" else (403 if status == "forbidden" else 502)
+        raise HTTPException(status_code=status_code, detail={"message": error, "status": status})
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        status = _record_session_failure(account_id, e)
+        status_code = 401 if status == "auth_expired" else (403 if status == "forbidden" else 502)
+        raise HTTPException(status_code=status_code, detail={"message": str(e), "status": status})
 
 
 # ==================== 视频生成 ====================
@@ -677,22 +1040,15 @@ def upload_image(body: ImageUpload):
         raise HTTPException(status_code=400, detail="请提供要上传的图片")
 
     try:
-        creds = WizstarCredentials(
-            email=account["email"],
-            password=account["password"],
-            uid=account["uid"],
-            osduss=account["osduss"],
-            refresh_token=account["refresh_token"],
-            pass_os_refresh_tk=account["pass_os_refresh_tk"],
-        )
+        creds = _account_credentials(account)
         client = WizstarClient(credentials=creds)
         url = client.upload_image(upload_path)
         return {"data": {"url": url}}
     except Exception as e:
         err_msg = str(e)
-        if "user forbidden" in err_msg.lower():
-            AccountDB.update_status(body.account_id, "forbidden")
-        raise HTTPException(status_code=500, detail=err_msg)
+        status = _record_session_failure(body.account_id, e, include_generic=False)
+        status_code = 401 if status == "auth_expired" else (403 if status == "forbidden" else 500)
+        raise HTTPException(status_code=status_code, detail=err_msg)
     finally:
         if temp_path:
             try:
@@ -740,58 +1096,61 @@ def face_censor_image(body: FaceCensorRequest):
 @app.post("/tasks/create")
 def create_task(body: TaskCreate):
     """创建视频生成任务"""
-    account = AccountDB.get(body.account_id)
-    if not account:
-        raise HTTPException(status_code=404, detail="account not found")
-    active_count = TaskDB.active_count_for_account(body.account_id)
-    max_concurrency = max(1, int(account.get("max_concurrency") or 1))
-    if active_count >= max_concurrency:
-        raise HTTPException(status_code=429, detail=f"该账号已达到并发上限：{active_count}/{max_concurrency}")
+    with _wizstar_task_create_lock:
+        account = AccountDB.get(body.account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="account not found")
+        account_status = str(account.get("status") or "active")
+        if account_status in {"forbidden", "auth_expired", "daily_limit"}:
+            raise HTTPException(status_code=403, detail=f"该渠道一账号不可用：{account_status}")
+        video_duration = int(body.video_duration or 0)
+        if video_duration >= 15 and TaskDB.used_15s_count_for_account(body.account_id) >= 1:
+            raise HTTPException(status_code=429, detail="该渠道一账号已生成过 15s 视频，请切换新账号")
+        active_count = TaskDB.active_count_for_account(body.account_id)
+        max_concurrency = max(1, int(account.get("max_concurrency") or 1))
+        if active_count >= max_concurrency:
+            raise HTTPException(status_code=429, detail=f"该账号已达到并发上限：{active_count}/{max_concurrency}")
 
-    try:
-        creds = WizstarCredentials(
-            email=account["email"],
-            password=account["password"],
-            uid=account["uid"],
-            osduss=account["osduss"],
-            refresh_token=account["refresh_token"],
-            pass_os_refresh_tk=account["pass_os_refresh_tk"],
-        )
-        client = WizstarClient(credentials=creds)
+        try:
+            creds = _account_credentials(account)
+            client = WizstarClient(credentials=creds)
 
-        params = {}
-        if body.pic_url:
-            params["pic_url"] = body.pic_url
-        if body.video_url:
-            params["video_url"] = body.video_url
+            params = {}
+            if body.pic_url:
+                params["pic_url"] = body.pic_url
+            if body.video_url:
+                params["video_url"] = body.video_url
 
-        task = client.create_task(
-            task_type=body.task_type,
-            prompt=body.prompt,
-            model=body.model,
-            video_ratio=body.video_ratio,
-            video_resolution=body.video_resolution,
-            video_duration=body.video_duration,
-            video_num=body.video_num,
-            params=params if params else None,
-        )
+            task = client.create_task(
+                task_type=body.task_type,
+                prompt=body.prompt,
+                model=body.model,
+                video_ratio=body.video_ratio,
+                video_resolution=body.video_resolution,
+                video_duration=body.video_duration,
+                video_num=body.video_num,
+                params=params if params else None,
+            )
 
-        task_id = task.get("task_id", "")
-        TaskDB.add(
-            task_id=task_id,
-            account_id=body.account_id,
-            task_type=body.task_type,
-            prompt=body.prompt,
-            model=body.model,
-        )
-        return {"data": task}
-    except Exception as e:
-        err_msg = str(e)
-        if "user forbidden" in err_msg.lower():
-            AccountDB.update_status(body.account_id, "forbidden")
-        if any(marker in err_msg for marker in ("达到上限", "已达上限", "生成次数", "明天再来")):
-            AccountDB.mark_daily_limit(body.account_id)
-        raise HTTPException(status_code=500, detail=err_msg)
+            task_id = task.get("task_id", "")
+            if not task_id:
+                raise RuntimeError("渠道一未返回 task_id")
+            TaskDB.add(
+                task_id=task_id,
+                account_id=body.account_id,
+                task_type=body.task_type,
+                prompt=body.prompt,
+                model=body.model,
+                video_duration=video_duration,
+            )
+            return {"data": task}
+        except Exception as e:
+            err_msg = str(e)
+            status = _record_session_failure(body.account_id, e, include_generic=False)
+            if any(marker in err_msg for marker in ("达到上限", "已达上限", "生成次数", "明天再来")):
+                AccountDB.mark_daily_limit(body.account_id)
+            status_code = 401 if status == "auth_expired" else (403 if status == "forbidden" else 500)
+            raise HTTPException(status_code=status_code, detail=err_msg)
 
 
 @app.get("/tasks/{task_id}/status")
@@ -810,14 +1169,7 @@ def get_task_status(task_id: str):
         raise HTTPException(status_code=404, detail="account not found")
 
     try:
-        creds = WizstarCredentials(
-            email=account["email"],
-            password=account["password"],
-            uid=account["uid"],
-            osduss=account["osduss"],
-            refresh_token=account["refresh_token"],
-            pass_os_refresh_tk=account["pass_os_refresh_tk"],
-        )
+        creds = _account_credentials(account)
         client = WizstarClient(credentials=creds)
         detail = client.get_task_detail(task_id)
         tasks = detail.get("data", {}).get("list", [])
@@ -843,7 +1195,9 @@ def get_task_status(task_id: str):
             "fail_reason": vr.get("fail_reason", ""),
         }}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        status = _record_session_failure(db_task["account_id"], e, include_generic=False)
+        status_code = 401 if status == "auth_expired" else (403 if status == "forbidden" else 500)
+        raise HTTPException(status_code=status_code, detail=str(e))
 
 
 def _refresh_chatgpt2api_task(task: dict) -> dict:
@@ -1112,7 +1466,10 @@ def quickframe_stats():
 
 @app.delete("/quickframe/accounts/{account_id}")
 def quickframe_delete_account(account_id: int):
+    account = QfAccountDB.get(account_id)
     QfAccountDB.delete(account_id)
+    if account:
+        _release_mailbox_channel_by_email(account.get("email", ""), "quickframe")
     return {"message": "deleted"}
 
 
@@ -1133,14 +1490,32 @@ def quickframe_refresh_account(account_id: int):
 
 @app.post("/quickframe/register")
 def quickframe_register(body: QuickFrameRegister):
-    """自动生成临时邮箱并批量注册 QuickFrame 账号，成功的写入 qf_accounts。"""
+    """从全局邮箱库领取 OAuth 邮箱并批量注册 QuickFrame 账号。"""
+    claimed_mailboxes: list[dict] = []
     try:
+        count = max(1, min(int(body.count or 1), 50))
+        claimed_mailboxes = MailboxDB.claim_for_channel(
+            "quickframe",
+            count=count,
+            mailbox_ids=body.mailbox_ids,
+            credential_type="oauth",
+            provider="microsoft",
+            lease_seconds=21600,
+        )
         results = qf.register_batch(
-            count=body.count,
+            count=count,
             concurrency=body.concurrency,
             domain=body.domain or None,
+            mailboxes=claimed_mailboxes,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except qf.QuickFrameError as e:
+        for mailbox in claimed_mailboxes:
+            MailboxDB.mark_channel_usage(
+                mailbox["id"], "quickframe", "failed",
+                account_email=mailbox.get("email", ""), error=str(e),
+            )
         raise HTTPException(status_code=400, detail=str(e))
 
     saved = []
@@ -1153,8 +1528,16 @@ def quickframe_register(body: QuickFrameRegister):
                 status="active",
             )
             saved.append(account)
+            _mark_mailbox_channel_by_email(r.get("email", ""), "quickframe")
         except Exception:  # noqa: BLE001 — 单条入库失败不影响整体
             pass
+    for failed in results.get("failed", []):
+        _mark_mailbox_channel_by_email(
+            failed.get("email", ""),
+            "quickframe",
+            "failed",
+            error=failed.get("err", "") or failed.get("error", ""),
+        )
 
     return {"data": {
         "success": saved,
@@ -1607,6 +1990,339 @@ def _dola_touch_account(account_id: int) -> None:
         pass
 
 
+# ==================== OreateAI 渠道八账号池 ====================
+
+def _oreateai_public_account(account: dict) -> dict:
+    cookies = account.get("cookies") if isinstance(account.get("cookies"), list) else []
+    public = {key: value for key, value in account.items() if key not in {"password", "cookies"}}
+    public["cookie_count"] = len(cookies)
+    public["configured"] = bool(cookies)
+    return public
+
+
+_OREATEAI_BASE_URL = "https://www.oreateai.com"
+_OREATEAI_REFERER = f"{_OREATEAI_BASE_URL}/home/vertical/aiVideo/zh"
+
+
+def _oreateai_http_session(account: dict) -> requests.Session:
+    cookies = account.get("cookies") if isinstance(account.get("cookies"), list) else []
+    if not cookies:
+        raise ValueError("渠道八账号缺少 Cookie")
+    session = requests.Session()
+    for cookie in cookies:
+        name = str(cookie.get("name") or "").strip()
+        value = cookie.get("value")
+        if not name or not isinstance(value, str):
+            continue
+        domain = str(cookie.get("domain") or "www.oreateai.com").strip().lstrip(".")
+        path = str(cookie.get("path") or "/").strip() or "/"
+        session.cookies.set(name, value, domain=domain, path=path)
+    return session
+
+
+def _oreateai_get_json(session: requests.Session, account: dict, path: str) -> dict:
+    response = session.get(
+        f"{_OREATEAI_BASE_URL}{path}",
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Client-Type": "pc",
+            "Locale": "zh-CN",
+            "Referer": _OREATEAI_REFERER,
+            "User-Agent": account.get("user_agent") or "Mozilla/5.0",
+        },
+        timeout=25,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    status = payload.get("status") if isinstance(payload, dict) else None
+    site_code = status.get("code") if isinstance(status, dict) else None
+    if site_code not in (None, 0):
+        message = status.get("errMsg") or status.get("msg") or "OreateAI 请求失败"
+        raise ValueError(f"{message}（code={site_code}）")
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+def _oreateai_credit_snapshot(account: dict, session: requests.Session | None = None) -> dict:
+    own_session = session is None
+    session = session or _oreateai_http_session(account)
+    try:
+        rest = _oreateai_get_json(session, account, "/bizapi/point/getrestpoints")
+        detail = _oreateai_get_json(session, account, "/oreate/account/getpointdetail")
+    finally:
+        if own_session:
+            session.close()
+    if "restPoint" not in rest:
+        raise ValueError("未读取到渠道八积分，账号登录态可能已失效")
+    return {
+        "rest_points": rest.get("restPoint", 0),
+        "detail": {
+            key: {
+                "amount": value.get("amount", 0),
+                "end_time": value.get("endTime"),
+            } if isinstance(value, dict) else None
+            for key, value in {
+                "daily": detail.get("daily"),
+                "pro": detail.get("pro"),
+                "bonus": detail.get("bonus"),
+            }.items()
+        },
+    }
+
+
+def _oreateai_pending_grant(session: requests.Session, account: dict) -> dict | None:
+    user_info = _oreateai_get_json(session, account, "/oreate/user/getuserinfo")
+    basic_info = user_info.get("basicInfo")
+    if not isinstance(basic_info, dict) or basic_info.get("isLogin") is not True:
+        raise ValueError("渠道八账号登录态已失效")
+    grant = user_info.get("pointGrantInfo")
+    if not isinstance(grant, dict) or not grant.get("pointGrant"):
+        return None
+    return {
+        "type": grant.get("pointGrantType"),
+        "points": grant.get("pointGrant"),
+        "message": str(grant.get("pointGrantMsg") or ""),
+    }
+
+
+@app.get("/oreateai/accounts")
+def oreateai_list_accounts():
+    return {"data": [_oreateai_public_account(account) for account in OreateAIAccountDB.list_all()]}
+
+
+@app.get("/oreateai/accounts/{account_id}/credits")
+def oreateai_get_credits(account_id: int):
+    account = OreateAIAccountDB.get(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="OreateAI account not found")
+    try:
+        return {"data": _oreateai_credit_snapshot(account)}
+    except (requests.RequestException, ValueError) as error:
+        raise HTTPException(status_code=502, detail=f"查询渠道八积分失败：{error}") from error
+
+
+@app.post("/oreateai/accounts/{account_id}/credits/claim")
+def oreateai_claim_credits(account_id: int):
+    account = OreateAIAccountDB.get(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="OreateAI account not found")
+    session = None
+    try:
+        session = _oreateai_http_session(account)
+        before = _oreateai_credit_snapshot(account, session)
+        pending_grant = _oreateai_pending_grant(session, account)
+        _oreateai_get_json(session, account, "/oreate/account/getfirstusepoint")
+        # OreateAI 异步入账；短暂等待只处理快速到账，较慢的情况由前端继续轮询。
+        time.sleep(1)
+        after = _oreateai_credit_snapshot(account, session)
+        amount = max(
+            0,
+            int(after.get("rest_points") or 0) - int(before.get("rest_points") or 0),
+        )
+        claim_requested = pending_grant is not None
+        return {
+            "data": {
+                **after,
+                "claimed": amount > 0,
+                "claimed_points": amount,
+                "before_points": before.get("rest_points", 0),
+                "claim_requested": claim_requested,
+                "pending": claim_requested and amount == 0,
+                "already_claimed": not claim_requested and amount == 0,
+                "pending_grant": pending_grant,
+            }
+        }
+    except (requests.RequestException, ValueError, TypeError) as error:
+        raise HTTPException(status_code=502, detail=f"领取渠道八积分失败：{error}") from error
+    finally:
+        if session is not None:
+            session.close()
+
+
+@app.get("/internal/oreateai/accounts/{account_id}/session")
+def oreateai_get_account_session(account_id: int, request: Request):
+    _require_internal_session_access(request)
+    account = OreateAIAccountDB.get(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="OreateAI account not found")
+    return {"data": account}
+
+
+@app.post("/oreateai/accounts")
+def oreateai_import_account(body: OreateAIAccountImport):
+    try:
+        account = OreateAIAccountDB.upsert(
+            email=body.email,
+            password=body.password,
+            cookies=body.cookies,
+            user_agent=body.user_agent,
+            location=body.location,
+            status=body.status,
+            note=body.note,
+        )
+        _mark_mailbox_channel_by_email(body.email, "oreateai")
+        return {"data": _oreateai_public_account(account)}
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+
+@app.delete("/oreateai/accounts/{account_id}")
+def oreateai_delete_account(account_id: int):
+    account = OreateAIAccountDB.get(account_id)
+    OreateAIAccountDB.delete(account_id)
+    if account:
+        _release_mailbox_channel_by_email(account.get("email", ""), "oreateai")
+    return {"message": "deleted"}
+
+
+# ==================== Lovart 渠道七账号池与任务 ====================
+
+def _lovart_public_account(account: dict) -> dict:
+    cookies = account.get("cookies") if isinstance(account.get("cookies"), list) else []
+    local_storage = account.get("local_storage") if isinstance(account.get("local_storage"), dict) else {}
+    session_storage = account.get("session_storage") if isinstance(account.get("session_storage"), dict) else {}
+    indexed_db = account.get("indexed_db") if isinstance(account.get("indexed_db"), list) else []
+    public = {k: v for k, v in account.items() if k not in {"cookies", "local_storage", "session_storage", "indexed_db"}}
+    public["cookie_count"] = len(cookies)
+    public["local_storage_count"] = len(local_storage)
+    public["session_storage_count"] = len(session_storage)
+    public["indexed_db_count"] = len(indexed_db)
+    public["configured"] = bool(lv.has_auth_token(account))
+    public["has_auth_token"] = public["configured"]
+    return public
+
+
+@app.get("/lovart/accounts")
+def lovart_list_accounts():
+    """Lovart 渠道七账号库。"""
+    return {"data": [_lovart_public_account(account) for account in LovartAccountDB.list_all()]}
+
+
+@app.post("/lovart/accounts")
+def lovart_import_account(body: LovartAccountImport):
+    """保存 Lovart Google OAuth 登录态。"""
+    try:
+        account = LovartAccountDB.upsert(
+            email=body.email,
+            cookie=body.cookie,
+            cookies=body.cookies,
+            user_agent=body.user_agent,
+            location=body.location,
+            local_storage=body.local_storage,
+            session_storage=body.session_storage,
+            indexed_db=body.indexed_db,
+            status=body.status,
+            note=body.note,
+        )
+        _mark_mailbox_channel_by_email(body.email, "lovart")
+        return {"data": _lovart_public_account(account)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/lovart/accounts")
+def lovart_delete_all_accounts():
+    accounts = LovartAccountDB.list_all()
+    deleted = LovartAccountDB.delete_all()
+    for account in accounts:
+        _release_mailbox_channel_by_email(account.get("email", ""), "lovart")
+    return {"data": {"deleted": deleted}}
+
+
+@app.delete("/lovart/accounts/{account_id}")
+def lovart_delete_account(account_id: int):
+    account = LovartAccountDB.get(account_id)
+    LovartAccountDB.delete(account_id)
+    if account:
+        _release_mailbox_channel_by_email(account.get("email", ""), "lovart")
+    return {"message": "deleted"}
+
+
+@app.get("/lovart/models")
+def lovart_models(account_id: int = 0):
+    """返回 Lovart 可选模型。"""
+    try:
+        account = lv.pick_account(account_id) if account_id else None
+        return {"data": lv.models(account)}
+    except lv.LovartError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/lovart/tasks/create")
+def lovart_create_task(body: LovartImageCreate):
+    """通过 Lovart 提交图片生成任务。"""
+    try:
+        account = lv.pick_account(body.account_id)
+        reference_images = [item for item in [*body.reference_images, *body.images, body.data_url] if str(item or "").strip()]
+        result = lv.create_image(
+            account,
+            prompt=body.prompt,
+            project_id=body.project_id or body.projectId,
+            cid=body.cid,
+            model=body.model,
+            aspect_ratio=body.aspectRatio or body.aspect_ratio,
+            size=body.size,
+            quality=body.quality,
+            image_path=body.image_path,
+            image_url=body.image_url or body.image,
+            reference_images=reference_images,
+            with_pricing=body.with_pricing,
+        )
+        task_id = result.get("task_id", "")
+        image_url = result.get("image_url", "") or ""
+        if task_id:
+            TaskDB.add(
+                task_id=task_id,
+                account_id=int(account.get("id") or 0),
+                task_type=TaskType.TEXT_TO_VIDEO,
+                prompt=body.prompt,
+                model=f"lovart:{result.get('model') or body.model}",
+                status=result.get("status") or "processing",
+                video_url=image_url,
+            )
+        result["account_id"] = int(account.get("id") or 0)
+        result["account_name"] = account.get("email", "") or f"Lovart账号 #{account.get('id') or 0}"
+        return {"data": result}
+    except lv.LovartError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/lovart/tasks/{task_id}/status")
+def lovart_task_status(task_id: str):
+    """查询 Lovart 图片生成状态。"""
+    try:
+        task = TaskDB.get(task_id) or {}
+        account_id = int(task.get("account_id") or 0)
+        account = lv.pick_account(account_id) if account_id else lv.pick_account(0)
+        result = lv.get_task_status(account, task_id)
+        status = result.get("status", "pending")
+        image_url = result.get("image_url", "") or ""
+        if status == "completed" and image_url:
+            TaskDB.update_status(task_id, "completed", image_url)
+        elif status == "failed":
+            TaskDB.update_status(task_id, "failed")
+        elif task:
+            TaskDB.update_status(task_id, status if status in {"pending", "processing"} else "processing")
+        result["account_id"] = int(account.get("id") or 0)
+        result["account_name"] = account.get("email", "") or f"Lovart账号 #{account.get('id') or 0}"
+        return {"data": result}
+    except lv.LovartError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/dola/config")
 def dola_get_config():
     """返回 Dola 通道配置、登录态和模型选项。"""
@@ -1622,7 +2338,13 @@ def dola_get_config():
 def dola_update_config(body: DolaConfigUpdate):
     """保存 Dola 通道配置。"""
     try:
-        dl.save_config(proxy=body.proxy, env_file=body.env_file, profile_dir=body.profile_dir, send_mode=body.send_mode)
+        dl.save_config(
+            proxy=body.proxy,
+            env_file=body.env_file,
+            profile_dir=body.profile_dir,
+            send_mode=body.send_mode,
+            browser_headless=body.browser_headless,
+        )
         return {"data": dl.account_status()}
     except dl.DolaError as e:
         raise HTTPException(status_code=e.status_code or 500, detail=str(e))
@@ -1657,13 +2379,15 @@ def dola_list_accounts():
 
 @app.post("/dola/accounts")
 def dola_import_account(body: DolaAccountImport):
-    """把已有 Dola 登录态加入账号库。"""
+    """把已有 Dola API 凭证加入账号库。"""
     try:
         if body.cookie.strip():
-            status = dl.write_env_from_cookie(body.cookie, env_file=body.env_file, profile_dir=body.profile_dir)
+            token = (body.ms_token or body.msToken or "").strip()
+            status = dl.write_env_from_cookie(body.cookie, env_file=body.env_file, profile_dir=body.profile_dir, ms_token=token)
         else:
             status = _dola_status_for_paths(body.env_file, body.profile_dir)
         account = _dola_save_account_from_status(body.name, body.note, status)
+        _mark_mailbox_channel_by_email(body.name, "dola")
         return {"data": account}
     except dl.DolaError as e:
         raise HTTPException(status_code=e.status_code or 500, detail=str(e))
@@ -1673,13 +2397,19 @@ def dola_import_account(body: DolaAccountImport):
 
 @app.delete("/dola/accounts")
 def dola_delete_all_accounts():
+    accounts = DolaAccountDB.list_all()
     deleted = DolaAccountDB.delete_all()
+    for account in accounts:
+        _release_mailbox_channel_by_email(account.get("name", ""), "dola")
     return {"data": {"deleted": deleted}}
 
 
 @app.delete("/dola/accounts/{account_id}")
 def dola_delete_account(account_id: int):
+    account = DolaAccountDB.get(account_id)
     DolaAccountDB.delete(account_id)
+    if account:
+        _release_mailbox_channel_by_email(account.get("name", ""), "dola")
     return {"message": "deleted"}
 
 
@@ -1804,7 +2534,7 @@ def dola_grab_account(body: DolaAccountGrab):
 
 @app.post("/dola/tasks/create")
 def dola_create_task(body: DolaTaskCreate):
-    """通过浏览器会话提交 Dola 视频生成任务。"""
+    """通过 Dola API 提交视频生成任务。"""
     try:
         normalized_duration = _dola_normalized_video_duration(body.duration)
         quota_cost = _dola_video_quota_cost(normalized_duration)
@@ -1816,7 +2546,7 @@ def dola_create_task(body: DolaTaskCreate):
                 account_id=int(account.get("id") or 0) if account else 0,
                 task_type=TaskType.IMAGE_TO_VIDEO if (body.image_path or body.image_url or body.reference_images) else TaskType.TEXT_TO_VIDEO,
                 prompt=body.prompt,
-                model=f"dola-browser:{body.model}:{normalized_duration}s",
+                model=f"dola-api:{body.model}:{normalized_duration}s",
                 status="pending",
                 video_url="",
             )
@@ -1834,16 +2564,18 @@ def dola_create_task(body: DolaTaskCreate):
                     quota_cost=quota_cost,
                     retry_account_picker=None,
                     max_empty_sse_retries=0,
+                    headless=body.headless,
                 )
             except Exception:
                 TaskDB.update_status(task_id, "failed")
                 raise
         result["account_id"] = int(account.get("id") or 0) if account else 0
-        result["account_name"] = account.get("name", "") if account else "浏览器会话"
+        result["account_name"] = account.get("name", "") if account else "API 凭证"
         result["quota_cost"] = quota_cost
         result["send_mode"] = dl.get_send_mode()
         result["send_mode_label"] = next((item["label"] for item in dl.SEND_MODE_OPTIONS if item["id"] == result["send_mode"]), result["send_mode"])
         result["browser_session"] = result["send_mode"] == dl.SEND_MODE_BROWSER
+        result["browser_headless"] = bool(result.get("browser_headless")) if result["browser_session"] else False
         return {"data": result}
     except dl.DolaError as e:
         raise HTTPException(status_code=e.status_code or 500, detail=str(e))
@@ -1892,6 +2624,7 @@ def dola_task_status(task_id: str):
             "queue_position": None,
             "send_mode": detail.get("send_mode", "") or dl.get_send_mode(),
             "send_mode_label": detail.get("send_mode_label", "") or next((item["label"] for item in dl.SEND_MODE_OPTIONS if item["id"] == dl.get_send_mode()), dl.get_send_mode()),
+            "browser_headless": bool(detail.get("browser_headless")),
             "fail_reason": fail_reason,
             "collectable": bool(detail.get("conversation_id")) and status not in ("completed", "failed", "collecting"),
             "account_id": account_id,
@@ -1945,11 +2678,12 @@ def oiioii_get_config():
 @app.post("/oiioii/config")
 def oiioii_update_config(body: OiiOiiConfigUpdate):
     """保存 OiiOii 通道配置，可选测试连接"""
-    if body.use_proxy is not None or body.proxy_host is not None or body.proxy_port is not None:
+    if body.use_proxy is not None or body.proxy_host is not None or body.proxy_port is not None or body.mail_provider is not None:
         oi.save_config(
             use_proxy=body.use_proxy,
             proxy_host=body.proxy_host,
             proxy_port=body.proxy_port,
+            mail_provider=body.mail_provider,
         )
 
     result = oi.config_status()
@@ -1964,17 +2698,60 @@ def oiioii_update_config(body: OiiOiiConfigUpdate):
 @app.post("/oiioii/register")
 def oiioii_register(body: OiiOiiBatchRegister | None = None):
     """全自动注册 OiiOii 账号（支持 count/concurrency 批量并发）"""
+    claimed_mailboxes: list[dict] = []
     try:
-        count = int(body.count if body else 1) if body else 1
+        count = max(1, min(int(body.count if body else 1) if body else 1, 50))
         concurrency = int(body.concurrency if body else 1) if body else 1
+        mail_provider = body.mail_provider if body else None
+        resolved_mail_provider = oi._normalize_mail_provider(mail_provider)
+        if resolved_mail_provider == "applemail":
+            claimed_mailboxes = MailboxDB.claim_for_channel(
+                "oiioii",
+                count=count,
+                mailbox_ids=body.mailbox_ids if body else [],
+                credential_type="oauth",
+                provider="microsoft",
+                lease_seconds=21600,
+            )
         if count <= 1:
-            result = oi.register_account()
+            result = oi.register_account(
+                mail_provider=resolved_mail_provider,
+                mailbox=claimed_mailboxes[0] if claimed_mailboxes else None,
+            )
+            if result.get("email"):
+                _mark_mailbox_channel_by_email(result["email"], "oiioii")
             return {"data": result}
-        result = oi.register_batch(count=count, concurrency=concurrency)
+        result = oi.register_batch(
+            count=count,
+            concurrency=concurrency,
+            mail_provider=resolved_mail_provider,
+            mailboxes=claimed_mailboxes,
+        )
+        for item in result.get("success", []):
+            _mark_mailbox_channel_by_email(item.get("email", ""), "oiioii")
+        for item in result.get("failed", []):
+            _mark_mailbox_channel_by_email(
+                item.get("email", ""),
+                "oiioii",
+                "failed",
+                error=item.get("error", ""),
+            )
         return {"data": result}
     except oi.OiiOiiError as e:
+        for mailbox in claimed_mailboxes:
+            MailboxDB.mark_channel_usage(
+                mailbox["id"], "oiioii", "failed",
+                account_email=mailbox.get("email", ""), error=str(e),
+            )
         raise HTTPException(status_code=500, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
+        for mailbox in claimed_mailboxes:
+            MailboxDB.mark_channel_usage(
+                mailbox["id"], "oiioii", "failed",
+                account_email=mailbox.get("email", ""), error=str(e),
+            )
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2006,6 +2783,7 @@ def oiioii_delete_account(email: str):
     result = oi.delete_account(email)
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error", "删除失败"))
+    _release_mailbox_channel_by_email(email, "oiioii")
     return {"message": "deleted"}
 
 
@@ -2014,6 +2792,8 @@ def oiioii_cleanup_zero_accounts():
     """删除所有积分为 0 的渠道四账号"""
     try:
         result = oi.cleanup_zero_point_accounts()
+        for account in result.get("deleted", []):
+            _release_mailbox_channel_by_email(account.get("email", ""), "oiioii")
         return {"data": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2070,6 +2850,7 @@ def oiioii_create_task(body: OiiOiiTaskCreate):
             duration=body.duration,
             aspect_ratio=body.aspect_ratio,
             resolution=body.resolution,
+            generate_mode=body.generateMode or body.generate_mode,
         )
         task_id = result.get("task_id", "")
         if task_id:
@@ -2142,10 +2923,16 @@ def oiioii_task_status(task_id: str):
         "submitted_model": detail.get("submitted_model", ""),
         "submitted_mcp_method_name": detail.get("submitted_mcp_method_name", ""),
         "submitted_model_param": detail.get("submitted_model_param", ""),
+        "submitted_generate_mode": detail.get("submitted_generate_mode", ""),
         "media_type": detail.get("media_type", "video"),
         "file_size": detail.get("file_size"),
         "progress": detail.get("progress"),
-        "queue_position": None,
+        "queue_position": detail.get("queue_position"),
+        "elapsed_seconds": detail.get("elapsed_seconds"),
+        "remaining_seconds": detail.get("remaining_seconds"),
+        "timeout_seconds": detail.get("timeout_seconds"),
+        "estimated_wait_seconds": detail.get("estimated_wait_seconds"),
+        "started_at": detail.get("started_at"),
         "fail_reason": detail.get("error", ""),
     }}
 
@@ -2203,6 +2990,11 @@ _ALLOWED_VIDEO_HOSTS = (
     "ibytedtos.com",
     "volcvideo.com",
     "dola.com",
+    "framia.pro",
+    "converge.ai",
+    "tensor.art",
+    "tensorartassets.com",
+    "cloudflarestorage.com",
 )
 
 
@@ -2214,7 +3006,7 @@ def _is_allowed_video_url(url: str) -> bool:
     if parsed.scheme not in ("http", "https"):
         return False
     host = (parsed.hostname or "").lower()
-    return any(host == h or host.endswith("." + h) or host.endswith(h) for h in _ALLOWED_VIDEO_HOSTS)
+    return any(host == h or host.endswith("." + h) for h in _ALLOWED_VIDEO_HOSTS)
 
 
 def _proxy_remote_video(url: str, range_header: str | None, as_download: bool, filename: str):
@@ -2378,7 +3170,790 @@ def download_video(url: str, filename: str = "video.mp4"):
     return _proxy_remote_video(url, None, as_download=True, filename=filename)
 
 
+# ==================== Framia 渠道九账号池与任务 ====================
+
+def _framia_public_account(account: dict) -> dict:
+    return FramiaAccountDB._public(account)
+
+
+@app.get("/framia/accounts")
+def framia_list_accounts():
+    """Framia 渠道九账号库。"""
+    return {"data": [_framia_public_account(account) for account in FramiaAccountDB.list_all()]}
+
+
+@app.get("/internal/framia/accounts/{account_id}/session")
+def framia_get_account_session(account_id: int, request: Request):
+    _require_internal_session_access(request)
+    account = FramiaAccountDB.get(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Framia account not found")
+    return {"data": account}
+
+
+@app.post("/framia/accounts")
+def framia_import_account(body: FramiaAccountImport):
+    """手动导入 Framia 登录态（accessToken + cookie）。"""
+    try:
+        account = FramiaAccountDB.upsert(
+            email=body.email,
+            password=body.password,
+            access_token=body.access_token,
+            expires_at=body.expires_at,
+            cookie=body.cookie,
+            user_agent=body.user_agent,
+            user_id=body.user_id,
+            location=body.location,
+            status=body.status,
+            note=body.note,
+        )
+        _mark_mailbox_channel_by_email(body.email, "framia")
+        return {"data": _framia_public_account(account)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/framia/accounts/login")
+def framia_login_account(body: FramiaAccountLogin):
+    """通过 Google OAuth 自动登录 Framia 并采集账号。"""
+    try:
+        account = _framia_login_and_save(
+            body.email,
+            body.password,
+            visible=body.visible,
+            proxy=body.proxy,
+            keep_open=body.keep_open,
+        )
+        return {"data": _framia_public_account(account)}
+    except fm.FramiaError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _framia_login_and_save(
+    email: str,
+    password: str,
+    *,
+    visible: bool = True,
+    proxy: str = "",
+    keep_open: bool = False,
+) -> dict:
+    login_result = fm.login_with_google(
+        email=email,
+        password=password,
+        visible=visible,
+        proxy=proxy,
+        keep_open=keep_open,
+    )
+    access_token = login_result.get("access_token", "")
+    if not access_token:
+        raise RuntimeError("登录成功但未获取到 accessToken")
+    account = FramiaAccountDB.upsert(
+        email=email,
+        password=password,
+        access_token=access_token,
+        expires_at=int(login_result.get("expires_at") or 0),
+        cookie=login_result.get("cookie", ""),
+        user_agent=login_result.get("user_agent", ""),
+        user_id=login_result.get("user_id", ""),
+        location=login_result.get("location", ""),
+        status="active",
+        note="Google OAuth 自动登录",
+    )
+    _mark_mailbox_channel_by_email(email, "framia")
+    return account
+
+
+@app.post("/framia/accounts/login-pool")
+def framia_login_from_mailbox_pool(body: FramiaMailboxBatchLogin):
+    """从全局邮箱库原子领取账号并批量完成渠道九登录。"""
+    import concurrent.futures
+
+    try:
+        mailboxes = MailboxDB.claim_for_channel(
+            "framia",
+            count=body.count,
+            mailbox_ids=body.mailbox_ids,
+            credential_type="password",
+            provider="google",
+            lease_seconds=21600,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+    def worker(mailbox: dict) -> dict:
+        email = str(mailbox.get("email") or "")
+        password = str(mailbox.get("password") or mailbox.get("google_password") or "")
+        try:
+            account = _framia_login_and_save(
+                email,
+                password,
+                visible=body.visible,
+                proxy=body.proxy,
+                keep_open=body.keep_open,
+            )
+            return {"ok": True, "email": email, "account": _framia_public_account(account)}
+        except Exception as error:  # noqa: BLE001
+            MailboxDB.mark_channel_usage(
+                mailbox["id"],
+                "framia",
+                "failed",
+                account_email=email,
+                error=str(error),
+            )
+            return {"ok": False, "email": email, "error": str(error)}
+
+    concurrency = max(1, min(int(body.concurrency or 1), 5, len(mailboxes)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        results = list(executor.map(worker, mailboxes))
+    succeeded = sum(1 for result in results if result.get("ok"))
+    return {
+        "data": {
+            "results": results,
+            "succeeded": succeeded,
+            "failed": len(results) - succeeded,
+            "total": len(results),
+        }
+    }
+
+
+@app.delete("/framia/accounts")
+def framia_delete_all_accounts():
+    accounts = FramiaAccountDB.list_all()
+    deleted = FramiaAccountDB.delete_all()
+    for account in accounts:
+        _release_mailbox_channel_by_email(account.get("email", ""), "framia")
+    return {"data": {"deleted": deleted}}
+
+
+@app.delete("/framia/accounts/{account_id}")
+def framia_delete_account(account_id: int):
+    account = FramiaAccountDB.get(account_id)
+    FramiaAccountDB.delete(account_id)
+    if account:
+        _release_mailbox_channel_by_email(account.get("email", ""), "framia")
+    return {"message": "deleted"}
+
+
+@app.get("/framia/accounts/{account_id}/test")
+def framia_test_account(account_id: int):
+    """测试 Framia 账号 accessToken 是否有效。"""
+    try:
+        account = FramiaAccountDB.get(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="Framia account not found")
+        client = fm.FramiaClient(
+            access_token=account.get("access_token", ""),
+            cookie=account.get("cookie", ""),
+            user_agent=account.get("user_agent", ""),
+        )
+        result = client.test_connection()
+        return {"data": result}
+    except fm.FramiaError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/framia/models")
+def framia_models():
+    """返回渠道九可选模型和比例。"""
+    return {"data": {"models": fm.DEFAULT_MODELS, "ratios": fm.DEFAULT_RATIOS}}
+
+
+@app.post("/framia/tasks/create")
+def framia_create_task(body: FramiaTaskCreate):
+    """通过 Framia 提交视频生成任务。
+
+    完整流程：
+      1. 选择账号、创建项目
+      2. 上传垫图（如有）→ 获取 resource_id 列表
+      3. 发布工作流版本（canvas_snapshot 含 Video 节点）
+      4. 执行工作流 → 返回 workflow_run_id
+      5. 记录 task_id = workflow_run_id 到 TaskDB
+    """
+    try:
+        account = fm.pick_account(body.account_id)
+        client = fm.FramiaClient(
+            access_token=account.get("access_token", ""),
+            cookie=account.get("cookie", ""),
+            user_agent=account.get("user_agent", ""),
+        )
+
+        # 1. 创建项目
+        project = client.create_project()
+        project_id = project.get("project_id", "")
+        canvas_id = project.get("canvas_id", "")
+        main_thread_id = project.get("main_thread_id", "")
+        if not project_id:
+            raise HTTPException(status_code=500, detail="Framia 创建项目失败：未返回 project_id")
+
+        # 2. 上传垫图（支持 image_path 和 image_paths）
+        resource_ids: list[str] = []
+        all_image_paths = list(body.image_paths or [])
+        if body.image_path:
+            all_image_paths.insert(0, body.image_path)
+
+        for img_path in all_image_paths:
+            if not img_path or not os.path.isfile(img_path):
+                continue
+            import mimetypes as _mt
+            filename = os.path.basename(img_path)
+            upload_info = client.get_upload_url(project_id, filename)
+            upload_url = upload_info.get("url", "")
+            oss_key = upload_info.get("key", "")
+            if not upload_url or not oss_key:
+                continue
+            mime = _mt.guess_type(img_path)[0] or "image/png"
+            client.upload_to_oss(upload_url, img_path, mime)
+            upload_result = client.upload_done(project_id, main_thread_id, filename, oss_key)
+            rid = upload_result.get("resource_id", "")
+            if rid:
+                resource_ids.append(rid)
+
+        # 3. 发布工作流版本
+        node_id = f"video-{uuid.uuid4().hex[:12]}"
+        wf_version = client.publish_workflow_version(
+            project_id=project_id,
+            canvas_id=canvas_id,
+            node_id=node_id,
+            prompt=body.prompt,
+            model=body.model,
+            aspect_ratio=body.aspect_ratio,
+            resolution=body.resolution,
+            duration=body.duration,
+            resource_ids=resource_ids,
+        )
+        workflow_id = wf_version.get("workflow_id", "")
+        workflow_version = wf_version.get("version", 0)
+
+        # 4. 执行工作流
+        run_result = client.run_workflow(
+            workflow_id=workflow_id,
+            workflow_version=workflow_version,
+            project_id=project_id,
+            canvas_id=canvas_id,
+            node_id=node_id,
+        )
+        workflow_run_id = run_result.get("workflow_run_id", "")
+        if not workflow_run_id:
+            raise HTTPException(status_code=500, detail="Framia 执行工作流失败：未返回 workflow_run_id")
+
+        task_id = workflow_run_id
+        TaskDB.add(
+            task_id=task_id,
+            account_id=int(account.get("id") or 0),
+            task_type=TaskType.IMAGE_TO_VIDEO if resource_ids else TaskType.TEXT_TO_VIDEO,
+            prompt=body.prompt,
+            model=f"framia:{body.model}",
+        )
+
+        return {"data": {
+            "task_id": task_id,
+            "workflow_run_id": workflow_run_id,
+            "status": run_result.get("status", "queued"),
+            "account_id": int(account.get("id") or 0),
+            "account_name": account.get("email", ""),
+            "resource_ids": resource_ids,
+        }}
+    except fm.FramiaError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/framia/tasks/{task_id}/status")
+def framia_task_status(task_id: str):
+    """查询 Framia 任务状态。
+
+    task_id 即 workflow_run_id。
+    通过 GET /video/api/workflows/runs/{run_id}/nodes 查询节点状态，
+    若节点已完成，再通过 GET /video/api/v1/resources/{resource_id}/info 获取视频 URL。
+    """
+    try:
+        task = TaskDB.get(task_id) or {}
+        account_id = int(task.get("account_id") or 0)
+        if account_id:
+            account = FramiaAccountDB.get(account_id)
+        else:
+            account = fm.pick_account(0)
+
+        if not account:
+            raise HTTPException(status_code=404, detail="Framia account not found for this task")
+
+        client = fm.FramiaClient(
+            access_token=account.get("access_token", ""),
+            cookie=account.get("cookie", ""),
+            user_agent=account.get("user_agent", ""),
+        )
+
+        workflow_run_id = task_id
+
+        # 查询工作流运行状态
+        run_status = client.get_workflow_run_status(workflow_run_id)
+        wf_status = run_status.get("status", "")
+
+        # 查询节点结果
+        node_result = client.get_workflow_run_nodes(workflow_run_id)
+        node_status = node_result.get("status", "")
+        resource_id = node_result.get("resource_id", "")
+
+        # 映射状态
+        status_map = {
+            "queued": "processing",
+            "running": "processing",
+            "pending": "processing",
+            "completed": "completed",
+            "failed": "failed",
+            "cancelled": "failed",
+        }
+        mapped_status = status_map.get(node_status or wf_status, "processing")
+
+        video_url = ""
+        thumbnail_url = ""
+        if mapped_status == "completed" and resource_id:
+            resource_info = client.get_resource_info(resource_id)
+            video_url = resource_info.get("download_url", "")
+            thumbnail_url = resource_info.get("thumbnail_url", "")
+            # 更新 TaskDB
+            TaskDB.update_status(task_id, "completed", video_url=video_url)
+        elif mapped_status == "failed":
+            TaskDB.update_status(task_id, "failed")
+
+        return {"data": {
+            "status": mapped_status,
+            "video_url": video_url,
+            "thumbnail_url": thumbnail_url,
+            "task_id": task_id,
+            "workflow_run_id": workflow_run_id,
+            "node_status": node_status,
+            "wf_status": wf_status,
+            "resource_id": resource_id,
+            "account_id": int(account.get("id") or 0),
+            "account_name": account.get("email", ""),
+        }}
+    except fm.FramiaError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/framia/credits")
+def framia_get_credits(account_id: int = 0):
+    """查询 Framia 账号积分余额。"""
+    try:
+        account = fm.pick_account(account_id) if account_id else fm.pick_account(0)
+        client = fm.FramiaClient(
+            access_token=account.get("access_token", ""),
+            cookie=account.get("cookie", ""),
+            user_agent=account.get("user_agent", ""),
+        )
+        credits = client.get_credits()
+        return {"data": {
+            "credits_balance": credits.get("credits_balance", 0),
+            "credit_cent_balance": credits.get("credit_cent_balance", 0),
+            "account_id": int(account.get("id") or 0),
+            "account_name": account.get("email", ""),
+        }}
+    except fm.FramiaError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== Tensor.Art 渠道十账号池与任务 ====================
+
+def _tensorart_public_account(account: dict) -> dict:
+    return TensorArtAccountDB._public(account)
+
+
+@app.get("/tensorart/config")
+def tensorart_config():
+    key = qf.get_yescap_key()
+    return {
+        "data": {
+            "yescap_configured": bool(key),
+            "account_count": len(TensorArtAccountDB.list_all()),
+            "models": ta.DEFAULT_MODELS,
+        }
+    }
+
+
+@app.get("/tensorart/accounts")
+def tensorart_list_accounts():
+    return {"data": TensorArtAccountDB.list_all()}
+
+
+@app.post("/tensorart/accounts")
+def tensorart_import_account(body: TensorArtAccountImport):
+    try:
+        token_payload = ta.decode_jwt_payload(body.access_token)
+        account = TensorArtAccountDB.upsert(
+            email=body.email,
+            access_token=body.access_token,
+            expires_at=body.expires_at or int(token_payload.get("exp") or 0) * 1000,
+            device_id=body.device_id or str(token_payload.get("deviceId") or ""),
+            user_agent=body.user_agent,
+            user_id=body.user_id or str(token_payload.get("userId") or ""),
+            status=body.status,
+            note=body.note or "手动导入",
+        )
+        _mark_mailbox_channel_by_email(body.email, "tensorart")
+        return {"data": _tensorart_public_account(account)}
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@app.post("/tensorart/accounts/register")
+@app.post("/tensorart/accounts/register-pool")
+def tensorart_register_from_mailbox_pool(body: TensorArtMailboxRegister):
+    yescap_key = qf.get_yescap_key()
+    if not yescap_key:
+        raise HTTPException(
+            status_code=400,
+            detail="未配置 YesCaptcha Key，请先在设置 → 渠道三中填写",
+        )
+    count = max(1, min(int(body.count or 1), 100))
+    mailbox_ids = list(
+        dict.fromkeys(
+            int(value)
+            for value in (body.mailbox_ids or [])
+            if int(value) > 0
+        )
+    )[:100]
+    effective_count = len(mailbox_ids) if mailbox_ids else count
+    max_wait = max(90, min(int(body.max_wait or 210), 600))
+    requested_concurrency = max(
+        1, min(int(body.concurrency or 1), 3, effective_count)
+    )
+    queue_rounds = (
+        effective_count + requested_concurrency - 1
+    ) // requested_concurrency
+    lease_seconds = min(
+        7 * 24 * 60 * 60,
+        max(1800, queue_rounds * (max_wait + 900) + 300),
+    )
+    try:
+        mailboxes = MailboxDB.claim_for_channel(
+            "tensorart",
+            count=count,
+            mailbox_ids=mailbox_ids,
+            credential_type="oauth",
+            provider="microsoft",
+            lease_seconds=lease_seconds,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+    def worker(mailbox: dict) -> dict:
+        email = str(mailbox.get("email") or "")
+        try:
+            login_result = ta.register_with_mailbox(
+                email,
+                str(mailbox.get("client_id") or ""),
+                str(mailbox.get("refresh_token") or ""),
+                yescap_key,
+                max_wait=max_wait,
+            )
+            account = TensorArtAccountDB.upsert(
+                email=email,
+                access_token=login_result.get("access_token", ""),
+                expires_at=int(login_result.get("expires_at") or 0),
+                device_id=login_result.get("device_id", ""),
+                user_agent=login_result.get("user_agent", ""),
+                user_id=login_result.get("user_id", ""),
+                status="active",
+                note="邮箱 magic-link 纯 API 注册",
+            )
+            MailboxDB.mark_channel_usage(
+                mailbox["id"],
+                "tensorart",
+                "registered",
+                account_email=email,
+            )
+            return {
+                "ok": True,
+                "email": email,
+                "account": _tensorart_public_account(account),
+            }
+        except Exception as error:  # noqa: BLE001
+            MailboxDB.mark_channel_usage(
+                mailbox["id"],
+                "tensorart",
+                "failed",
+                account_email=email,
+                error=str(error),
+            )
+            return {"ok": False, "email": email, "error": str(error)}
+
+    concurrency = min(requested_concurrency, len(mailboxes))
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        results = list(executor.map(worker, mailboxes))
+    succeeded = sum(1 for result in results if result.get("ok"))
+    return {
+        "data": {
+            "results": results,
+            "succeeded": succeeded,
+            "failed": len(results) - succeeded,
+            "total": len(results),
+        }
+    }
+
+
+@app.delete("/tensorart/accounts")
+def tensorart_delete_all_accounts():
+    accounts = TensorArtAccountDB.list_all()
+    deleted = TensorArtAccountDB.delete_all()
+    for account in accounts:
+        _release_mailbox_channel_by_email(account.get("email", ""), "tensorart")
+    return {"data": {"deleted": deleted}}
+
+
+@app.delete("/tensorart/accounts/{account_id}")
+def tensorart_delete_account(account_id: int):
+    account = TensorArtAccountDB.get(account_id)
+    TensorArtAccountDB.delete(account_id)
+    if account:
+        _release_mailbox_channel_by_email(account.get("email", ""), "tensorart")
+    return {"message": "deleted"}
+
+
+@app.get("/tensorart/accounts/{account_id}/test")
+def tensorart_test_account(account_id: int):
+    try:
+        account = TensorArtAccountDB.get(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="Tensor.Art account not found")
+        client = ta.TensorArtClient(
+            account.get("access_token", ""),
+            device_id=account.get("device_id", ""),
+            user_agent=account.get("user_agent", ""),
+        )
+        return {"data": client.test_connection()}
+    except ta.TensorArtError as error:
+        raise HTTPException(
+            status_code=error.status_code or 500,
+            detail=str(error),
+        ) from error
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@app.get("/tensorart/models")
+def tensorart_models():
+    return {"data": {"models": ta.DEFAULT_MODELS, "ratios": ta.DEFAULT_RATIOS}}
+
+
+@app.get("/tensorart/energy")
+def tensorart_get_energy(account_id: int = 0):
+    try:
+        account = ta.pick_account(account_id)
+        client = ta.TensorArtClient(
+            account.get("access_token", ""),
+            device_id=account.get("device_id", ""),
+            user_agent=account.get("user_agent", ""),
+        )
+        energy = client.get_energy()
+        total = energy.get("totalBalance")
+        if total is None:
+            total = energy.get("balance", energy.get("energy", 0))
+        return {
+            "data": {
+                "total_balance": total,
+                "sources": energy.get("sources", []),
+                "account_id": int(account.get("id") or 0),
+                "account_name": account.get("email", ""),
+            }
+        }
+    except ta.TensorArtError as error:
+        raise HTTPException(
+            status_code=error.status_code or 500,
+            detail=str(error),
+        ) from error
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@app.post("/tensorart/tasks/create")
+def tensorart_create_task(body: TensorArtTaskCreate):
+    # 账号选择到 TaskDB 落库之间串行化，避免并发请求同时挑中同一最低负载账号。
+    with _tensorart_task_create_lock:
+        return _tensorart_create_task_locked(body)
+
+
+def _tensorart_create_task_locked(body: TensorArtTaskCreate):
+    try:
+        duration = ta.normalize_video_duration(body.duration)
+        credits = ta.video_credits_for_duration(duration)
+        account = ta.pick_account(body.account_id, min_credits=credits)
+        client = ta.TensorArtClient(
+            account.get("access_token", ""),
+            device_id=account.get("device_id", ""),
+            user_agent=account.get("user_agent", ""),
+        )
+        image_sources = list(body.image_paths or [])
+        if body.image_path:
+            image_sources.insert(0, body.image_path)
+        if body.image_url:
+            image_sources.append(body.image_url)
+        image_sources = list(
+            dict.fromkeys(str(value).strip() for value in image_sources if str(value).strip())
+        )
+        if not image_sources:
+            raise HTTPException(
+                status_code=400,
+                detail="渠道十当前仅支持图生视频，请先为分镜添加垫图",
+            )
+
+        result = client.start_video_generation(
+            body.prompt,
+            image_sources,
+            aspect_ratio=body.aspect_ratio,
+            resolution=body.resolution or "480p",
+            duration=duration,
+        )
+        task_id = ta.encode_task_id(
+            result["run_id"],
+            result["canvas_id"],
+            result["node_id"],
+            account_id=int(account.get("id") or 0),
+        )
+        persistence_warning = ""
+        try:
+            TaskDB.add(
+                task_id=task_id,
+                account_id=int(account.get("id") or 0),
+                task_type=TaskType.IMAGE_TO_VIDEO,
+                prompt=body.prompt,
+                model=f"tensorart:{body.model}",
+                status="processing",
+                video_duration=duration,
+            )
+        except Exception as database_error:  # noqa: BLE001
+            # 远端已经扣费启动；task_id 自带账号/Canvas/节点上下文，仍返回给前端继续轮询。
+            persistence_warning = f"远端任务已启动，但本地任务记录保存失败：{database_error}"
+            traceback.print_exc()
+        return {
+            "data": {
+                "task_id": task_id,
+                "workflow_run_id": result["run_id"],
+                "canvas_id": result["canvas_id"],
+                "node_id": result["node_id"],
+                "status": "processing",
+                "account_id": int(account.get("id") or 0),
+                "account_name": account.get("email", ""),
+                "asset_ids": [
+                    asset.get("asset_id", "") for asset in result.get("assets", [])
+                ],
+                "duration": duration,
+                "credits": credits,
+                "persistence_warning": persistence_warning,
+            }
+        }
+    except ta.TensorArtError as error:
+        raise HTTPException(
+            status_code=error.status_code or 500,
+            detail=str(error),
+        ) from error
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@app.get("/tensorart/tasks/{task_id}/status")
+def tensorart_task_status(task_id: str):
+    try:
+        context = ta.decode_task_id(task_id)
+        task = TaskDB.get(task_id) or {}
+        account_id = int(task.get("account_id") or context.get("account_id") or 0)
+        account = (
+            TensorArtAccountDB.get(account_id)
+            if account_id
+            else ta.pick_account(0)
+        )
+        if not account:
+            raise HTTPException(
+                status_code=404,
+                detail="Tensor.Art account not found for this task",
+            )
+        client = ta.TensorArtClient(
+            account.get("access_token", ""),
+            device_id=account.get("device_id", ""),
+            user_agent=account.get("user_agent", ""),
+        )
+        payload = client.query_run(
+            context["canvas_id"],
+            context["node_id"],
+            context["run_id"],
+        )
+        result = ta.parse_run_result(payload, context["run_id"])
+        video_url = result.get("video_url", "")
+        if result["status"] == "completed" and not video_url:
+            detail = client.canvas_detail(context["canvas_id"])
+            video_url = ta.extract_video_url(detail, context["node_id"])
+            result["video_url"] = video_url
+            result["download_url"] = video_url
+        if result["status"] == "completed" and not video_url:
+            # SUCCESS 与产物 URL 的持久化可能存在短暂时间差，继续轮询而不是提前终止。
+            result["status"] = "processing"
+            result["finalizing"] = True
+
+        if result["status"] == "completed":
+            TaskDB.update_status(task_id, "completed", video_url=video_url)
+        elif result["status"] == "failed":
+            TaskDB.update_status(task_id, "failed")
+        else:
+            TaskDB.update_status(task_id, "processing")
+
+        return {
+            "data": {
+                **result,
+                "task_id": task_id,
+                "workflow_run_id": context["run_id"],
+                "canvas_id": context["canvas_id"],
+                "node_id": context["node_id"],
+                "account_id": int(account.get("id") or 0),
+                "account_name": account.get("email", ""),
+            }
+        }
+    except ta.TensorArtError as error:
+        raise HTTPException(
+            status_code=error.status_code or 500,
+            detail=str(error),
+        ) from error
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
 # ==================== 健康检查 ====================
+
+@app.get("/internal/health")
+def internal_health(request: Request):
+    _require_internal_session_access(request)
+    return {"status": "ok", "version": "1.0.0"}
+
 
 @app.get("/health")
 def health():

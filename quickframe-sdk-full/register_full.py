@@ -1,4 +1,4 @@
-"""单条完整注册流程：YesCaptcha 解 Turnstile + Auth0 Universal Login 表单流 + GPTMail 收码。
+"""单条完整注册流程：YesCaptcha + Auth0 Universal Login + 邮箱收码。
 
 验证核心未知数：YesCaptcha 在它自己环境解出的 Turnstile token，
 能否被 login.quickframe.com 的 Auth0 后端接受（异地 token 可用性）。
@@ -7,7 +7,7 @@
   /authorize -> 落地 identifier 页(取 state+sitekey)
   -> YesCaptcha 解 Turnstile -> 带 token POST identifier(触发发码)
   -> 落地 passwordless-email-challenge 页
-  -> GPTMail 收码 -> POST code
+  -> 全局邮箱库/兼容 GPTMail 收码 -> POST code
   -> /authorize/resume -> server.cs.quickframe.com/auth/callback (拿 cs_session)
   -> POST /token 刷 Bearer 验证
 """
@@ -27,6 +27,7 @@ import urllib.error
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 import gptmail_getcode as gm
+import applemail_getcode as am
 
 # 是否让 QuickFrame/Auth0 的请求走链式旋转代理（每个 session 独立出口 IP，绕开 429）
 USE_PROXY = os.getenv("QF_USE_PROXY", "0") == "1"
@@ -178,7 +179,7 @@ def get_sitekey(text):
     return m.group(1) if m else None
 
 
-def register_one(email):
+def register_one(email, mailbox=None):
     t0 = time.time()
     opener, jar = make_session()
     print(f"\n{'='*60}\n邮箱: {email}\n{'='*60}")
@@ -203,6 +204,7 @@ def register_one(email):
 
     # ---- 步骤 2：带 token 提交邮箱，触发发码 ----
     print("[2] 提交邮箱 + captcha token")
+    verification_requested_at = time.time()
     submit_url = f"https://login.quickframe.com/u/login/identifier?state={state}"
     form = urllib.parse.urlencode({
         "state": state, "username": email, "captcha": token,
@@ -238,10 +240,17 @@ def register_one(email):
                 "err": f"not at challenge: {chal_url[:80]}"}
     print("    >>> 发码成功！token 被 Auth0 接受")
 
-    # ---- 步骤 3：GPTMail 收码 ----
-    print("[3] GPTMail 收码")
-    cookies, gm_token, _ = gm.build_session(email)
-    code = gm.wait_for_code(email, max_wait=90)
+    # ---- 步骤 3：邮箱收码 ----
+    if mailbox:
+        print("[3] 全局邮箱库（小苹果 API）收码")
+        code = am.wait_for_code(
+            mailbox,
+            max_wait=90,
+            min_ts=verification_requested_at - 120,
+        )
+    else:
+        print("[3] GPTMail 收码")
+        code = gm.wait_for_code(email, max_wait=90)
     if not code:
         return {"email": email, "ok": False, "stage": "get_code", "err": "no code"}
     print(f"    验证码: {code}")

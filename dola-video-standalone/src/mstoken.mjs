@@ -1,13 +1,12 @@
-// msToken management for Doubao CLI.
+// msToken management for the Dola API client.
 //
-// The msToken must originate from mssdk.bytedance.com. Three sources, in
-// priority order:
-//   1. Cached token from .mstoken file (fastest, written by previous runs)
-//   2. Extracted from the user's browser via Chrome DevTools MCP
-//   3. Cookie-extracted fallback (rarely valid for chat)
+// Accepted sources are deliberately limited to credentials explicitly supplied
+// by the user:
+//   1. DOLA_MS_TOKEN
+//   2. A local cache written by setUserProvidedMsToken() after an explicit user action
 //
-// Once bootstrapped, the token is rotated automatically via the x-ms-token
-// response header from doubao.com API calls.
+// This module never reads browser state, derives a token from Cookie, refreshes
+// credentials, or performs network requests.
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -15,75 +14,57 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TOKEN_FILE = path.resolve(__dirname, '..', '.mstoken');
-const TOKEN_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+const USER_PROVIDED_SOURCE = 'user-provided';
 
-let _current = null;
+let currentToken = null;
 
-export function getMsToken() { return _current; }
-
-export function setMsToken(token) {
-  if (!token) return;
-  _current = token;
-  saveToFile(token);
+export function getMsToken() {
+  return currentToken;
 }
 
-function saveToFile(token) {
+export function setUserProvidedMsToken(token) {
+  const value = String(token || '').trim();
+  if (!value) return;
+  currentToken = value;
+  saveExplicitToken(value);
+}
+
+function saveExplicitToken(token) {
   try {
     fs.writeFileSync(TOKEN_FILE, JSON.stringify({
       token,
+      source: USER_PROVIDED_SOURCE,
       timestamp: Date.now(),
     }));
   } catch {}
 }
 
-function loadFromFile() {
+function loadExplicitToken() {
   try {
     const raw = fs.readFileSync(TOKEN_FILE, 'utf8');
-    const { token, timestamp } = JSON.parse(raw);
-    if (Date.now() - timestamp < TOKEN_MAX_AGE_MS && token) {
-      return token;
+    const { token, source } = JSON.parse(raw);
+    if (source === USER_PROVIDED_SOURCE && token) {
+      return String(token).trim();
     }
   } catch {}
   return null;
 }
 
-function extractFromCookie() {
-  const cookie = process.env.DOUBAO_COOKIE || '';
-  const m = cookie.match(/msToken=([^;]+)/);
-  return m ? m[1] : null;
-}
+export async function bootstrapMsToken({ envName = 'DOLA_MS_TOKEN' } = {}) {
+  if (currentToken) return currentToken;
 
-/**
- * Bootstrap the msToken. Tries cached file first, then cookie.
- * For the initial token from mssdk.bytedance.com, run:
- *   node src/fetch-mstoken.mjs
- */
-export async function bootstrapMsToken() {
-  if (_current) return _current;
-
-  const explicit = process.env.DOUBAO_MS_TOKEN || process.env.DOLA_MS_TOKEN;
+  const explicit = String(process.env[envName] || '').trim();
   if (explicit) {
-    _current = explicit;
-    console.error('[mstoken] loaded from env');
-    return _current;
+    currentToken = explicit;
+    return currentToken;
   }
 
-  // 1. Cached file
-  const cached = loadFromFile();
+  const cached = loadExplicitToken();
   if (cached) {
-    _current = cached;
-    console.error('[mstoken] loaded from cache');
-    return _current;
+    currentToken = cached;
+    return currentToken;
   }
 
-  // 2. Cookie
-  const fromCookie = extractFromCookie();
-  if (fromCookie) {
-    _current = fromCookie;
-    console.error('[mstoken] extracted from cookie');
-    return _current;
-  }
-
-  console.error('[mstoken] no token available. Run: node src/fetch-mstoken.mjs');
+  console.error(`[needs_auth] 缺少 ${envName}。请由用户手动配置 API 凭证。`);
   return null;
 }

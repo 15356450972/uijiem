@@ -32,6 +32,16 @@
         "!node_modules/.cache/**/*",
         "!**/.DS_Store"
       ]
+    },
+    {
+      "from": "framia-google-login",
+      "to": "framia-google-login",
+      "filter": [
+        "package.json",
+        "package-lock.json",
+        "index.mjs",
+        "node_modules/**/*"
+      ]
     }
   ],
   "win": {

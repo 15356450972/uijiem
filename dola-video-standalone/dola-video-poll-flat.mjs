@@ -10,7 +10,7 @@
  *   node dola-video-poll-flat.mjs <conversation_id> [output.mp4]
  *
  * 环境变量：
- *   .env.dola 必须存在（含 DOLA_COOKIE 等）
+ *   .env.dola 必须存在（含 DOLA_COOKIE、DOLA_MS_TOKEN 等）
  *   DOLA_PROXY=direct  禁用代理
  *   DOLA_MAX_POLL_TIME_MS  默认 720000 (12分钟)
  *   DOLA_POLL_INTERVAL_MS  默认 10000 (10秒)
@@ -49,7 +49,7 @@ for (const envFile of envCandidates) {
   }
 }
 if (!envLoaded) {
-  console.error('[!] .env.dola not found.');
+  console.error('[needs_auth] 未找到 .env.dola。请由用户手动配置 DOLA_COOKIE 和 DOLA_MS_TOKEN。');
   process.exit(1);
 }
 
@@ -87,12 +87,10 @@ const clientPath = pathToFileURL(path.join(__dir, 'src', 'client.mjs')).href;
 const { signedFetch, setPlatform, ensureSignerReady, getPlatformOrigin } = await import(clientPath);
 
 if (typeof setPlatform === 'function') setPlatform('dola');
-if (typeof ensureSignerReady === 'function') {
-  try { await ensureSignerReady(); } catch (e) { console.warn(`[!] signer init: ${e.message}`); }
-}
+await ensureSignerReady();
 
 function envGet(name, fallback = '') {
-  return process.env[`DOLA_${name}`] || process.env[`DOUBAO_${name}`] || fallback;
+  return process.env[`DOLA_${name}`] || fallback;
 }
 
 function browserImQuery() {
@@ -350,8 +348,7 @@ async function main() {
             console.log(`  wrote ${buf.length} bytes`);
             // 给上游 Python 解析器使用的规范行
             console.log(`保存到: ${outputPath}`);
-          } else {
-            // dump candidate list as JSON for downstream tools
+          } else if (process.env.DOLA_POLL_OUTPUT_MODE !== 'stdout') {
             const dumpPath = `dola-poll-flat-${conversationId}.json`;
             fs.writeFileSync(dumpPath, JSON.stringify({ conversationId, candidates: cands }, null, 2));
             console.log(`\n[dump] ${dumpPath}`);
@@ -366,6 +363,7 @@ async function main() {
         }
       }
     } catch (e) {
+      if (e?.code === 'needs_auth' || /\[needs_auth\]/i.test(String(e?.message || e))) throw e;
       if (!firstError) firstError = e.message;
       console.log(`  [${elapsed}s] exception: ${e.message}`);
     }

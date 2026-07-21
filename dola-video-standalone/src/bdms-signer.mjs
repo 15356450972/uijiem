@@ -34,14 +34,7 @@ const PLATFORM_CONFIG = {
 
 let sandbox = null;
 let initialized = false;
-let _latestMsToken = null;
 let _platform = 'doubao';
-
-/**
- * Returns the latest msToken obtained from the mssdk endpoint,
- * or null if none has been received yet.
- */
-export function getLatestMsToken() { return _latestMsToken; }
 
 /** Returns the current platform name ('doubao' or 'dola'). */
 export function getPlatform() { return _platform; }
@@ -50,7 +43,6 @@ export function getPlatform() { return _platform; }
 export function resetSigner() {
   sandbox = null;
   initialized = false;
-  _latestMsToken = null;
   _platform = 'doubao';
 }
 
@@ -197,32 +189,12 @@ export async function initSigner(cookie = '', options = {}) {
   win.queueMicrotask = queueMicrotask;
   win.structuredClone = structuredClone;
 
-  // Smart fetch stub: makes REAL requests to mssdk.bytedance.com (needed for
-  // msToken acquisition), stubs everything else.
-  const realFetch = globalThis.fetch;
-  const nativeFetch = (url, init) => {
-    const urlStr = typeof url === 'string' ? url : (url instanceof Request ? url.url : String(url));
-    if (urlStr.includes('mssdk.bytedance.com')) {
-      return realFetch(urlStr, {
-        method: init?.method || 'POST',
-        headers: {
-          'content-type': init?.headers?.['Content-Type'] || init?.headers?.['content-type'] || 'text/plain;charset=UTF-8',
-          'user-agent': navigator.userAgent,
-          'origin': cfg.origin,
-          'referer': cfg.referer,
-        },
-        body: init?.body,
-      }).then(res => {
-        const ms = res.headers.get('x-ms-token');
-        if (ms) _latestMsToken = ms;
-        return res;
-      });
-    }
-    return Promise.resolve(new Response('{}', {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    }));
-  };
+  // The SDK runs in a local VM strictly to calculate a_bogus. Network access
+  // is stubbed so it cannot acquire or refresh credentials as a side effect.
+  const nativeFetch = () => Promise.resolve(new Response('{}', {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  }));
   win.fetch = nativeFetch;
 
   win.XMLHttpRequest = function() {

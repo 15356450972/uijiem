@@ -31,8 +31,12 @@ const crypto = require('crypto');
 // 可选依赖：注册流程需要，纯生成/下载流程不需要
 let TCaptchaCracker = null;
 let gptmail = null;
+let tenMinuteMail = null;
+let appleMail = null;
 try { ({ TCaptchaCracker } = require('./tcaptcha_crack')); } catch (e) {}
 try { gptmail = require('./gptmail'); } catch (e) {}
+try { tenMinuteMail = require('./tenminutemail'); } catch (e) {}
+try { appleMail = require('./applemail'); } catch (e) {}
 
 const DEFAULTS = {
   apiHost: 'api-qc.oiioii.ai',
@@ -62,6 +66,9 @@ const VIDEO_MODELS = {
   'wan2.7': 'generate_video_wan27',
   'grok': 'generate_video_grok_imagine',
   'grok-imagine': 'generate_video_grok_imagine',
+  'grok-imagine-1.5': 'generate_video_grok_imagine_15',
+  'grok-1.5': 'generate_video_grok_imagine_15',
+  'grok15': 'generate_video_grok_imagine_15',
   'kling-3-pro': 'generate_video_kling',
   'kling-3-std': 'generate_video_kling',
   'kling-v3-omni': 'generate_video_kling',
@@ -99,6 +106,8 @@ const IMAGE_MODELS = {
   'midjourney-niji7': 'generate_image_midjourney',
   'midjourney-niji6': 'generate_image_midjourney',
   'midjourney': 'generate_image_midjourney',
+  'midjourney8': 'generate_image_midjourney8',
+  'midjourney-v8': 'generate_image_midjourney8',
   'novelai': 'generate_image_novelai',
   'gpt4o': 'generate_image_gpt4o'
 };
@@ -108,7 +117,9 @@ const IMAGE_MODEL_PARAMS = {
   'nano2': 'nano2',
   'midjourney': 'niji7',
   'midjourney-niji7': 'niji7',
-  'midjourney-niji6': 'niji6'
+  'midjourney-niji6': 'niji6',
+  'midjourney8': 'v8',
+  'midjourney-v8': 'v8'
 };
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -157,6 +168,7 @@ class OiiOiiClient {
     this.shareToken = options.shareToken || '';
     this.subAccountId = options.subAccountId || '';
     this.workspaceId = options.workspaceId || null;
+    this.mailProvider = options.mailProvider || options.mail_provider || null;
 
     this.apiHost = options.apiHost || DEFAULTS.apiHost;
     this.authHost = options.authHost || DEFAULTS.authHost;
@@ -424,15 +436,78 @@ class OiiOiiClient {
   // ===========================================================================
   // 1. 注册
   // ===========================================================================
+  _resolveMailboxProvider(provider = 'gptmail', mailboxCredentials = {}) {
+    const normalized = String(provider || 'gptmail').trim().toLowerCase().replace(/[\s_-]+/g, '');
+
+    if (['apple', 'applemail', 'shared', 'mailboxpool'].includes(normalized)) {
+      if (!appleMail) {
+        throw new Error('共享邮箱库依赖 ./applemail 模块，请确保文件存在');
+      }
+      const mailbox = appleMail.createMailbox(mailboxCredentials);
+      return {
+        id: 'applemail',
+        name: '全局邮箱库（小苹果取件）',
+        generateEmail: () => mailbox.email,
+        waitForVerificationEmail: (_email, maxWait) => appleMail.waitForVerificationEmail(mailbox, maxWait)
+      };
+    }
+
+    if (['10minutemail', '10minute', 'tenminutemail', '10min'].includes(normalized)) {
+      if (!tenMinuteMail) {
+        throw new Error('10MinuteMail 邮箱依赖 ./tenminutemail 模块，请确保文件存在');
+      }
+      return {
+        id: '10minutemail',
+        name: '10MinuteMail.one',
+        generateEmail: () => tenMinuteMail.generateEmail(),
+        waitForVerificationEmail: (email, maxWait) => tenMinuteMail.waitForVerificationEmail(email, maxWait)
+      };
+    }
+
+    if (!gptmail) {
+      throw new Error('GPTMail 邮箱依赖 ./gptmail 模块，请确保文件存在');
+    }
+    return {
+      id: 'gptmail',
+      name: 'GPTMail',
+      generateEmail: () => gptmail.generateEmail(),
+      waitForVerificationEmail: async (email, maxWait) => {
+        const cookies = await gptmail.getFullBrowserCookies(email);
+        const start = Date.now();
+        while (Date.now() - start < maxWait) {
+          const result = await gptmail.getEmailsWithCookies(email, cookies);
+          if (result?.success && result.data?.emails?.length > 0) {
+            const mail = result.data.emails[0];
+            const content = mail.html_content || mail.content || '';
+            const link = (content.match(/href="(https?:\/\/[^"]*(?:verify|confirm)[^"]*)"/i) ||
+              content.match(/href="(https?:\/\/[^"]*token=[^"]*)"/i) || [])[1];
+            if (link) return { link, mail };
+            const code = (content.match(/\b(\d{4,6})\b/) || [])[1];
+            if (code) return { code, mail };
+            return { mail, content };
+          }
+          await sleep(2000);
+        }
+        throw new Error(`验证邮件超时（${maxWait / 1000}s）`);
+      }
+    };
+  }
+
   async register(options = {}) {
-    if (!TCaptchaCracker || !gptmail) {
-      throw new Error('注册功能依赖 ./tcaptcha_crack 和 ./gptmail 模块，请确保文件存在');
+    if (!TCaptchaCracker) {
+      throw new Error('注册功能依赖 ./tcaptcha_crack 模块，请确保文件存在');
     }
 
     this.log('[register] 开始全自动注册...');
     const password = options.password || this.password || this._genPassword();
+    const mailboxProvider = this._resolveMailboxProvider(
+      options.mailProvider || options.mail_provider || this.mailProvider || 'gptmail',
+      options.mailbox || options.mailboxCredentials || {}
+    );
+    this.mailProvider = mailboxProvider.id;
+    this.log(`[register] 邮箱来源: ${mailboxProvider.name}`);
 
-    const email = options.email || await gptmail.generateEmail();
+    const email = options.email || await mailboxProvider.generateEmail();
     this.log(`[register] 邮箱: ${email}`);
 
     const captchaConfig = await this._getCaptchaConfig(email);
@@ -462,7 +537,7 @@ class OiiOiiClient {
     }
     this.log('[register] 验证邮件已发送，等待收件...');
 
-    const verification = await this._waitForVerificationEmail(email, options.maxWait || 90000);
+    const verification = await this._waitForVerificationEmail(email, options.maxWait || 90000, mailboxProvider);
     if (verification.link) {
       const r1 = await this._confirmEmail(verification.link);
       if (r1.status >= 300 && r1.status < 400 && r1.location) {
@@ -473,7 +548,7 @@ class OiiOiiClient {
     this.email = email;
     this.password = password;
     this.log('[register] 注册成功');
-    return { success: true, email, password };
+    return { success: true, email, password, mailProvider: mailboxProvider.id };
   }
 
   async _getCaptchaConfig(email) {
@@ -502,24 +577,9 @@ class OiiOiiClient {
     return result;
   }
 
-  async _waitForVerificationEmail(email, maxWait) {
-    const cookies = await gptmail.getFullBrowserCookies(email);
-    const start = Date.now();
-    while (Date.now() - start < maxWait) {
-      const result = await gptmail.getEmailsWithCookies(email, cookies);
-      if (result?.success && result.data?.emails?.length > 0) {
-        const mail = result.data.emails[0];
-        const content = mail.html_content || mail.content || '';
-        const link = (content.match(/href="(https?:\/\/[^"]*(?:verify|confirm)[^"]*)"/i) ||
-          content.match(/href="(https?:\/\/[^"]*token=[^"]*)"/i) || [])[1];
-        if (link) return { link, mail };
-        const code = (content.match(/\b(\d{4,6})\b/) || [])[1];
-        if (code) return { code, mail };
-        return { mail, content };
-      }
-      await sleep(2000);
-    }
-    throw new Error(`验证邮件超时（${maxWait / 1000}s）`);
+  async _waitForVerificationEmail(email, maxWait, mailboxProvider) {
+    const provider = mailboxProvider || this._resolveMailboxProvider(this.mailProvider || 'gptmail');
+    return provider.waitForVerificationEmail(email, maxWait);
   }
 
   _confirmEmail(verifyLink) {
@@ -674,20 +734,38 @@ class OiiOiiClient {
   async getWorkspace(options = {}) {
     if (this.workspaceId && !options.force) return this.workspaceId;
 
-    const res = await this._request('/workspace/create_workspace', {
-      method: 'POST', body: JSON.stringify({ name: options.name || `ws_${Date.now()}` })
-    });
-    if (res.json?.code === 'SUCCESS' || res.json?.success) {
-      this.workspaceId = res.json.data?.id || res.json.data?.workspaceId || res.json.workspaceId;
-    }
-    if (!this.workspaceId) {
+    const requestWorkspace = async () => {
+      const createRes = await this._request('/workspace/create_workspace', {
+        method: 'POST', body: JSON.stringify({ name: options.name || `ws_${Date.now()}` })
+      });
+      let workspaceId = '';
+      if (createRes.json?.code === 'SUCCESS' || createRes.json?.success) {
+        workspaceId = createRes.json.data?.id || createRes.json.data?.workspaceId || createRes.json.workspaceId || '';
+      }
+      if (workspaceId) return { workspaceId, res: createRes };
+
       const listRes = await this._request('/workspace/list', {
         method: 'POST', body: JSON.stringify({ data: {} })
       });
-      if (listRes.json?.data?.length > 0) this.workspaceId = listRes.json.data[0].id;
-    }
-    if (!this.workspaceId) throw new Error(`无法获取 workspace: ${res.data.substring(0, 150)}`);
+      if (listRes.json?.data?.length > 0) {
+        workspaceId = listRes.json.data[0].id;
+      }
+      return { workspaceId, res: workspaceId ? listRes : createRes, listRes };
+    };
 
+    let result = await requestWorkspace();
+    const authExpired = isAuthExpiredResponse(result.res) || isAuthExpiredResponse(result.listRes);
+    if (!result.workspaceId && authExpired && !options._retriedAuth) {
+      this.log('[workspace] 登录态被上游拒绝，强制重新登录后重试');
+      this.workspaceId = null;
+      await this.login({ force: true });
+      result = await this.getWorkspace({ ...options, _retriedAuth: true, force: true });
+      return result;
+    }
+
+    if (!result.workspaceId) throw new Error(formatUpstreamError('无法获取 workspace', result.res));
+
+    this.workspaceId = result.workspaceId;
     this.log(`[workspace] ${this.workspaceId}`);
     return this.workspaceId;
   }
@@ -816,6 +894,8 @@ class OiiOiiClient {
       refImages = uris;
       if (options.imageRefBindings) {
         refBindings = options.imageRefBindings;
+      } else if (model === 'generate_video_grok_imagine_15') {
+        refBindings = [];
       } else if (options.primaryImageIndex !== undefined) {
         const idx = options.primaryImageIndex;
         refBindings = uris[idx] ? [{ index: idx + 1, kind: 'image', label: `Image_${idx + 1}`, uri: uris[idx] }] : [];
@@ -834,8 +914,15 @@ class OiiOiiClient {
       prompt: options.prompt || '生成一段精美的视频',
       resolution: options.resolution || '720p',
       referenceImages: refImages,
-      imageRefBindings: refBindings
+      imageRefBindings: refBindings,
+      roleAssets: options.roleAssets || [],
+      sceneAssets: options.sceneAssets || [],
+      itemAssets: options.itemAssets || []
     };
+
+    if (options.generateMode || model === 'generate_video_grok_imagine_15') {
+      body.generateMode = options.generateMode || 'firstframe2Video';
+    }
 
     if (options.afterAssetId) body.afterAssetId = options.afterAssetId;
 
@@ -854,7 +941,7 @@ class OiiOiiClient {
     this.log(`[video] taskId: ${taskId}`);
 
     const task = await this._pollTask(taskId, options);
-    return this._finishTask(task, 'video', options);
+    return this._finishTask(task, 'video', { ...options, mcpMethodName: model, modelParam });
   }
 
   async generateImageToVideo(options = {}) {
@@ -936,6 +1023,7 @@ class OiiOiiClient {
       submittedModel: options.model || '',
       submittedMcpMethodName: task.result_payload?.inputArgs?.mcpMethodName || options.mcpMethodName || '',
       submittedModelParam: task.result_payload?.inputArgs?.model || options.modelParam || '',
+      submittedGenerateMode: task.result_payload?.inputArgs?.generateMode || options.generateMode || '',
       task
     };
     if (options.fetchMeta) {
@@ -1034,6 +1122,7 @@ class OiiOiiClient {
       email: this.email,
       password: this.password,
       token: this.token,
+      mailProvider: this.mailProvider,
       savedAt: new Date().toISOString()
     };
   }
@@ -1054,6 +1143,7 @@ class OiiOiiClient {
     this.email = this.email || acc.email;
     this.password = this.password || acc.password;
     this.token = this.token || acc.token;
+    this.mailProvider = this.mailProvider || acc.mailProvider || acc.mail_provider || null;
     return acc;
   }
 

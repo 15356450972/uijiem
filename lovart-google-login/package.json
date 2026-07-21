@@ -1,0 +1,13 @@
+{
+  "name": "lovart-google-login",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Lovart Google OAuth login automation",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

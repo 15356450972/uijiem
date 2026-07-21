@@ -12,13 +12,13 @@ import {
 export default function Sidebar({ activeTab, setActiveTab, collapsed, setCollapsed }) {
   const menuItems = [
     { id: 'creator', label: '内容创作', icon: PenTool, category: '常用' },
-    { id: 'wizstar-mailbox', label: '邮箱库', icon: Mail, category: '渠道一' },
-    { id: 'wizstar-accounts', label: '账号库', icon: KeyRound, category: '渠道一' },
+    { id: 'wizstar-mailbox', label: '全局邮箱库', icon: Mail, category: '资源' },
+    { id: 'wizstar-accounts', label: '渠道账号库', icon: KeyRound, category: '资源' },
     { id: 'accounts', label: '账号管理', icon: Users2, category: '个人' },
     { id: 'settings', label: '设置', icon: Settings, category: '个人' },
   ];
 
-  const categories = ['常用', '渠道一', '个人'];
+  const categories = ['常用', '资源', '个人'];
 
   return (
     <div className={`${collapsed ? 'w-14' : 'w-52'} bg-dark-sidebar border-r border-dark-border flex flex-col justify-start h-full shrink-0 select-none transition-all duration-200`}>

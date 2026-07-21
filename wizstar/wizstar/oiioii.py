@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 import time
 import uuid
 import base64
@@ -26,6 +25,9 @@ import threading
 from pathlib import Path
 
 from .app_paths import get_wizstar_data_dir
+
+OIIOII_VIDEO_GENERATION_TIMEOUT_SECONDS = 15 * 60
+OIIOII_IMAGE_GENERATION_TIMEOUT_SECONDS = 30 * 60
 
 def _clean_str(value, default: str = "") -> str:
     """Return a stripped string while treating None as an empty value."""
@@ -70,6 +72,38 @@ def _cleanup_temp_files(paths: list[str]) -> None:
                 os.remove(path)
         except OSError:
             pass
+
+
+def _task_timing_fields(task: dict) -> dict:
+    started_at = task.get("started_at")
+    timeout_seconds = task.get("timeout_seconds")
+    estimated_wait_seconds = task.get("estimated_wait_seconds") or task.get("estimatedWaitSeconds")
+    try:
+        started_at = float(started_at or 0)
+    except (TypeError, ValueError):
+        started_at = 0
+    try:
+        timeout_seconds = int(float(timeout_seconds or 0))
+    except (TypeError, ValueError):
+        timeout_seconds = 0
+    try:
+        estimated_wait_seconds = int(float(estimated_wait_seconds)) if estimated_wait_seconds is not None else None
+    except (TypeError, ValueError):
+        estimated_wait_seconds = None
+
+    elapsed_seconds = max(0, int(time.time() - started_at)) if started_at else 0
+    remaining_seconds = max(0, timeout_seconds - elapsed_seconds) if timeout_seconds else None
+    return {
+        "started_at": started_at or None,
+        "timeout_seconds": timeout_seconds or None,
+        "elapsed_seconds": elapsed_seconds,
+        "remaining_seconds": remaining_seconds,
+        "estimated_wait_seconds": estimated_wait_seconds if estimated_wait_seconds is not None else remaining_seconds,
+    }
+
+
+def _with_task_timing(task: dict) -> dict:
+    return {**task, **_task_timing_fields(task)}
 
 
 def _friendly_error(message: str, model: str = "", is_video: bool = False) -> str:
@@ -140,6 +174,7 @@ def save_config(
     use_proxy: bool | None = None,
     proxy_host: str | None = None,
     proxy_port: int | None = None,
+    mail_provider: str | None = None,
 ) -> dict:
     config = _load_config()
     if use_proxy is not None:
@@ -148,6 +183,8 @@ def save_config(
         config["proxy_host"] = _clean_str(proxy_host, "127.0.0.1")
     if proxy_port is not None:
         config["proxy_port"] = int(proxy_port)
+    if mail_provider is not None:
+        config["mail_provider"] = _normalize_mail_provider(mail_provider)
     Path(CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
@@ -173,6 +210,7 @@ def config_status() -> dict:
                     "availablePerm": acc.get("availablePerm"),
                     "hasSignedInToday": acc.get("hasSignedInToday"),
                     "points_updated_at": acc.get("pointsUpdatedAt", ""),
+                    "mail_provider": acc.get("mailProvider") or acc.get("mail_provider") or "",
                 })
         except (json.JSONDecodeError, OSError):
             pass
@@ -191,6 +229,8 @@ def config_status() -> dict:
         "use_proxy": config.get("use_proxy", True),
         "proxy_host": config.get("proxy_host", "127.0.0.1"),
         "proxy_port": config.get("proxy_port", 7890),
+        "mail_provider": _normalize_mail_provider(config.get("mail_provider")),
+        "mail_provider_options": _mail_provider_options(),
         "account_count": len(accounts),
         "accounts": accounts,
     }
@@ -396,6 +436,26 @@ def _pick_account() -> dict:
         return pool[index]
 
 
+def _normalize_mail_provider(value: str | None = None) -> str:
+    text = _clean_str(value or _load_config().get("mail_provider") or "applemail", "applemail").lower()
+    text = re.sub(r"[\s_-]+", "", text)
+    if text in {"apple", "applemail", "shared", "mailboxpool"}:
+        return "applemail"
+    if text in {"10minutemail", "10minute", "tenminutemail", "10min"}:
+        return "10minutemail"
+    if text == "gptmail":
+        return "gptmail"
+    return "applemail"
+
+
+def _mail_provider_options() -> list[dict]:
+    return [
+        {"id": "applemail", "label": "全局邮箱库（默认）"},
+        {"id": "gptmail", "label": "GPTMail"},
+        {"id": "10minutemail", "label": "10MinuteMail.one"},
+    ]
+
+
 def _proxy_args() -> str:
     """生成 JS 代码中的 proxy 配置片段"""
     config = _load_config()
@@ -409,44 +469,67 @@ def _proxy_args() -> str:
 
 # ==================== 公开 API ====================
 
-def register_account() -> dict:
-    """全自动注册一个 OiiOii 账号（临时邮箱 + 验证码破解 + 邮箱验证）"""
+def register_account(mail_provider: str | None = None, mailbox: dict | None = None) -> dict:
+    """全自动注册一个 OiiOii 账号（共享邮箱或临时邮箱 + 邮箱验证）。"""
     account_file = os.path.join(ACCOUNT_DIR, f"acc_{uuid.uuid4().hex[:8]}.json")
     Path(ACCOUNT_DIR).mkdir(parents=True, exist_ok=True)
+    resolved_mail_provider = _normalize_mail_provider(mail_provider)
+    if resolved_mail_provider == "applemail" and not mailbox:
+        raise OiiOiiError("渠道四使用全局邮箱库时必须提供邮箱凭证")
 
     script = f"""
 const {{ OiiOiiClient }} = require('./oiioii_sdk');
-const client = new OiiOiiClient({{ {_proxy_args()}, debug: false }});
-const result = await client.register();
+const mailProvider = {json.dumps(resolved_mail_provider)};
+const mailbox = {json.dumps(mailbox or {}, ensure_ascii=False)};
+const client = new OiiOiiClient({{ {_proxy_args()}, debug: false, mailProvider }});
+const result = await client.register({{ mailProvider, mailbox }});
 await client.login();
 const points = await client.getPoints();
 const accountPath = {json.dumps(account_file)};
 const fs = require('fs');
-fs.writeFileSync(accountPath, JSON.stringify(client.toAccount(), null, 2), 'utf-8');
+const accountData = client.toAccount();
+accountData.mailProvider = mailProvider;
+fs.writeFileSync(accountPath, JSON.stringify(accountData, null, 2), 'utf-8');
 process.stdout.write(JSON.stringify({{
   success: true,
   email: result.email,
   points: points.points,
+  mail_provider: mailProvider,
   account_file: accountPath
 }}));
 """
     return _run_sdk_script(script, timeout=180)
 
 
-def register_batch(count: int = 1, concurrency: int = 2) -> dict:
+def register_batch(
+    count: int = 1,
+    concurrency: int = 2,
+    mail_provider: str | None = None,
+    mailboxes: list[dict] | None = None,
+) -> dict:
     """并发注册多个 OiiOii 账号。"""
     import concurrent.futures
 
     count = max(1, min(int(count or 1), 50))
     concurrency = max(1, min(int(concurrency or 1), 10, count))
-    results = {"success": [], "failed": [], "success_count": 0, "failed_count": 0, "total": count}
+    resolved_mail_provider = _normalize_mail_provider(mail_provider)
+    if resolved_mail_provider == "applemail" and len(mailboxes or []) < count:
+        raise OiiOiiError(f"全局邮箱库凭证不足：需要 {count} 个")
+    results = {"success": [], "failed": [], "success_count": 0, "failed_count": 0, "total": count, "mail_provider": resolved_mail_provider}
 
     def _worker(index: int) -> dict:
         try:
-            data = register_account()
+            mailbox = (mailboxes or [])[index - 1] if resolved_mail_provider == "applemail" else None
+            data = register_account(mail_provider=resolved_mail_provider, mailbox=mailbox)
             return {"ok": True, "index": index, **data}
         except Exception as e:
-            return {"ok": False, "index": index, "error": str(e)}
+            mailbox = (mailboxes or [])[index - 1] if resolved_mail_provider == "applemail" else None
+            return {
+                "ok": False,
+                "index": index,
+                "email": (mailbox or {}).get("email", ""),
+                "error": str(e),
+            }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [executor.submit(_worker, i + 1) for i in range(count)]
@@ -585,6 +668,7 @@ def generate_video(
     duration: int = 10,
     aspect_ratio: str = "16:9",
     resolution: str = "720p",
+    generate_mode: str = "",
 ) -> dict:
     """提交视频生成任务（异步，后台线程轮询）"""
     prompt = _clean_str(prompt)
@@ -594,18 +678,20 @@ def generate_video(
     model = _clean_str(model, "gemini") or "gemini"
     aspect_ratio = _clean_str(aspect_ratio, "16:9") or "16:9"
     resolution = _clean_str(resolution, "720p") or "720p"
+    generate_mode = _clean_str(generate_mode)
     acc = _pick_account()
     account_file = acc["_file"]
     task_id = f"oiioii-{uuid.uuid4().hex[:12]}"
     Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
     output_file = os.path.join(DOWNLOAD_DIR, f"{task_id}.mp4")
-
     _task_cache[task_id] = {
         "status": "pending",
         "progress": 0,
         "video_url": "",
         "error": "",
         "model": model,
+        "started_at": time.time(),
+        "timeout_seconds": OIIOII_VIDEO_GENERATION_TIMEOUT_SECONDS,
     }
 
     import threading
@@ -621,12 +707,16 @@ const result = await client.generateVideo({{
   duration: {duration},
   aspectRatio: {json.dumps(aspect_ratio)},
   resolution: {json.dumps(resolution)},
+  generateMode: {json.dumps(generate_mode)},
   {ref_arg}
   download: true,
   filename: {json.dumps(os.path.basename(output_file))},
   outputDir: {json.dumps(DOWNLOAD_DIR)},
   onProgress: (p, elapsed) => {{
-    process.stdout.write(JSON.stringify({{ __type: 'progress', progress: p || 0, elapsed }}) + '\\n');
+    const payload = (p && typeof p === 'object') ? p : {{ progress: p || 0, elapsed }};
+    if (payload.elapsed == null) payload.elapsed = elapsed;
+    if (payload.progress == null && typeof p !== 'object') payload.progress = p || 0;
+    process.stdout.write(JSON.stringify({{ __type: 'progress', ...payload }}) + '\\n');
   }}
 }});
 const fs = require('fs');
@@ -641,7 +731,8 @@ process.stdout.write(JSON.stringify({{
   fileSize: result.fileSize,
   submittedModel: result.submittedModel,
   submittedMcpMethodName: result.submittedMcpMethodName,
-  submittedModelParam: result.submittedModelParam
+  submittedModelParam: result.submittedModelParam,
+  submittedGenerateMode: result.submittedGenerateMode
 }}));
 """
 
@@ -656,6 +747,8 @@ process.stdout.write(JSON.stringify({{
             "status": "running",
             "progress": progress,
             "elapsed": event.get("elapsed"),
+            "queue_position": event.get("queue_position") or event.get("queuePosition"),
+            "estimated_wait_seconds": event.get("estimated_wait_seconds") or event.get("estimatedWaitSeconds"),
         })
 
     def _run():
@@ -684,7 +777,7 @@ process.stdout.write(JSON.stringify({{
                 ref_arg = f"referenceImages: {json.dumps(refs)}," if refs else ""
 
                 script = _build_script(current_account_file, ref_arg)
-                result, sdk_logs = _run_sdk_script_stream(script, timeout=900, on_event=_on_progress)
+                result, sdk_logs = _run_sdk_script_stream(script, timeout=OIIOII_VIDEO_GENERATION_TIMEOUT_SECONDS, on_event=_on_progress)
                 if result.get("error"):
                     err_text = str(result["error"])
                     if re.search(r"INSUFFICIENT_POI|INSUFFICIENT_POINTS|insufficient.*poi|insufficient.*points", err_text, re.I):
@@ -737,6 +830,7 @@ process.stdout.write(JSON.stringify({{
                         "submitted_model": result.get("submittedModel") or model,
                         "submitted_mcp_method_name": result.get("submittedMcpMethodName") or "",
                         "submitted_model_param": result.get("submittedModelParam") or "",
+                        "submitted_generate_mode": result.get("submittedGenerateMode") or generate_mode,
                         "error": "",
                         "sdk_task_id": result.get("taskId", ""),
                     }
@@ -784,7 +878,7 @@ process.stdout.write(JSON.stringify({{
     t = threading.Thread(target=_run, daemon=True)
     t.start()
 
-    return {"task_id": task_id, "status": "pending"}
+    return {"task_id": task_id, "status": "pending", "timeout_seconds": OIIOII_VIDEO_GENERATION_TIMEOUT_SECONDS}
 
 
 def generate_image(
@@ -809,13 +903,15 @@ def generate_image(
     acc = _pick_account()
     account_file = acc["_file"]
     task_id = f"oiioii-img-{uuid.uuid4().hex[:12]}"
-
     _task_cache[task_id] = {
         "status": "pending",
         "progress": 0,
         "video_url": "",
         "error": "",
         "model": model,
+        "media_type": "image",
+        "started_at": time.time(),
+        "timeout_seconds": OIIOII_IMAGE_GENERATION_TIMEOUT_SECONDS,
     }
 
     import threading
@@ -858,7 +954,10 @@ const requestOptions = {{
   fetchMeta: true,
   fetchRecord: true,
   onProgress: (p, elapsed) => {{
-    process.stdout.write(JSON.stringify({{ __type: 'progress', progress: p || 0, elapsed }}) + '\\n');
+    const payload = (p && typeof p === 'object') ? p : {{ progress: p || 0, elapsed }};
+    if (payload.elapsed == null) payload.elapsed = elapsed;
+    if (payload.progress == null && typeof p !== 'object') payload.progress = p || 0;
+    process.stdout.write(JSON.stringify({{ __type: 'progress', ...payload }}) + '\\n');
   }}
 }};
 let result;
@@ -903,7 +1002,7 @@ process.stdout.write(JSON.stringify({{
                     "elapsed": event.get("elapsed"),
                 })
 
-            result, sdk_logs = _run_sdk_script_stream(script, timeout=900, on_event=_on_progress)
+            result, sdk_logs = _run_sdk_script_stream(script, timeout=OIIOII_IMAGE_GENERATION_TIMEOUT_SECONDS, on_event=_on_progress)
             if result.get("error"):
                 raw_err = result.get("error", "")
                 error_message = _friendly_error(raw_err, model, is_video=False)
@@ -963,13 +1062,13 @@ process.stdout.write(JSON.stringify({{
     t = threading.Thread(target=_run, daemon=True)
     t.start()
 
-    return {"task_id": task_id, "status": "pending"}
+    return {"task_id": task_id, "status": "pending", "timeout_seconds": OIIOII_IMAGE_GENERATION_TIMEOUT_SECONDS}
 
 
 def get_task_status(task_id: str) -> dict:
     """查询任务状态"""
     if task_id in _task_cache:
-        return _task_cache[task_id]
+        return _with_task_timing(_task_cache[task_id])
     return {"status": "not_found", "video_url": "", "error": "任务不存在"}
 
 
@@ -1029,7 +1128,7 @@ def cleanup_zero_point_accounts() -> dict:
 def test_connection() -> dict:
     """测试 SDK 可用性 + 代理连通性"""
     try:
-        sdk_dir = _get_sdk_dir()
+        _get_sdk_dir()
     except OiiOiiError as e:
         return {"ok": False, "error": str(e)}
 

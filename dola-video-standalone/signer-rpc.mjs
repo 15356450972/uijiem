@@ -10,7 +10,6 @@
  * 接口：
  *   GET  /health                          → {"ok": true, "platform": "dola"}
  *   POST /sign  { url, method?, body? }   → {"url": "...&a_bogus=..."}
- *   GET  /mstoken                         → {"token": "..."}
  *   POST /reload  { platform? }           → {"ok": true}  (重新初始化签名器，可换平台)
  *
  * 该服务无鉴权，仅监听 127.0.0.1，由 unified_server 的子进程方式拉起。
@@ -42,18 +41,15 @@ process.on('uncaughtException', (err) => {
 });
 
 const bdmsSignerPath = pathToFileURL(path.join(__dir, 'src', 'bdms-signer.mjs')).href;
-const mstokenPath = pathToFileURL(path.join(__dir, 'src', 'mstoken.mjs')).href;
 
-const { initSigner, addABogus, generateABogus, resetSigner, getLatestMsToken } =
+const { initSigner, addABogus, generateABogus, resetSigner } =
   await import(bdmsSignerPath);
-const { bootstrapMsToken, getMsToken, setMsToken } = await import(mstokenPath);
 
 let currentPlatform = args.platform;
 
 async function init(platform) {
   resetSigner();
   await initSigner('', { platform });
-  await bootstrapMsToken();
   currentPlatform = platform;
   console.error(`[signer-rpc] initialized for platform=${platform}`);
 }
@@ -91,17 +87,6 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, platform: currentPlatform });
     }
 
-    if (req.method === 'GET' && url.pathname === '/mstoken') {
-      const tok = getMsToken() || getLatestMsToken() || null;
-      return sendJson(res, 200, { token: tok });
-    }
-
-    if (req.method === 'POST' && url.pathname === '/mstoken') {
-      const body = await readBody(req);
-      if (body.token) setMsToken(body.token);
-      return sendJson(res, 200, { ok: true });
-    }
-
     if (req.method === 'POST' && url.pathname === '/sign') {
       const body = await readBody(req);
       if (!body.url) return sendJson(res, 400, { error: 'missing url' });
@@ -114,7 +99,6 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         url: signed,
         a_bogus: aBogus,
-        msToken: getMsToken() || getLatestMsToken() || null,
       });
     }
 

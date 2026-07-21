@@ -326,42 +326,61 @@ def _prepare_register_module():
     return rf
 
 
-def register_one(email: Optional[str] = None, domain: Optional[str] = None) -> dict:
+def register_one(
+    email: Optional[str] = None,
+    domain: Optional[str] = None,
+    mailbox: Optional[dict] = None,
+) -> dict:
     """注册单个 QuickFrame 账号。返回 register_full.register_one 的结果字典。
 
     成功结构: {email, ok=True, cs_session, bearer, elapsed}
     失败结构: {email, ok=False, stage, err, ...}
     """
     rf = _prepare_register_module()
+    if mailbox:
+        email = str(mailbox.get("email") or "").strip()
     if not email:
         email = gen_email(domain)
     try:
-        return rf.register_one(email)
+        return rf.register_one(email, mailbox=mailbox)
     except Exception as e:  # noqa: BLE001
         return {"email": email, "ok": False, "stage": "exception", "err": f"{type(e).__name__}: {e}"}
 
 
-def register_batch(count: int, concurrency: int = 3, domain: Optional[str] = None) -> dict:
+def register_batch(
+    count: int,
+    concurrency: int = 3,
+    domain: Optional[str] = None,
+    mailboxes: Optional[List[dict]] = None,
+) -> dict:
     """批量并发注册 count 个账号。返回 {success: [...], failed: [...]}。"""
     rf = _prepare_register_module()
     count = max(1, int(count))
     concurrency = max(1, min(int(concurrency), 10))
 
-    # 预生成邮箱（一次取域名，避免并发重复请求域名接口）
-    emails = [gen_email(domain) for _ in range(count)]
+    if mailboxes:
+        if len(mailboxes) < count:
+            raise QuickFrameError(f"全局邮箱库凭证不足：需要 {count} 个")
+        jobs = [
+            (str(mailbox.get("email") or "").strip(), mailbox)
+            for mailbox in mailboxes[:count]
+        ]
+    else:
+        # 兼容原临时邮箱流程
+        jobs = [(gen_email(domain), None) for _ in range(count)]
 
     import concurrent.futures
 
     results = {"success": [], "failed": []}
 
-    def worker(addr: str) -> dict:
+    def worker(addr: str, mailbox: Optional[dict]) -> dict:
         try:
-            return rf.register_one(addr)
+            return rf.register_one(addr, mailbox=mailbox)
         except Exception as e:  # noqa: BLE001
             return {"email": addr, "ok": False, "stage": "exception", "err": f"{type(e).__name__}: {e}"}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futs = {pool.submit(worker, e): e for e in emails}
+        futs = {pool.submit(worker, email, mailbox): email for email, mailbox in jobs}
         for fut in concurrent.futures.as_completed(futs):
             r = fut.result()
             (results["success"] if r.get("ok") else results["failed"]).append(r)

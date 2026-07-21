@@ -1,4 +1,4 @@
-"""Wizstar 主客户端：注册 + 用户信息 + 上传 + 视频生成 + 轮询"""
+"""Wizstar 主客户端：邮箱登录 + 用户信息 + 上传 + 视频生成 + 轮询"""
 
 from __future__ import annotations
 
@@ -8,9 +8,7 @@ from dataclasses import dataclass, field
 
 import requests
 
-from .crypto import rsa_encrypt
 from .enums import Model, Ratio, Resolution, TaskType
-from .mailbox import OutlookMailbox
 
 
 BASE_URL = "https://wizstar.com"
@@ -32,16 +30,18 @@ DEFAULT_HEADERS = {
 
 @dataclass
 class WizstarCredentials:
-    """注册成功后服务端返回的凭证。osduss + passOsRefreshTk 是真正的认证 cookie"""
+    """浏览器授权后复用的 Wizstar 会话凭证。"""
 
     email: str
-    password: str
+    password: str = ""
     uid: int = 0
     display_name: str = ""
     osduss: str = ""
     refresh_token: str = ""
     pass_os_refresh_tk: str = ""
     portrait_url: str = ""
+    auth_token: str = ""
+    cookies: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -54,6 +54,8 @@ class WizstarCredentials:
             "refreshToken": self.refresh_token,
             "passOsRefreshTk": self.pass_os_refresh_tk,
             "portraitURL": self.portrait_url,
+            "authToken": self.auth_token,
+            "cookies": self.cookies,
         }
 
     @classmethod
@@ -67,99 +69,101 @@ class WizstarCredentials:
             refresh_token=d.get("refreshToken", ""),
             pass_os_refresh_tk=d.get("passOsRefreshTk", ""),
             portrait_url=d.get("portraitURL", ""),
+            auth_token=d.get("authToken", ""),
+            cookies=d.get("cookies") or {},
         )
 
 
-class WizstarClient:
-    """所有请求复用 requests.Session，cookie 自动维持登录态"""
+# reCAPTCHA v2 invisible 配置：服务端要求验证时的 sitekey / 校验页面。
+# 来自真实抓包：api2/clr?k=6LdPwTMtAAAAAKKEpYw0P1AAkpyEapV1LOoIP4zV。
+# 服务端如更换 sitekey，可通过 WizstarClient(... recaptcha_sitekey=...) 注入。
+RECAPTCHA_SITEKEY_DEFAULT = "6LdPwTMtAAAAAKKEpYw0P1AAkpyEapV1LOoIP4zV"
+RECAPTCHA_PAGE_URL_DEFAULT = "https://wizstar.com/tools/generate_video"
 
-    def __init__(self, credentials: WizstarCredentials | None = None):
+# 服务端在创建任务前要求人机验证时的错误码。
+ERRNO_RECAPTCHA_REQUIRED = 10100090
+
+
+class WizstarClient:
+    """所有请求复用 requests.Session，cookie 与浏览器授权令牌保持一致。"""
+
+    def __init__(
+        self,
+        credentials: WizstarCredentials | None = None,
+        *,
+        yescap_key: str | None = None,
+        recaptcha_sitekey: str | None = None,
+        recaptcha_page_url: str | None = None,
+    ):
         self.session = requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
         self.creds = credentials
+        # yescap key 不在 import 期解析；为 None 时调用前懒加载 quickframe_bridge。
+        self._yescap_key = yescap_key
+        self.recaptcha_sitekey = recaptcha_sitekey or RECAPTCHA_SITEKEY_DEFAULT
+        self.recaptcha_page_url = recaptcha_page_url or RECAPTCHA_PAGE_URL_DEFAULT
         if credentials:
             self._apply_credentials(credentials)
 
+    def _resolve_yescap_key(self) -> str:
+        """惰性解析 yescap key：构造器注入 > quickframe_bridge.get_yescap_key > 空。"""
+        if self._yescap_key:
+            return self._yescap_key
+        try:
+            from .quickframe_bridge import get_yescap_key
+            return get_yescap_key()
+        except Exception:
+            return ""
+
+    def _pass_recaptcha_v2(self) -> None:
+        """触发一次 reCAPTCHA v2 invisible 解码，并把 token 提交到站点 verify 接口。
+
+        - 复用 self.session 让 cookie 与会话令牌自动带上。
+        - verify 失败抛 RuntimeError，由调用方决定是否回失败给上层。
+        - errcode/errno 透传短文本，不打印 token、cookie、邮箱。
+        """
+        from .yescaptcha import solve_recaptcha_v2, YesCaptchaError
+
+        key = self._resolve_yescap_key()
+        if not key:
+            raise RuntimeError("create task failed: yescaptcha key not configured")
+
+        try:
+            token = solve_recaptcha_v2(
+                client_key=key,
+                website_url=self.recaptcha_page_url,
+                website_key=self.recaptcha_sitekey,
+                is_invisible=True,
+            )
+        except YesCaptchaError as e:
+            raise RuntimeError(f"create task failed: yescaptcha solve failed: {e}")
+
+        verify_resp = self.session.post(
+            f"{BASE_URL}/wizstar/gcode/verify",
+            json={"recaptcha_response": token},
+            timeout=30,
+        ).json()
+        if verify_resp.get("errno") != 0:
+            raise RuntimeError(
+                f"create task failed: gcode verify errno={verify_resp.get('errno')} "
+                f"msg={verify_resp.get('message')}"
+            )
+
     def _apply_credentials(self, creds: WizstarCredentials) -> None:
+        for name, value in (creds.cookies or {}).items():
+            if value not in (None, ""):
+                self.session.cookies.set(str(name), str(value), domain="wizstar.com", path="/")
         if creds.osduss:
             self.session.cookies.set("osduss", creds.osduss, domain="wizstar.com", path="/")
         if creds.pass_os_refresh_tk:
             self.session.cookies.set(
                 "passOsRefreshTk", creds.pass_os_refresh_tk, domain="wizstar.com", path="/"
             )
-
-    # ---------- 注册 ----------
-
-    def send_register_code(self, email: str) -> dict:
-        ts = int(time.time())
-        url = f"{BASE_URL}/passport/email/send_code?ts={ts}&tpl=wizstar&lang=en-US&client=pc"
-        payload = {
-            "tpl": "wizstar",
-            "client": "pc",
-            "lang": "en-US",
-            "scene": "email_register_send_code",
-            "email": rsa_encrypt(email),
-            "ext": json.dumps({"actionName": "email_register_send_code_send"}),
-        }
-        return self.session.post(url, json=payload, timeout=30).json()
-
-    def register(self, email: str, password: str, verify_code: str) -> WizstarCredentials:
-        ts = int(time.time())
-        url = f"{BASE_URL}/passport/reg/email?ts={ts}&tpl=wizstar&lang=en-US&client=pc"
-        payload = {
-            "tpl": "wizstar",
-            "client": "pc",
-            "lang": "en-US",
-            "email": rsa_encrypt(email),
-            "password": rsa_encrypt(password),
-            "verify_code": verify_code,
-        }
-        resp = self.session.post(url, json=payload, timeout=30)
-        result = resp.json()
-        if result.get("errno") != 0:
-            raise RuntimeError(f"register failed: {result}")
-        data = result.get("data", {})
-
-        cookies = {c.name: c.value for c in resp.cookies}
-        creds = WizstarCredentials(
-            email=email,
-            password=password,
-            uid=data.get("uid", 0),
-            display_name=data.get("displayName", ""),
-            osduss=data.get("osduss") or cookies.get("osduss", ""),
-            refresh_token=data.get("refreshToken", ""),
-            pass_os_refresh_tk=cookies.get("passOsRefreshTk", "") or data.get("refreshToken", ""),
-            portrait_url=data.get("portraitURL", ""),
-            raw=data,
-        )
-        self.creds = creds
-        self._apply_credentials(creds)
-        return creds
-
-    def register_auto(self, mailbox: OutlookMailbox, password: str) -> WizstarCredentials:
-        print(f"[register] sending code to {mailbox.email}...")
-        result = self.send_register_code(mailbox.email)
-        if result.get("errno") != 0:
-            raise RuntimeError(f"send_code failed: {result}")
-        print("[register] code sent, waiting for email arrival...")
-        time.sleep(8)
-        code = mailbox.fetch_verification_code(max_wait=90)
-        print(f"[register] got verification code: {code}")
-        creds = self.register(mailbox.email, password, code)
-        print(f"[register] success! uid={creds.uid}, displayName={creds.display_name}")
-        self._warm_up_session()
-        return creds
-
-    def _warm_up_session(self) -> None:
-        """新账号注册后必须先调一次 user/info，服务端才会下发 WIZSTARID 会话 cookie。
-        没这步的话 upload/init、tools/create 等接口会报 user not exists。"""
-        try:
-            info = self.user_info()
-            if info.get("errno") == 0:
-                names = [c.name for c in self.session.cookies]
-                print(f"[register] session warmed up (cookies: {names})")
-        except Exception as e:
-            print(f"[register] warm-up failed (will retry on first call): {e}")
+        auth_token = creds.auth_token or (creds.refresh_token if not creds.osduss else "")
+        if auth_token:
+            self.session.headers["Authorization"] = (
+                auth_token if auth_token.startswith("Bearer ") else f"Bearer {auth_token}"
+            )
 
     # ---------- 用户信息 / 积分 ----------
 
@@ -291,9 +295,17 @@ class WizstarClient:
         if extra:
             body.update(extra)
 
+        # 第一次创建可能触发 reCAPTCHA v2 invisible 风控（errno=10100090）。
+        # 抓包证明：通过 yescap 解码 -> POST /wizstar/gcode/verify -> 用同 body 重试，
+        # 即可成功创建任务。失败时保留原"create task failed"契约。
         result = self.session.post(
             f"{BASE_URL}/wizstar/tools/common/create", json=body, timeout=30
         ).json()
+        if result.get("errno") == ERRNO_RECAPTCHA_REQUIRED:
+            self._pass_recaptcha_v2()
+            result = self.session.post(
+                f"{BASE_URL}/wizstar/tools/common/create", json=body, timeout=30
+            ).json()
         if result.get("errno") != 0:
             raise RuntimeError(f"create task failed: {result}")
         return result["data"]["tasks"][0]

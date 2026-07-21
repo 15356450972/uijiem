@@ -34,6 +34,7 @@ for pkg in (
     'pydantic_core',
     'anyio',
     'requests',
+    'curl_cffi',
     'urllib3',
     'certifi',
     'charset_normalizer',
@@ -42,7 +43,7 @@ for pkg in (
     'click',
     'sniffio',
     'Crypto',          # pycryptodome
-    'aiosqlite',
+    'pymysql',
     'cv2',
     'numpy',
     'PIL',
@@ -59,7 +60,7 @@ for pkg in (
 hiddenimports += collect_submodules('uvicorn')
 
 # quickframe-sdk-full 顶层模块名（被动态 import，分析阶段不一定可见）。
-hiddenimports += ['chain_proxy', 'register_full', 'register_concurrent', 'gptmail_getcode']
+hiddenimports += ['chain_proxy', 'register_full', 'register_concurrent', 'gptmail_getcode', 'applemail_getcode']
 hiddenimports += collect_submodules('quickframe')
 
 block_cipher = None

@@ -11,6 +11,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "electron:dev": "sh -lc 'PORT=${VITE_PORT:-5174}; if lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then PORT=$((PORT+1)); fi; VITE_PORT=$PORT concurrently \"npm run dev\" \"wait-on http://localhost:$PORT && electron .\"'",
+    "oreateai:smoke": "electron electron/oreateai-smoke.cjs",
     "electron:build": "npm run build && npm --prefix dola-video-standalone ci && electron-builder"
   },
   "build": {
@@ -57,6 +58,34 @@
         "to": "dola-google-login",
         "filter": [
           "package.json",
+          "index.mjs",
+          "node_modules/**/*"
+        ]
+      },
+      {
+        "from": "oreateai-sdk",
+        "to": "oreateai-sdk",
+        "filter": [
+          "package.json",
+          "src/**/*"
+        ]
+      },
+      {
+        "from": "lovart-google-login",
+        "to": "lovart-google-login",
+        "filter": [
+          "package.json",
+          "package-lock.json",
+          "index.mjs",
+          "node_modules/**/*"
+        ]
+      },
+      {
+        "from": "framia-google-login",
+        "to": "framia-google-login",
+        "filter": [
+          "package.json",
+          "package-lock.json",
           "index.mjs",
           "node_modules/**/*"
         ]

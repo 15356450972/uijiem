@@ -24,7 +24,6 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { refreshDolaCookie, detectNeedsRefresh } from './src/cookie-refresh.mjs';
 import { applyGlobalProxyFromEnv } from './src/proxy-env.mjs';
 
 // ─── 加载环境变量 ───
@@ -55,7 +54,7 @@ for (const envFile of envCandidates) {
   }
 }
 if (!envLoaded) {
-  console.error('[!] .env.dola not found. Create it with DOLA_COOKIE=...');
+  console.error('[needs_auth] 未找到 .env.dola。请由用户手动配置 DOLA_COOKIE 和 DOLA_MS_TOKEN；API 流程不会打开浏览器。');
   process.exit(1);
 }
 
@@ -121,27 +120,9 @@ function normalizeDolaRuntimeEnv() {
 normalizeDolaRuntimeEnv();
 
 
-// DOLA_ 前缀映射到 DOUBAO_；显式浏览器态字段（含 msToken）优先于旧缓存。
-const DOLA_KEYS = ['COOKIE', 'USER_AGENT', 'DEVICE_ID', 'WEB_ID', 'TEA_UUID',
-  'WEB_TAB_ID', 'AID', 'VERSION_CODE', 'PC_VERSION', 'FP', 'MS_TOKEN'];
-for (const k of DOLA_KEYS) {
-  if (process.env[`DOLA_${k}`]) {
-    process.env[`DOUBAO_${k}`] = process.env[`DOLA_${k}`];
-  }
-}
-process.env.DOUBAO_AID = process.env.DOLA_AID || process.env.DOUBAO_AID || '495671';
-process.env.DOUBAO_VERSION_CODE = process.env.DOLA_VERSION_CODE || process.env.DOUBAO_VERSION_CODE || '20800';
-process.env.DOUBAO_PC_VERSION = process.env.DOLA_PC_VERSION || process.env.DOUBAO_PC_VERSION || DOLA_BROWSER_PC_VERSION;
-if (process.env.DOLA_MS_TOKEN) process.env.DOUBAO_MS_TOKEN = process.env.DOLA_MS_TOKEN;
-if (process.env.DOLA_DEVICE_ID) process.env.DOUBAO_DEVICE_ID = process.env.DOLA_DEVICE_ID;
-if (process.env.DOLA_WEB_ID) process.env.DOUBAO_WEB_ID = process.env.DOLA_WEB_ID;
-if (process.env.DOLA_TEA_UUID) process.env.DOUBAO_TEA_UUID = process.env.DOLA_TEA_UUID;
-if (process.env.DOLA_WEB_TAB_ID) process.env.DOUBAO_WEB_TAB_ID = process.env.DOLA_WEB_TAB_ID;
-if (process.env.DOLA_FP) process.env.DOUBAO_FP = process.env.DOLA_FP;
-if (process.env.DOLA_USER_AGENT) process.env.DOUBAO_USER_AGENT = process.env.DOLA_USER_AGENT;
-if (process.env.DOLA_MS_TOKEN) process.env.DOUBAO_MS_TOKEN = process.env.DOLA_MS_TOKEN;
+// Dola API runtime uses only DOLA_* values. No legacy credential aliases are read.
 
-// 捕获 signer VM 的异步错误
+// Capture signer VM asynchronous errors.
 process.on('uncaughtException', (err) => {
   if (err.stack?.includes('bdms-sdk')) return;
   console.error('Uncaught:', err);
@@ -154,11 +135,9 @@ import { pathToFileURL } from 'node:url';
 
 const baseDir = path.resolve(__dir);
 const clientPath = pathToFileURL(path.join(baseDir, 'src', 'client.mjs')).href;
-const bootstrapPath = pathToFileURL(path.join(baseDir, 'src', 'bootstrap.mjs')).href;
 
 const { setPlatform, ensureSignerReady, env, headersFor, buildSignedUrl,
   signedFetch, getPlatformOrigin, uuid, uuidV1 } = await import(clientPath);
-const { bootstrap } = await import(bootstrapPath);
 
 async function loadUploadImage() {
   const uploadPath = pathToFileURL(path.join(baseDir, 'src', 'upload.mjs')).href;
@@ -166,7 +145,6 @@ async function loadUploadImage() {
   return uploadImage;
 }
 
-await bootstrap({});
 setPlatform('dola');
 
 // ─── 常量 ───
@@ -181,6 +159,14 @@ class VideoGenerationFailedError extends Error {
     this.name = 'VideoGenerationFailedError';
     this.sourceText = sourceText;
   }
+}
+
+function apiAuthenticationFailureMessage(value) {
+  const text = String(value?.message || value || '');
+  if (!/\b(?:401|403)\b|\bneeds_auth\b|login_required|session_expired|not[_\s-]?login|unauthori[sz]ed|cookie[^\n]{0,40}(?:过期|失效|invalid)|(?:登录态|登录|会话)[^\n]{0,40}(?:过期|失效|无效|invalid)/i.test(text)) {
+    return '';
+  }
+  return 'Dola API 登录态无效或已过期。请由用户手动更新 DOLA_COOKIE（必要时 DOLA_MS_TOKEN）后重试；系统不会自动打开浏览器或刷新 Cookie。';
 }
 
 const VIDEO_FAILURE_TEXT_RULES = [
@@ -1008,6 +994,40 @@ async function enrichExistingConversation(conversation) {
   }
 }
 
+async function pollVideoResultFlat(conversationId) {
+  const scriptPath = path.join(baseDir, 'dola-video-poll-flat.mjs');
+  const output = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [scriptPath, conversationId], {
+      cwd: baseDir,
+      env: {
+        ...process.env,
+        DOLA_POLL_OUTPUT_MODE: 'stdout',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    const append = (current, chunk) => `${current}${chunk}`.slice(-1_000_000);
+
+    child.stdout.on('data', (chunk) => { stdout = append(stdout, chunk); });
+    child.stderr.on('data', (chunk) => { stderr = append(stderr, chunk); });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      const outputText = `${stdout}\n${stderr}`;
+      const videoUrl = outputText.match(/^videoUrl:\s*(\S+)\s*$/m)?.[1] || '';
+      const downloadUrl = outputText.match(/^unwatermarkedUrl:\s*(\S+)\s*$/m)?.[1]
+        || outputText.match(/^ciciUrl:\s*(\S+)\s*$/m)?.[1]
+        || videoUrl;
+      if (code === 0 && videoUrl) {
+        resolve({ videoUrl, downloadUrl });
+        return;
+      }
+      reject(new Error(`[flat-poll] ${outputText.trim().slice(-1000) || `退出码 ${code}`}`));
+    });
+  });
+  return output;
+}
+
 async function pollVideoResult(conversationId) {
   console.log(`\n[轮询] 等待视频生成 (最长 ${MAX_POLL_TIME_MS / 1000}s, 每 ${POLL_INTERVAL_MS / 1000}s 查一次)...`);
   const startTime = Date.now();
@@ -1025,9 +1045,13 @@ async function pollVideoResult(conversationId) {
         fixup_need: true,
       });
 
-      const statusCode = result.status_code;
-      if (statusCode && statusCode !== 0) {
-        console.log(` error: code=${statusCode} ${result.status_desc || ''}`);
+      const statusCode = Number(result?.status_code ?? result?.code ?? 0);
+      if (statusCode === 712012002) {
+        console.log(' 返回 712012002，切换到 flat API 轮询。');
+        return await pollVideoResultFlat(conversationId);
+      }
+      if (statusCode !== 0) {
+        console.log(` error: code=${statusCode} ${result.status_desc || result.msg || ''}`);
         continue;
       }
 
@@ -1049,6 +1073,7 @@ async function pollVideoResult(conversationId) {
       console.log(` 还没好 (${messages.length} msgs)`);
     } catch (e) {
       if (e instanceof VideoGenerationFailedError) throw e;
+      if (e?.code === 'needs_auth' || /\[needs_auth\]/i.test(String(e?.message || e))) throw e;
       console.log(` error: ${e.message}`);
     }
   }
@@ -1090,7 +1115,7 @@ function findEnvDola() {
   return path.join(__dir, '.env.dola');
 }
 
-// ─── 核心视频生成流程（可重试） ───
+// ─── 核心视频生成流程 ───
 
 async function runVideoGeneration({ mode, prompt, ratio, duration, model, imagePaths }) {
   await ensureSignerReady();
@@ -1105,7 +1130,7 @@ async function runVideoGeneration({ mode, prompt, ratio, duration, model, imageP
     duration: effectiveDuration,
     model,
     imagePathCount: Array.isArray(imagePaths) ? imagePaths.filter(Boolean).length : (imagePaths ? 1 : 0),
-    hasMsTokenEnv: Boolean(process.env.DOLA_MS_TOKEN || process.env.DOUBAO_MS_TOKEN),
+    hasMsTokenEnv: Boolean(process.env.DOLA_MS_TOKEN),
     pcVersion: env.PC_VERSION(),
     userAgentHeadless: /HeadlessChrome/i.test(String(process.env.DOLA_USER_AGENT || '')),
   });
@@ -1226,10 +1251,10 @@ async function runVideoGeneration({ mode, prompt, ratio, duration, model, imageP
   // 检查是否真的触发了视频生成
   const isVideoTriggered = /视频|video|Seedance|生成好后/i.test(result.fullText);
 
-  // 检测是否需要刷新 cookie（额度不足 / session 过期）
-  if (detectNeedsRefresh(result.fullText)) {
-    console.log(`\n[检测] 可能额度不足或 cookie 过期，需要刷新`);
-    return 'needs_refresh';
+  const authenticationFailure = apiAuthenticationFailureMessage(result.fullText);
+  if (authenticationFailure) {
+    console.error(`\n[认证/配置错误] ${authenticationFailure}`);
+    return false;
   }
 
   // Fallback: 如果 SSE 流中没拿到视频，尝试轮询
@@ -1359,41 +1384,17 @@ async function main() {
   console.log(`  模型: ${model}`);
   if (imagePaths) console.log(`  参考图 (${imagePaths.length}): ${imagePaths.join(', ')}`);
 
-  const MAX_RETRIES = 2;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const result = await runVideoGeneration({ mode, prompt, ratio, duration, model, imagePaths });
-
-    if (result === true) {
-      process.exit(0);
-    }
-
-    if (result === 'needs_refresh' && attempt < MAX_RETRIES) {
-      console.log(`\n[自动刷新] 尝试打开浏览器获取新 cookie (第 ${attempt + 1} 次)...`);
-      try {
-        const envFile = findEnvDola();
-        await refreshDolaCookie(envFile, {
-          headless: false,
-          proxy: PROXY_URL !== 'http://127.0.0.1:7890' ? PROXY_URL : undefined,
-          profileDir: path.join(__dir, '.doubao_browsers', 'dola-refresh-profile'),
-        });
-        // 删除缓存的 state 文件，强制 bootstrap 重新初始化
-        const stateFile = path.join(__dir, '.doubao-state.json');
-        if (fs.existsSync(stateFile)) fs.unlinkSync(stateFile);
-        console.log('[自动刷新] cookie 已更新，重新发起请求...\n');
-        continue;
-      } catch (refreshErr) {
-        console.error(`[自动刷新] 失败: ${refreshErr.message}`);
-        process.exit(1);
-      }
-    }
-
-    // result === false 或重试次数用完
-    process.exit(1);
-  }
+  const result = await runVideoGeneration({ mode, prompt, ratio, duration, model, imagePaths });
+  process.exit(result === true ? 0 : 1);
 }
 
 main().catch(e => {
-  console.error('\n[错误]', e.message);
+  const authenticationFailure = apiAuthenticationFailureMessage(e);
+  if (authenticationFailure) {
+    console.error(`\n[认证/配置错误] ${authenticationFailure}`);
+  } else {
+    console.error('\n[错误]', e.message);
+  }
   process.exit(1);
 }).finally(() => {
   if (process.argv[2] !== 'image' || process.argv[3] !== '--refs-file') return;

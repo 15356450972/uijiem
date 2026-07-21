@@ -20,7 +20,7 @@ import {
 export default function AccountManagement() {
   const [accounts, setAccounts] = useState([]);
 
-  const [showAddModal, setShowShowAddModal] = useState(false);
+  const [showAddModal, setShowAddModal] = useState(false);
   const [newAccountPlatform, setNewAccountPlatform] = useState('抖音');
   const [newAccountName, setNewAccountName] = useState('');
   const [simulatedQRStep, setSimulatedQRStep] = useState(0); // 0: input details, 1: QR scan simulation, 2: complete
@@ -142,7 +142,7 @@ export default function AccountManagement() {
       setDolaLoginError('请输入邮箱和密码');
       return;
     }
-    setShowShowAddModal(false);
+    setShowAddModal(false);
     setShowDolaLogin(true);
     setDolaLoginStep('running');
     setDolaLoginError('');
@@ -214,7 +214,7 @@ export default function AccountManagement() {
   const triggerAddAccount = () => {
     if (newAccountPlatform === 'Dola') {
       // Dola uses Google login flow, not QR scan
-      setShowShowAddModal(false);
+      setShowAddModal(false);
       setShowDolaLogin(true);
       return;
     }
@@ -239,7 +239,7 @@ export default function AccountManagement() {
       setSimulatedQRStep(2);
       setTimeout(() => {
         // Reset states
-        setShowShowAddModal(false);
+        setShowAddModal(false);
         setSimulatedQRStep(0);
         setNewAccountName('');
       }, 1000);
@@ -272,7 +272,7 @@ export default function AccountManagement() {
             取消全选
           </button>
           <button 
-            onClick={() => setShowShowAddModal(true)}
+            onClick={() => setShowAddModal(true)}
             className="flex items-center space-x-1 px-4 py-1.5 bg-brand hover:bg-brand-dark rounded-lg text-xs text-black font-bold transition-all shadow-lg shadow-brand/10"
           >
             <Plus className="w-3.5 h-3.5" />
@@ -303,7 +303,7 @@ export default function AccountManagement() {
             </div>
             <button 
               type="button"
-              onClick={() => setShowShowAddModal(true)}
+              onClick={() => setShowAddModal(true)}
               className="flex items-center space-x-1.5 px-6 py-2.5 bg-brand hover:bg-brand-dark rounded-lg text-xs text-black font-bold transition-all shadow-md shadow-brand/10 hover:scale-105"
             >
               <Plus className="w-4 h-4" />
@@ -525,7 +525,7 @@ export default function AccountManagement() {
 
                       <button
                         onClick={() => {
-                          setShowShowAddModal(false);
+                          setShowAddModal(false);
                           setShowDolaLogin(true);
                         }}
                         className="w-full flex items-center justify-center space-x-1.5 py-2.5 bg-white hover:bg-zinc-200 rounded-lg text-xs text-black font-bold transition-all shadow-md"

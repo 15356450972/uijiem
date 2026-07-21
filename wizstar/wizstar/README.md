@@ -8,7 +8,26 @@
 pip install -r requirements.txt
 ```
 
-依赖只有两个：`requests` + `pycryptodome`。
+## MySQL 配置
+
+本地 FastAPI 后端现在使用 MySQL 8.0+。复制项目根目录的示例配置并填写账号：
+
+```bash
+cp .env.example .env
+```
+
+也可通过系统环境变量传入 `WIZSTAR_MYSQL_HOST`、`WIZSTAR_MYSQL_PORT`、
+`WIZSTAR_MYSQL_DATABASE`、`WIZSTAR_MYSQL_USER` 和
+`WIZSTAR_MYSQL_PASSWORD`。打包运行时还会读取 Wizstar 数据目录中的
+`mysql.env`。数据库默认自动创建；若账号没有建库权限，请预先建库并把
+`WIZSTAR_MYSQL_AUTOCREATE_DATABASE` 设为 `0`。
+
+旧 SQLite 数据可一次性导入，源文件只读且不会被删除：
+
+```bash
+PYTHONPATH=wizstar python -m wizstar.migrate_sqlite_to_mysql \
+  --sqlite-path ~/.wizstar/wizstar.db
+```
 
 ## 包结构
 

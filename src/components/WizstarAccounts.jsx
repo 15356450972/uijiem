@@ -8,8 +8,6 @@ import {
   XCircle,
   Coins,
   ExternalLink,
-  Eye,
-  EyeOff,
   Copy,
   User,
   CheckCircle2,
@@ -21,15 +19,14 @@ import {
 } from 'lucide-react';
 import { WIZSTAR_API as API_BASE } from '../config';
 
-export default function WizstarAccounts() {
-  const [activePool, setActivePool] = useState('wizstar'); // 'wizstar' | 'quickframe' | 'oiioii' | 'dola'
+export default function WizstarAccounts({ onOpenGoogleLogin }) {
+  const [activePool, setActivePool] = useState('wizstar'); // 'wizstar' | 'quickframe' | 'oiioii' | 'dola' | 'lovart' | 'oreateai' | 'framia' | 'tensorart'
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshingId, setRefreshingId] = useState(null);
   const [batchRefreshing, setBatchRefreshing] = useState(false);
   const [error, setError] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
-  const [visiblePasswords, setVisiblePasswords] = useState({});
   const [selectedAccountId, setSelectedAccountId] = useState(null);
   const [savingConcurrencyId, setSavingConcurrencyId] = useState(null);
 
@@ -81,6 +78,7 @@ export default function WizstarAccounts() {
   const [dolaGrabAccountId, setDolaGrabAccountId] = useState(0);
   const [dolaImportName, setDolaImportName] = useState('');
   const [dolaImportCookie, setDolaImportCookie] = useState('');
+  const [dolaImportMsToken, setDolaImportMsToken] = useState('');
   const [dolaImportEnvFile, setDolaImportEnvFile] = useState('');
   const [dolaImportProfileDir, setDolaImportProfileDir] = useState('');
   const [dolaImportNote, setDolaImportNote] = useState('');
@@ -89,9 +87,58 @@ export default function WizstarAccounts() {
   const [showDolaBatchLogin, setShowDolaBatchLogin] = useState(false);
   const [dolaBatchText, setDolaBatchText] = useState('');
   const [dolaBatchConcurrency, setDolaBatchConcurrency] = useState(2);
+  const [dolaPoolCount, setDolaPoolCount] = useState(1);
   const [dolaBatchStep, setDolaBatchStep] = useState('idle');
   const [dolaBatchResults, setDolaBatchResults] = useState({});
   const [dolaBatchSummary, setDolaBatchSummary] = useState(null);
+
+  // ---- Lovart 渠道七账号池状态 ----
+  const [lovartAccounts, setLovartAccounts] = useState([]);
+  const [lovartLoading, setLovartLoading] = useState(false);
+  const [lovartDeletingAll, setLovartDeletingAll] = useState(false);
+  const [showLovartBatchLogin, setShowLovartBatchLogin] = useState(false);
+  const [lovartBatchText, setLovartBatchText] = useState('');
+  const [lovartBatchConcurrency, setLovartBatchConcurrency] = useState(1);
+  const [lovartPoolCount, setLovartPoolCount] = useState(1);
+  const [lovartBatchVisible, setLovartBatchVisible] = useState(true);
+  const [lovartBatchStep, setLovartBatchStep] = useState('idle');
+  const [lovartBatchResults, setLovartBatchResults] = useState({});
+  const [lovartBatchSummary, setLovartBatchSummary] = useState(null);
+
+  // ---- OreateAI 渠道八账号池状态 ----
+  const [oreateaiAccounts, setOreateaiAccounts] = useState([]);
+  const [oreateaiLoading, setOreateaiLoading] = useState(false);
+  const [oreateaiRegistering, setOreateaiRegistering] = useState(false);
+  const [oreateaiProgress, setOreateaiProgress] = useState('');
+  const [showOreateaiRegister, setShowOreateaiRegister] = useState(false);
+  const [oreateaiRegCount, setOreateaiRegCount] = useState(1);
+  const [oreateaiRegConcurrency, setOreateaiRegConcurrency] = useState(1);
+  const [oreateaiCaptureOpeningId, setOreateaiCaptureOpeningId] = useState(null);
+  const [oreateaiCredits, setOreateaiCredits] = useState({});
+  const [oreateaiClaimingAll, setOreateaiClaimingAll] = useState(false);
+  const [oreateaiClaimAllProgress, setOreateaiClaimAllProgress] = useState('');
+
+  // ---- Framia 渠道九账号池状态 ----
+  const [framiaAccounts, setFramiaAccounts] = useState([]);
+  const [framiaLoading, setFramiaLoading] = useState(false);
+  const [framiaRefreshingId, setFramiaRefreshingId] = useState(null);
+  const [showFramiaBatchLogin, setShowFramiaBatchLogin] = useState(false);
+  const [framiaBatchText, setFramiaBatchText] = useState('');
+  const [framiaBatchVisible, setFramiaBatchVisible] = useState(true);
+  const [framiaBatchConcurrency, setFramiaBatchConcurrency] = useState(1);
+  const [framiaPoolCount, setFramiaPoolCount] = useState(1);
+  const [framiaBatchStep, setFramiaBatchStep] = useState('idle');
+  const [framiaBatchResults, setFramiaBatchResults] = useState({});
+  const [framiaBatchSummary, setFramiaBatchSummary] = useState(null);
+
+  // ---- Tensor.Art 渠道十账号池状态 ----
+  const [tensorartAccounts, setTensorartAccounts] = useState([]);
+  const [tensorartLoading, setTensorartLoading] = useState(false);
+  const [tensorartRegistering, setTensorartRegistering] = useState(false);
+  const [tensorartRefreshingId, setTensorartRefreshingId] = useState(null);
+  const [showTensorartRegister, setShowTensorartRegister] = useState(false);
+  const [tensorartRegCount, setTensorartRegCount] = useState(1);
+  const [tensorartRegConcurrency, setTensorartRegConcurrency] = useState(1);
 
   const fetchAccounts = async () => {
     try {
@@ -392,9 +439,14 @@ export default function WizstarAccounts() {
     e?.preventDefault?.();
     const name = dolaImportName.trim();
     const cookie = dolaImportCookie.trim();
+    const ms_token = dolaImportMsToken.trim();
     const env_file = dolaImportEnvFile.trim();
     const profile_dir = dolaImportProfileDir.trim();
     const note = dolaImportNote.trim();
+    if (!ms_token) {
+      setError('请填写用户显式提供的 DOLA_MS_TOKEN；不能仅凭 Cookie 导入渠道六账号。');
+      return;
+    }
     if (!cookie && !env_file && !profile_dir) {
       setError('请至少填写 Cookie、登录态文件或 profile 目录');
       return;
@@ -406,7 +458,7 @@ export default function WizstarAccounts() {
       const res = await fetch(`${API_BASE}/dola/accounts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, cookie, env_file, profile_dir, note }),
+        body: JSON.stringify({ name, cookie, ms_token, env_file, profile_dir, note }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -418,6 +470,7 @@ export default function WizstarAccounts() {
       setShowDolaImport(false);
       setDolaImportName('');
       setDolaImportCookie('');
+      setDolaImportMsToken('');
       setDolaImportEnvFile('');
       setDolaImportProfileDir('');
       setDolaImportNote('');
@@ -563,16 +616,19 @@ export default function WizstarAccounts() {
     return unsubscribe;
   }, []);
 
-  const handleDolaBatchLogin = async () => {
+  const handleDolaBatchLogin = async (useMailboxPool = false) => {
     const lines = dolaBatchText.trim().split('\n').filter(l => l.trim());
     const accounts = lines.map(line => {
       const [email, password] = line.trim().split('|');
       return { email: (email || '').trim(), password: (password || '').trim() };
     }).filter(a => a.email && a.password);
-    if (accounts.length === 0) {
+    if (!useMailboxPool && accounts.length === 0) {
       setError('请输入有效的账号密码，每行一个，格式: email|password');
       return;
     }
+    const requestedCount = useMailboxPool
+      ? Math.max(1, Math.min(parseInt(dolaPoolCount, 10) || 1, 100))
+      : accounts.length;
     setDolaBatchStep('running');
     setDolaBatchResults({});
     setDolaBatchSummary(null);
@@ -584,10 +640,12 @@ export default function WizstarAccounts() {
       }
       const result = await window.electronAPI.dolaBatchLogin({
         accounts,
+        useMailboxPool,
+        count: requestedCount,
         concurrency: dolaBatchConcurrency,
       });
       if (result?.ok) {
-        setDolaBatchSummary({ succeeded: result.succeeded, failed: result.failed, total: accounts.length });
+        setDolaBatchSummary({ succeeded: result.succeeded, failed: result.failed, total: result.results?.length || requestedCount });
         setDolaBatchStep('done');
         setSuccessMsg(`批量登录完成：成功 ${result.succeeded}，失败 ${result.failed}`);
         fetchDolaAccounts();
@@ -601,6 +659,637 @@ export default function WizstarAccounts() {
     }
   };
 
+  const fetchLovartAccounts = async () => {
+    try {
+      setLovartLoading(true);
+      const res = await fetch(`${API_BASE}/lovart/accounts`);
+      const data = await res.json();
+      setLovartAccounts(data.data || []);
+      setError('');
+    } catch (e) {
+      setError('无法连接到渠道七服务，请确认 Python 服务已启动');
+    } finally {
+      setLovartLoading(false);
+    }
+  };
+
+  const handleLovartDeleteAll = async () => {
+    if (lovartAccounts.length === 0) return;
+    if (!confirm(`确定删除全部 ${lovartAccounts.length} 个渠道七 Lovart 账号？`)) return;
+    setLovartDeletingAll(true);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/lovart/accounts`, { method: 'DELETE' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || '清空失败');
+      }
+      const result = await res.json();
+      const deleted = result.data?.deleted ?? lovartAccounts.length;
+      setSuccessMsg(`已删除 ${deleted} 个渠道七账号`);
+      fetchLovartAccounts();
+    } catch (e) {
+      setError(e.message || '清空失败');
+    } finally {
+      setLovartDeletingAll(false);
+    }
+  };
+
+  const handleLovartDelete = async (id) => {
+    if (!confirm('确定删除该渠道七 Lovart 账号？')) return;
+    try {
+      const res = await fetch(`${API_BASE}/lovart/accounts/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || '删除失败');
+      }
+      setSuccessMsg('渠道七账号已删除');
+      fetchLovartAccounts();
+    } catch (e) {
+      setError(e.message || '删除失败');
+    }
+  };
+
+  useEffect(() => {
+    if (!window.electronAPI?.onLovartBatchProgress) return;
+    const unsubscribe = window.electronAPI.onLovartBatchProgress((data) => {
+      if (data?.step === 'batch_complete') {
+        setLovartBatchSummary(data.data);
+        setLovartBatchStep('done');
+        fetchLovartAccounts();
+        return;
+      }
+      if (data?.index !== undefined) {
+        setLovartBatchResults(prev => ({
+          ...prev,
+          [data.index]: {
+            email: data.email,
+            step: data.step,
+            ok: data.step === 'saved_to_db' ? data.data?.ok : prev[data.index]?.ok,
+          }
+        }));
+      }
+    });
+    return unsubscribe;
+  }, []);
+
+  const handleLovartBatchLogin = async (useMailboxPool = false) => {
+    const lines = lovartBatchText.trim().split('\n').filter(l => l.trim());
+    const accounts = lines.map(line => {
+      const [email, password] = line.trim().split('|');
+      return { email: (email || '').trim(), password: (password || '').trim() };
+    }).filter(a => a.email && a.password);
+    if (!useMailboxPool && accounts.length === 0) {
+      setError('请输入有效的 Lovart Google 账号密码，每行一个，格式: email|password');
+      return;
+    }
+    const requestedCount = useMailboxPool
+      ? Math.max(1, Math.min(parseInt(lovartPoolCount, 10) || 1, 100))
+      : accounts.length;
+    setLovartBatchStep('running');
+    setLovartBatchResults({});
+    setLovartBatchSummary(null);
+    setError('');
+    setSuccessMsg('');
+    try {
+      if (!window.electronAPI?.lovartBatchLogin) {
+        throw new Error('Electron 环境不可用，请确保在 Electron 应用中运行，并重启应用以加载新的 preload。');
+      }
+      const result = await window.electronAPI.lovartBatchLogin({
+        accounts,
+        useMailboxPool,
+        count: requestedCount,
+        concurrency: lovartBatchConcurrency,
+        visible: lovartBatchVisible,
+      });
+      if (result?.ok) {
+        setLovartBatchSummary({ succeeded: result.succeeded, failed: result.failed, total: result.results?.length || requestedCount });
+        setLovartBatchStep('done');
+        setSuccessMsg(`渠道七 Lovart 批量登录完成：成功 ${result.succeeded}，失败 ${result.failed}`);
+        fetchLovartAccounts();
+      } else {
+        setLovartBatchStep('idle');
+        setError(result?.error || '渠道七 Lovart 批量登录失败');
+      }
+    } catch (e) {
+      setLovartBatchStep('idle');
+      setError(e.message || String(e));
+    }
+  };
+
+  const fetchOreateaiAccounts = async () => {
+    try {
+      setOreateaiLoading(true);
+      const res = await fetch(`${API_BASE}/oreateai/accounts`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setOreateaiAccounts(data.data || []);
+      setError('');
+    } catch (e) {
+      setError(e.message || '无法连接到渠道八服务，请确认 Python 服务已启动');
+    } finally {
+      setOreateaiLoading(false);
+    }
+  };
+
+  const handleOreateaiRegister = async (event) => {
+    event?.preventDefault();
+    if (!window.electronAPI?.oreateaiRegisterLogin) {
+      setError('请在 Electron 桌面端中使用渠道八注册');
+      return;
+    }
+    setOreateaiRegistering(true);
+    setOreateaiProgress('正在准备注册...');
+    setError('');
+    setSuccessMsg('');
+    try {
+      const count = Math.max(1, Math.min(parseInt(oreateaiRegCount, 10) || 1, 50));
+      const concurrency = Math.max(1, Math.min(parseInt(oreateaiRegConcurrency, 10) || 1, 5, count));
+      const result = await window.electronAPI.oreateaiRegisterLogin({
+        visible: true,
+        keepOpen: false,
+        count,
+        concurrency,
+      });
+      if (!result?.ok) throw new Error(result?.error || '渠道八注册登录失败');
+      if (count === 1) {
+        const single = result.results?.[0] || result;
+        if (!single?.ok) throw new Error(single?.error || '渠道八注册登录失败');
+        setSuccessMsg(`渠道八注册成功：${single.email}，已保存 ${single.cookieCount} 个 Cookie`);
+      } else {
+        setSuccessMsg(`渠道八批量注册完成：成功 ${result.succeeded || 0} 个，失败 ${result.failed || 0} 个`);
+        const failures = (result.results || []).filter(item => !item?.ok);
+        if (failures.length > 0) {
+          setError(failures.map(item => `${item.email || `#${(item.index ?? 0) + 1}`}: ${item.error || '注册失败'}`).join('\n'));
+        }
+      }
+      setShowOreateaiRegister(false);
+      await fetchOreateaiAccounts();
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setOreateaiRegistering(false);
+      setOreateaiProgress('');
+    }
+  };
+
+  useEffect(() => {
+    if (!window.electronAPI?.onOreateaiLoginProgress) return undefined;
+    const labels = {
+      mailbox_connecting: '正在连接小苹果邮件 API...',
+      browser_opening: '正在启动真实浏览器...',
+      ticket_request: '正在获取注册票据...',
+      risk_request: '正在生成风控凭证...',
+      signup_submit: '正在提交注册...',
+      email_wait: '正在等待验证邮件...',
+      email_verify: '正在验证邮箱...',
+      login_check: '正在确认登录状态...',
+      complete: '登录成功，正在保存账号...',
+    };
+    return window.electronAPI.onOreateaiLoginProgress(({ step, index, total, completed, succeeded, failed }) => {
+      if (step === 'batch_progress' || step === 'batch_complete') {
+        setOreateaiProgress(`已完成 ${completed || 0}/${total || 0}，成功 ${succeeded || 0}，失败 ${failed || 0}`);
+        return;
+      }
+      const prefix = Number.isInteger(index) && total > 1 ? `[任务 ${index + 1}/${total}] ` : '';
+      setOreateaiProgress(`${prefix}${labels[step] || step || ''}`);
+    });
+  }, []);
+
+  const handleOreateaiCapture = async (accountId) => {
+    if (!window.electronAPI?.oreateaiOpenCapture) {
+      setError('Electron 录制入口不可用，请重启桌面应用');
+      return;
+    }
+    setOreateaiCaptureOpeningId(accountId);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const result = await window.electronAPI.oreateaiOpenCapture(accountId);
+      if (!result?.ok) throw new Error(result?.error || '打开渠道八操作记录窗口失败');
+      setSuccessMsg('操作记录窗口已打开。请在新窗口中完成一次视频生成，操作结束后直接关闭该窗口。');
+    } catch (captureError) {
+      setError(captureError.message || String(captureError));
+    } finally {
+      setOreateaiCaptureOpeningId(null);
+    }
+  };
+
+  const requestOreateaiCredits = async (accountId, claim = false, { silent = false } = {}) => {
+    const flag = claim ? 'claiming' : 'loading';
+    setOreateaiCredits((current) => ({
+      ...current,
+      [accountId]: { ...current[accountId], [flag]: true, error: '' },
+    }));
+    if (!silent) {
+      setError('');
+      if (claim) setSuccessMsg('');
+    }
+    try {
+      const res = await fetch(
+        `${API_BASE}/oreateai/accounts/${accountId}/credits${claim ? '/claim' : ''}`,
+        { method: claim ? 'POST' : 'GET' },
+      );
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || `${claim ? '领取' : '查询'}积分失败`);
+      const data = payload.data || {};
+      setOreateaiCredits((current) => ({
+        ...current,
+        [accountId]: {
+          ...current[accountId],
+          ...data,
+          loading: false,
+          claiming: Boolean(claim && data.pending),
+          error: '',
+        },
+      }));
+      if (!claim) return { status: 'queried', ...data };
+      if (data.claimed) {
+        if (!silent) setSuccessMsg(`渠道八领取成功：+${data.claimed_points || 0} 积分，当前 ${data.rest_points || 0} 积分`);
+        return { status: 'claimed', ...data };
+      }
+      if (!data.pending) {
+        if (!silent) setSuccessMsg(`该渠道八账号当前没有待领取积分，当前 ${data.rest_points || 0} 积分`);
+        return { status: 'already_claimed', ...data };
+      }
+
+      const beforePoints = Number(data.before_points || data.rest_points || 0);
+      if (!silent) setSuccessMsg('领取请求已提交，OreateAI 正在异步入账...');
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        try {
+          const checkRes = await fetch(`${API_BASE}/oreateai/accounts/${accountId}/credits`);
+          const checkPayload = await checkRes.json().catch(() => ({}));
+          if (!checkRes.ok) continue;
+          const latest = checkPayload.data || {};
+          const claimedPoints = Math.max(0, Number(latest.rest_points || 0) - beforePoints);
+          setOreateaiCredits((current) => ({
+            ...current,
+            [accountId]: {
+              ...current[accountId],
+              ...latest,
+              claiming: claimedPoints === 0,
+              error: '',
+            },
+          }));
+          if (claimedPoints > 0) {
+            if (!silent) setSuccessMsg(`渠道八领取成功：+${claimedPoints} 积分，当前 ${latest.rest_points || 0} 积分`);
+            return { status: 'claimed', claimed_points: claimedPoints, ...latest };
+          }
+        } catch {
+          // 远端偶发超时，下一轮继续查询入账结果。
+        }
+      }
+      setOreateaiCredits((current) => ({
+        ...current,
+        [accountId]: { ...current[accountId], claiming: false },
+      }));
+      if (!silent) setSuccessMsg('领取请求已提交，但积分到账较慢；稍后点击「查询积分」确认。');
+      return { status: 'pending', ...data };
+    } catch (requestError) {
+      const message = requestError.message || String(requestError);
+      setOreateaiCredits((current) => ({
+        ...current,
+        [accountId]: {
+          ...current[accountId],
+          loading: false,
+          claiming: false,
+          error: message,
+        },
+      }));
+      if (!silent) setError(message);
+      return { status: 'failed', error: message };
+    }
+  };
+
+  const handleOreateaiClaimAll = async () => {
+    const accountsToClaim = oreateaiAccounts.filter(
+      (account) => account.configured && account.status !== 'disabled',
+    );
+    if (accountsToClaim.length === 0) {
+      setError('没有可领取积分的渠道八账号');
+      return;
+    }
+    setOreateaiClaimingAll(true);
+    setOreateaiClaimAllProgress(`0/${accountsToClaim.length}`);
+    setError('');
+    setSuccessMsg('');
+    const results = new Array(accountsToClaim.length);
+    let cursor = 0;
+    let completed = 0;
+    try {
+      const worker = async () => {
+        while (cursor < accountsToClaim.length) {
+          const index = cursor;
+          cursor += 1;
+          const account = accountsToClaim[index];
+          results[index] = {
+            account,
+            result: await requestOreateaiCredits(account.id, true, { silent: true }),
+          };
+          completed += 1;
+          setOreateaiClaimAllProgress(`${completed}/${accountsToClaim.length}`);
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(2, accountsToClaim.length) }, () => worker()),
+      );
+      const claimed = results.filter((item) => item?.result?.status === 'claimed').length;
+      const alreadyClaimed = results.filter((item) => item?.result?.status === 'already_claimed').length;
+      const pending = results.filter((item) => item?.result?.status === 'pending').length;
+      const failed = results.filter((item) => item?.result?.status === 'failed');
+      setSuccessMsg(
+        `渠道八一键领取完成：到账 ${claimed}，已领取 ${alreadyClaimed}，待到账 ${pending}，失败 ${failed.length}`,
+      );
+      if (failed.length > 0) {
+        setError(failed.map(({ account, result }) => `${account.email || account.id}: ${result.error}`).join('\n'));
+      }
+    } finally {
+      setOreateaiClaimingAll(false);
+      setOreateaiClaimAllProgress('');
+    }
+  };
+
+  useEffect(() => {
+    if (!window.electronAPI?.onOreateaiCaptureProgress) return undefined;
+    return window.electronAPI.onOreateaiCaptureProgress(({ step, data = {} }) => {
+      if (step === 'capture_finished') {
+        setSuccessMsg(`渠道八操作记录完成：共捕获 ${data.requestCount || 0} 个接口请求。记录文件：${data.networkPath || ''}`);
+      } else if (step === 'capture_failed') {
+        setError(data.error || '渠道八操作记录失败');
+      }
+    });
+  }, []);
+
+  const handleOreateaiDelete = async (id) => {
+    if (!confirm('确定删除该渠道八 OreateAI 账号？')) return;
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/oreateai/accounts/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || '删除失败');
+      }
+      setSuccessMsg('渠道八账号已删除');
+      fetchOreateaiAccounts();
+    } catch (e) {
+      setError(e.message || '删除失败');
+    }
+  };
+
+  const fetchFramiaAccounts = async () => {
+    try {
+      setFramiaLoading(true);
+      const res = await fetch(`${API_BASE}/framia/accounts`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      setFramiaAccounts(data.data || []);
+      setError('');
+    } catch (e) {
+      setError(e.message || '无法连接到渠道九服务，请确认 Python 服务已启动');
+    } finally {
+      setFramiaLoading(false);
+    }
+  };
+
+  const handleFramiaDelete = async (id) => {
+    if (!confirm('确定删除该渠道九 Framia 账号？')) return;
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/framia/accounts/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || '删除失败');
+      }
+      setSuccessMsg('渠道九账号已删除');
+      fetchFramiaAccounts();
+    } catch (e) {
+      setError(e.message || '删除失败');
+    }
+  };
+
+  const handleFramiaRefreshCredits = async (id) => {
+    setFramiaRefreshingId(id);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/framia/credits?account_id=${id}`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || '查询积分失败');
+      }
+      const data = await res.json();
+      const credits = data.data || {};
+      setFramiaAccounts(prev => prev.map(a => a.id === id ? { ...a, credits_balance: credits.credits_balance } : a));
+      setSuccessMsg(`渠道九积分：${credits.credits_balance ?? '-'}`);
+    } catch (e) {
+      setError(e.message || '查询积分失败');
+    } finally {
+      setFramiaRefreshingId(null);
+    }
+  };
+
+  const handleFramiaBatchLogin = async () => {
+    const lines = framiaBatchText.trim().split('\n').filter(l => l.trim());
+    const accounts = lines.map(line => {
+      const [email, password] = line.trim().split('|');
+      return { email: (email || '').trim(), password: (password || '').trim() };
+    }).filter(a => a.email && a.password);
+    if (accounts.length === 0) {
+      setError('请输入有效的 Framia Google 账号密码，每行一个，格式: email|password');
+      return;
+    }
+    const concurrency = Math.max(1, Math.min(parseInt(framiaBatchConcurrency, 10) || 1, 5, accounts.length));
+    setFramiaBatchStep('running');
+    setFramiaBatchResults({});
+    setFramiaBatchSummary(null);
+    setError('');
+    setSuccessMsg('');
+    let succeeded = 0;
+    let failed = 0;
+    let cursor = 0;
+    const runOne = async (i) => {
+      const { email, password } = accounts[i];
+      setFramiaBatchResults(prev => ({ ...prev, [i]: { email, ok: null, step: 'starting' } }));
+      try {
+        const res = await fetch(`${API_BASE}/framia/accounts/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password, visible: framiaBatchVisible, keep_open: false }),
+        });
+        const responseText = await res.text();
+        let data = {};
+        try {
+          data = responseText ? JSON.parse(responseText) : {};
+        } catch {
+          data = { detail: responseText };
+        }
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        succeeded++;
+        setFramiaBatchResults(prev => ({ ...prev, [i]: { email, ok: true, step: 'saved_to_db' } }));
+      } catch (e) {
+        failed++;
+        setFramiaBatchResults(prev => ({ ...prev, [i]: { email, ok: false, step: 'error', error: e.message } }));
+      }
+    };
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= accounts.length) break;
+        await runOne(i);
+      }
+    });
+    await Promise.all(workers);
+    setFramiaBatchSummary({ succeeded, failed, total: accounts.length });
+    setFramiaBatchStep('done');
+    if (succeeded > 0) {
+      setSuccessMsg(`渠道九 Framia 批量登录完成：成功 ${succeeded}，失败 ${failed}`);
+      fetchFramiaAccounts();
+    } else {
+      setError('渠道九 Framia 批量登录全部失败，请查看下方每个账号的失败原因。');
+    }
+  };
+
+  const handleFramiaPoolLogin = async () => {
+    const count = Math.max(1, Math.min(parseInt(framiaPoolCount, 10) || 1, 100));
+    const concurrency = Math.max(1, Math.min(parseInt(framiaBatchConcurrency, 10) || 1, 5, count));
+    setFramiaBatchStep('running');
+    setFramiaBatchResults({});
+    setFramiaBatchSummary(null);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/framia/accounts/login-pool`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          count,
+          concurrency,
+          visible: framiaBatchVisible,
+          keep_open: false,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || `HTTP ${res.status}`);
+      const result = payload.data || {};
+      const items = Array.isArray(result.results) ? result.results : [];
+      setFramiaBatchResults(Object.fromEntries(items.map((item, index) => [
+        index,
+        {
+          email: item.email,
+          ok: Boolean(item.ok),
+          step: item.ok ? 'saved_to_db' : 'error',
+          error: item.error || '',
+        },
+      ])));
+      setFramiaBatchSummary({
+        succeeded: result.succeeded || 0,
+        failed: result.failed || 0,
+        total: result.total || items.length,
+      });
+      setFramiaBatchStep('done');
+      if (result.succeeded > 0) {
+        setSuccessMsg(`渠道九从邮箱库登录完成：成功 ${result.succeeded}，失败 ${result.failed || 0}`);
+        fetchFramiaAccounts();
+      } else {
+        setError('渠道九邮箱库账号登录全部失败，请查看失败原因。');
+      }
+    } catch (e) {
+      setFramiaBatchStep('idle');
+      setError(e.message || String(e));
+    }
+  };
+
+  const fetchTensorartAccounts = async () => {
+    try {
+      setTensorartLoading(true);
+      const res = await fetch(`${API_BASE}/tensorart/accounts`);
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || `HTTP ${res.status}`);
+      setTensorartAccounts(payload.data || []);
+      setError('');
+    } catch (e) {
+      setError(e.message || '无法连接到渠道十服务，请确认 Python 服务已启动');
+    } finally {
+      setTensorartLoading(false);
+    }
+  };
+
+  const handleTensorartRegister = async () => {
+    setTensorartRegistering(true);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/tensorart/accounts/register-pool`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          count: Math.max(1, Math.min(parseInt(tensorartRegCount, 10) || 1, 100)),
+          concurrency: Math.max(1, Math.min(parseInt(tensorartRegConcurrency, 10) || 1, 3)),
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || `HTTP ${res.status}`);
+      const result = payload.data || {};
+      if (!result.succeeded) {
+        const firstError = (result.results || []).find(item => !item.ok)?.error;
+        throw new Error(firstError || '渠道十注册失败');
+      }
+      setSuccessMsg(`渠道十注册完成：成功 ${result.succeeded}，失败 ${result.failed || 0}`);
+      setShowTensorartRegister(false);
+      await fetchTensorartAccounts();
+    } catch (e) {
+      setError(e.message || '渠道十注册失败');
+    } finally {
+      setTensorartRegistering(false);
+    }
+  };
+
+  const handleTensorartDelete = async (id) => {
+    if (!confirm('确定删除该渠道十 Tensor.Art 账号？')) return;
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/tensorart/accounts/${id}`, { method: 'DELETE' });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || '删除失败');
+      setSuccessMsg('渠道十账号已删除');
+      await fetchTensorartAccounts();
+    } catch (e) {
+      setError(e.message || '删除失败');
+    }
+  };
+
+  const handleTensorartRefreshEnergy = async (id) => {
+    setTensorartRefreshingId(id);
+    setError('');
+    try {
+      const res = await fetch(`${API_BASE}/tensorart/energy?account_id=${id}`);
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || '查询能量失败');
+      const energy = payload.data || {};
+      setTensorartAccounts(prev => prev.map(account => (
+        account.id === id
+          ? { ...account, total_balance: energy.total_balance }
+          : account
+      )));
+      setSuccessMsg(`渠道十能量：${energy.total_balance ?? '-'}`);
+    } catch (e) {
+      setError(e.message || '查询能量失败');
+    } finally {
+      setTensorartRefreshingId(null);
+    }
+  };
+
   useEffect(() => {
     if (activePool === 'quickframe') {
       fetchQfAccounts();
@@ -611,6 +1300,18 @@ export default function WizstarAccounts() {
     }
     if (activePool === 'dola') {
       fetchDolaAccounts();
+    }
+    if (activePool === 'lovart') {
+      fetchLovartAccounts();
+    }
+    if (activePool === 'oreateai') {
+      fetchOreateaiAccounts();
+    }
+    if (activePool === 'framia') {
+      fetchFramiaAccounts();
+    }
+    if (activePool === 'tensorart') {
+      fetchTensorartAccounts();
     }
   }, [activePool]);
 
@@ -687,7 +1388,13 @@ export default function WizstarAccounts() {
       }
       const result = await res.json();
       const { success, failed } = result.data;
-      setSuccessMsg(`积分刷新完成：成功 ${success.length} 个，失败 ${failed.length} 个`);
+      const expired = failed.filter((item) => item.status === 'auth_expired').length;
+      const forbidden = failed.filter((item) => item.status === 'forbidden').length;
+      const suffix = [
+        expired ? `${expired} 个登录失效` : '',
+        forbidden ? `${forbidden} 个账号受限` : '',
+      ].filter(Boolean).join('，');
+      setSuccessMsg(`积分刷新完成：成功 ${success.length} 个，失败 ${failed.length} 个${suffix ? `（${suffix}）` : ''}`);
       fetchAccounts();
     } catch (e) {
       setError(e.message);
@@ -708,16 +1415,27 @@ export default function WizstarAccounts() {
 
   const handleRefresh = async (id) => {
     setRefreshingId(id);
+    setError('');
     try {
       const res = await fetch(`${API_BASE}/accounts/${id}/refresh`, { method: 'POST' });
+      const payload = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || '刷新失败');
+        const detail = payload.detail;
+        const message = typeof detail === 'object' ? detail?.message : detail;
+        const status = typeof detail === 'object' ? detail?.status : '';
+        if (status === 'auth_expired') {
+          throw new Error('登录态已失效，请到邮箱库点击“重新登录”');
+        }
+        if (status === 'forbidden') {
+          throw new Error('该账号已被渠道一限制，请更换账号或稍后重试');
+        }
+        throw new Error(message || '刷新失败');
       }
-      fetchAccounts();
+      setSuccessMsg('登录态有效，积分已更新');
     } catch (e) {
       setError(e.message);
     } finally {
+      await fetchAccounts();
       setRefreshingId(null);
     }
   };
@@ -775,10 +1493,6 @@ export default function WizstarAccounts() {
     }
   };
 
-  const togglePasswordVisible = (id) => {
-    setVisiblePasswords(prev => ({ ...prev, [id]: !prev[id] }));
-  };
-
   const formatDate = (timestamp) => {
     if (!timestamp) return '-';
     const d = new Date(timestamp * 1000);
@@ -820,11 +1534,44 @@ export default function WizstarAccounts() {
             >
               渠道六
             </button>
+            <button
+              onClick={() => setActivePool('lovart')}
+              className={`px-3 py-1 text-xs font-medium transition-all ${activePool === 'lovart' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+            >
+              渠道七
+            </button>
+            <button
+              onClick={() => setActivePool('oreateai')}
+              className={`px-3 py-1 text-xs font-medium transition-all ${activePool === 'oreateai' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+            >
+              渠道八
+            </button>
+            <button
+              onClick={() => setActivePool('framia')}
+              className={`px-3 py-1 text-xs font-medium transition-all ${activePool === 'framia' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+            >
+              渠道九
+            </button>
+            <button
+              onClick={() => setActivePool('tensorart')}
+              className={`px-3 py-1 text-xs font-medium transition-all ${activePool === 'tensorart' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+            >
+              渠道十
+            </button>
           </div>
         </div>
         <div className="flex items-center gap-2">
           {activePool === 'wizstar' ? (
             <>
+              <button
+                onClick={onOpenGoogleLogin}
+                disabled={!onOpenGoogleLogin}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-500/10 text-blue-300 text-sm font-medium hover:bg-blue-500/20 disabled:opacity-50 transition-colors"
+                title="添加账号或重新获取 Google 登录态"
+              >
+                <Mail className="w-4 h-4" />
+                Google 登录
+              </button>
               <button
                 onClick={handleBatchRefresh}
                 disabled={batchRefreshing || accounts.length === 0}
@@ -905,7 +1652,7 @@ export default function WizstarAccounts() {
                 <RefreshCw className="w-4 h-4" />
               </button>
             </>
-          ) : (
+          ) : activePool === 'dola' ? (
             <>
               <button
                 onClick={() => setShowDolaBatchLogin(prev => !prev)}
@@ -947,6 +1694,99 @@ export default function WizstarAccounts() {
                 <RefreshCw className="w-4 h-4" />
               </button>
             </>
+          ) : activePool === 'lovart' ? (
+            <>
+              <button
+                onClick={() => setShowLovartBatchLogin(prev => !prev)}
+                disabled={lovartDeletingAll || lovartBatchStep === 'running'}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-500/10 text-blue-300 text-sm font-medium hover:bg-blue-500/20 disabled:opacity-50 transition-colors"
+              >
+                {lovartBatchStep === 'running' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mail className="w-4 h-4" />}
+                Google 批量登录
+              </button>
+              <button
+                onClick={handleLovartDeleteAll}
+                disabled={lovartDeletingAll || lovartAccounts.length === 0 || lovartBatchStep === 'running'}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-500/10 text-red-300 text-sm font-medium hover:bg-red-500/20 disabled:opacity-50 transition-colors"
+              >
+                {lovartDeletingAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                一键清空
+              </button>
+              <button
+                onClick={fetchLovartAccounts}
+                className="p-2 rounded-lg text-dark-muted hover:text-white hover:bg-dark-card/50 transition-colors"
+                title="刷新"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
+            </>
+          ) : activePool === 'framia' ? (
+            <>
+              <button
+                onClick={() => setShowFramiaBatchLogin(prev => !prev)}
+                disabled={framiaBatchStep === 'running'}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-500/10 text-purple-300 text-sm font-medium hover:bg-purple-500/20 disabled:opacity-50 transition-colors"
+              >
+                {framiaBatchStep === 'running' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mail className="w-4 h-4" />}
+                Google 批量登录
+              </button>
+              <button
+                onClick={fetchFramiaAccounts}
+                disabled={framiaLoading || framiaBatchStep === 'running'}
+                className="p-2 rounded-lg text-dark-muted hover:text-white hover:bg-dark-card/50 disabled:opacity-50 transition-colors"
+                title="刷新渠道九账号"
+              >
+                <RefreshCw className={`w-4 h-4 ${framiaLoading ? 'animate-spin' : ''}`} />
+              </button>
+            </>
+          ) : activePool === 'tensorart' ? (
+            <>
+              <button
+                onClick={() => setShowTensorartRegister(prev => !prev)}
+                disabled={tensorartRegistering}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-500/10 text-violet-300 text-sm font-medium hover:bg-violet-500/20 disabled:opacity-50 transition-colors"
+              >
+                {tensorartRegistering ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                {tensorartRegistering ? '注册中' : '邮箱库注册'}
+              </button>
+              <button
+                onClick={fetchTensorartAccounts}
+                disabled={tensorartLoading || tensorartRegistering}
+                className="p-2 rounded-lg text-dark-muted hover:text-white hover:bg-dark-card/50 disabled:opacity-50 transition-colors"
+                title="刷新渠道十账号"
+              >
+                <RefreshCw className={`w-4 h-4 ${tensorartLoading ? 'animate-spin' : ''}`} />
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={handleOreateaiClaimAll}
+                disabled={oreateaiClaimingAll || oreateaiRegistering || oreateaiAccounts.length === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/10 text-amber-300 text-sm font-medium hover:bg-amber-500/20 disabled:opacity-50 transition-colors"
+                title="并发两个账号领取积分，并等待异步到账"
+              >
+                {oreateaiClaimingAll ? <Loader2 className="w-4 h-4 animate-spin" /> : <Coins className="w-4 h-4" />}
+                {oreateaiClaimingAll ? `领取中 ${oreateaiClaimAllProgress}` : '一键领取积分'}
+              </button>
+              <button
+                onClick={() => setShowOreateaiRegister(prev => !prev)}
+                disabled={oreateaiRegistering || oreateaiClaimingAll}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-green-500/10 text-green-400 text-sm font-medium hover:bg-green-500/20 disabled:opacity-50 transition-colors"
+                title="使用真实 Chromium 注册渠道八账号"
+              >
+                {oreateaiRegistering ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                {oreateaiRegistering ? (oreateaiProgress || '注册中...') : '注册账号'}
+              </button>
+              <button
+                onClick={fetchOreateaiAccounts}
+                disabled={oreateaiLoading || oreateaiRegistering || oreateaiClaimingAll}
+                className="p-2 rounded-lg text-dark-muted hover:text-white hover:bg-dark-card/50 disabled:opacity-50 transition-colors"
+                title="刷新渠道八账号"
+              >
+                <RefreshCw className={`w-4 h-4 ${oreateaiLoading ? 'animate-spin' : ''}`} />
+              </button>
+            </>
           )}
         </div>
       </div>
@@ -970,6 +1810,77 @@ export default function WizstarAccounts() {
             <button onClick={() => setError('')} className="ml-auto text-red-400/60 hover:text-red-400 shrink-0">
               <XCircle className="w-4 h-4" />
             </button>
+          </div>
+        )}
+
+        {activePool === 'oreateai' && showOreateaiRegister && (
+          <div className="p-4 rounded-xl bg-dark-card border border-green-500/20 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-medium text-white">批量注册渠道八账号</h3>
+                <p className="text-xs text-dark-muted mt-1">
+                  按邮箱库顺序使用尚未注册的 Microsoft OAuth 邮箱，通过小苹果取件 API 接收验证邮件。每个任务使用独立 Chromium，会自动跳过已注册邮箱。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowOreateaiRegister(false)}
+                disabled={oreateaiRegistering}
+                className="p-1.5 rounded-lg text-dark-muted hover:text-white hover:bg-dark-bg disabled:opacity-50 transition-colors"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            </div>
+            <form onSubmit={handleOreateaiRegister} className="space-y-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <label className="space-y-1">
+                  <span className="text-xs text-dark-muted">使用邮箱数</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="50"
+                    value={oreateaiRegCount}
+                    disabled={oreateaiRegistering}
+                    onChange={(event) => {
+                      const count = Math.max(1, Math.min(Number(event.target.value) || 1, 50));
+                      setOreateaiRegCount(count);
+                      setOreateaiRegConcurrency(current => Math.min(Number(current) || 1, count));
+                    }}
+                    className="w-full px-3 py-2 rounded-lg bg-dark-bg border border-dark-border text-sm text-white focus:outline-none focus:border-green-500/50 disabled:opacity-50"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-xs text-dark-muted">并发数</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max={Math.min(5, Number(oreateaiRegCount) || 1)}
+                    value={oreateaiRegConcurrency}
+                    disabled={oreateaiRegistering}
+                    onChange={(event) => setOreateaiRegConcurrency(
+                      Math.max(1, Math.min(Number(event.target.value) || 1, 5, Number(oreateaiRegCount) || 1)),
+                    )}
+                    className="w-full px-3 py-2 rounded-lg bg-dark-bg border border-dark-border text-sm text-white focus:outline-none focus:border-green-500/50 disabled:opacity-50"
+                  />
+                </label>
+              </div>
+              {oreateaiRegistering && (
+                <div className="flex items-center gap-2 text-xs text-green-300">
+                  <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+                  <span>{oreateaiProgress || '正在准备批量注册...'}</span>
+                </div>
+              )}
+              <button
+                type="submit"
+                disabled={oreateaiRegistering}
+                className="flex items-center justify-center gap-2 w-full px-4 py-2 rounded-lg bg-green-500/15 text-green-300 text-sm font-medium hover:bg-green-500/25 disabled:opacity-50 transition-colors"
+              >
+                {oreateaiRegistering ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                {oreateaiRegistering
+                  ? '注册任务执行中'
+                  : `使用 ${oreateaiRegCount} 个邮箱注册（并发 ${oreateaiRegConcurrency}）`}
+              </button>
+            </form>
           </div>
         )}
 
@@ -1161,10 +2072,23 @@ export default function WizstarAccounts() {
                   <textarea
                     value={dolaImportCookie}
                     onChange={e => setDolaImportCookie(e.target.value)}
-                    placeholder="ttwid=...; odin_tt=...; msToken=..."
+                    placeholder="ttwid=...; odin_tt=...; sid_guard=..."
                     rows={4}
                     className="w-full px-3 py-2 rounded-lg bg-dark-bg border border-dark-border text-sm text-white placeholder:text-dark-muted/50 focus:outline-none focus:border-brand/50 resize-y font-mono text-xs"
                   />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-xs text-dark-muted">DOLA_MS_TOKEN（必填）</span>
+                  <input
+                    type="text"
+                    value={dolaImportMsToken}
+                    onChange={e => setDolaImportMsToken(e.target.value)}
+                    placeholder="粘贴用户显式提供的 msToken"
+                    className="w-full px-3 py-2 rounded-lg bg-dark-bg border border-dark-border text-sm text-white placeholder:text-dark-muted/50 focus:outline-none focus:border-brand/50 font-mono text-xs"
+                  />
+                  <span className="block text-[10px] text-dark-subtle">
+                    只接受用户授权请求中真实捕获或手动提供的 msToken；不会从 Cookie 推导、刷新或生成替代值。
+                  </span>
                 </label>
                 <label className="space-y-1">
                   <span className="text-xs text-dark-muted">登录态文件路径</span>
@@ -1188,7 +2112,7 @@ export default function WizstarAccounts() {
                 </label>
               </div>
               <p className="text-[11px] text-dark-subtle">
-                Cookie、登录态文件、profile 目录至少填写一项。直接粘贴 Cookie 时，系统会自动生成运行所需的本地登录态文件。
+                必须填写用户显式提供的 DOLA_MS_TOKEN；Cookie、登录态文件、profile 目录至少填写一项。系统不会从 Cookie 推导、刷新或生成 Token。
               </p>
               <div className="flex items-center gap-2 pt-1">
                 <button
@@ -1242,6 +2166,26 @@ export default function WizstarAccounts() {
                   rows={8}
                   className="w-full bg-dark-input text-sm border border-dark-border focus:border-blue-500 focus:outline-none rounded-lg p-3 text-white placeholder-dark-subtle font-mono resize-none"
                 />
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-brand/20 bg-brand/5 p-3">
+                  <span className="text-xs text-brand">从全局邮箱库领取</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={dolaPoolCount}
+                    onChange={(e) => setDolaPoolCount(Math.max(1, Math.min(100, parseInt(e.target.value, 10) || 1)))}
+                    className="w-16 bg-dark-input text-sm border border-dark-border focus:border-brand focus:outline-none rounded-lg p-2 text-white text-center"
+                  />
+                  <span className="text-xs text-dark-muted">个尚未用于渠道六的 Google 密码账号</span>
+                  <button
+                    type="button"
+                    onClick={() => handleDolaBatchLogin(true)}
+                    className="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-lg bg-brand/15 text-brand text-sm font-medium hover:bg-brand/25 transition-colors"
+                  >
+                    <Mail className="w-4 h-4" />
+                    领取并登录
+                  </button>
+                </div>
                 <div className="flex items-center gap-3">
                   <label className="text-xs text-dark-muted">并发数</label>
                   <input
@@ -1257,7 +2201,7 @@ export default function WizstarAccounts() {
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={handleDolaBatchLogin}
+                    onClick={() => handleDolaBatchLogin(false)}
                     disabled={!dolaBatchText.trim()}
                     className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-blue-500/15 text-blue-300 text-sm font-medium hover:bg-blue-500/25 disabled:opacity-50 transition-colors"
                   >
@@ -1366,12 +2310,173 @@ export default function WizstarAccounts() {
           </div>
         )}
 
+        {activePool === 'lovart' && showLovartBatchLogin && (
+          <div className="p-4 rounded-xl bg-dark-card border border-blue-500/20 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-medium text-white">渠道七 Lovart · Google 批量登录</h3>
+                <p className="text-xs text-dark-muted mt-1">
+                  每行一个账号，格式: 邮箱|密码。系统会打开独立 Chrome profile 完成 Lovart → Google OAuth，并把登录态保存到渠道七账号池。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (lovartBatchStep !== 'running') setShowLovartBatchLogin(false);
+                }}
+                disabled={lovartBatchStep === 'running'}
+                className="p-1.5 rounded-lg text-dark-muted hover:text-white hover:bg-dark-bg disabled:opacity-50 transition-colors"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            </div>
+
+            {lovartBatchStep === 'idle' && (
+              <div className="space-y-3">
+                <textarea
+                  placeholder="email1@ffcfd.cfd|password1&#10;email2@ffcfd.cfd|password2"
+                  value={lovartBatchText}
+                  onChange={(e) => setLovartBatchText(e.target.value)}
+                  rows={8}
+                  className="w-full bg-dark-input text-sm border border-dark-border focus:border-blue-500 focus:outline-none rounded-lg p-3 text-white placeholder-dark-subtle font-mono resize-none"
+                />
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-brand/20 bg-brand/5 p-3">
+                  <span className="text-xs text-brand">从全局邮箱库领取</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={lovartPoolCount}
+                    onChange={(e) => setLovartPoolCount(Math.max(1, Math.min(100, parseInt(e.target.value, 10) || 1)))}
+                    className="w-16 bg-dark-input text-sm border border-dark-border focus:border-brand focus:outline-none rounded-lg p-2 text-white text-center"
+                  />
+                  <span className="text-xs text-dark-muted">个尚未用于渠道七的 Google 密码账号</span>
+                  <button
+                    type="button"
+                    onClick={() => handleLovartBatchLogin(true)}
+                    className="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-lg bg-brand/15 text-brand text-sm font-medium hover:bg-brand/25 transition-colors"
+                  >
+                    <Mail className="w-4 h-4" />
+                    领取并登录
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="text-xs text-dark-muted">并发数</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="3"
+                    value={lovartBatchConcurrency}
+                    onChange={(e) => setLovartBatchConcurrency(Math.max(1, Math.min(3, parseInt(e.target.value) || 1)))}
+                    className="w-16 bg-dark-input text-sm border border-dark-border focus:border-blue-500 focus:outline-none rounded-lg p-2 text-white text-center"
+                  />
+                  <span className="text-xs text-dark-muted">Lovart/Google 风控更敏感，建议 1</span>
+                  <label className="flex items-center gap-2 text-xs text-dark-muted">
+                    <input
+                      type="checkbox"
+                      checked={lovartBatchVisible}
+                      onChange={(e) => setLovartBatchVisible(e.target.checked)}
+                      className="accent-brand"
+                    />
+                    可见浏览器
+                  </label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleLovartBatchLogin(false)}
+                    disabled={!lovartBatchText.trim()}
+                    className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-blue-500/15 text-blue-300 text-sm font-medium hover:bg-blue-500/25 disabled:opacity-50 transition-colors"
+                  >
+                    <Mail className="w-4 h-4" />
+                    开始登录（{lovartBatchText.trim().split('\n').filter(l => l.trim() && l.includes('|')).length} 个账号）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowLovartBatchLogin(false)}
+                    className="px-4 py-2 rounded-lg text-dark-muted text-sm hover:text-white hover:bg-dark-card/80 transition-colors"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {lovartBatchStep === 'running' && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2 py-1">
+                  <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                  <span className="text-sm text-white">Lovart 批量登录进行中...</span>
+                </div>
+                <div className="space-y-1.5 max-h-72 overflow-y-auto">
+                  {Object.entries(lovartBatchResults)
+                    .sort(([a], [b]) => parseInt(a) - parseInt(b))
+                    .map(([idx, info]) => (
+                      <div key={idx} className="flex items-center justify-between bg-dark-input/50 border border-dark-border/40 rounded-lg px-3 py-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          {info.ok === true ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
+                          ) : info.ok === false ? (
+                            <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                          ) : (
+                            <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin shrink-0" />
+                          )}
+                          <span className="text-xs text-white truncate">{info.email}</span>
+                        </div>
+                        <span className="text-[10px] text-dark-muted shrink-0 ml-2">
+                          {info.step === 'starting' ? '启动中' :
+                           info.step === 'saved_to_db' ? '已保存' :
+                           info.step === 'login_complete' ? '登录完成' :
+                           info.step?.includes('email') ? '输入邮箱' :
+                           info.step?.includes('password') ? '输入密码' :
+                           info.step?.includes('captcha') ? '需要人工验证' :
+                           info.step?.includes('deleted') ? '账号异常' :
+                           info.step?.includes('redirect') ? '跳转中' :
+                           info.step || '处理中'}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
+
+            {lovartBatchStep === 'done' && lovartBatchSummary && (
+              <div className="space-y-3">
+                <div className="flex items-center gap-3 py-2">
+                  {lovartBatchSummary.failed === 0 ? (
+                    <CheckCircle2 className="w-5 h-5 text-green-400" />
+                  ) : (
+                    <AlertCircle className="w-5 h-5 text-orange-400" />
+                  )}
+                  <span className="text-sm text-white">
+                    批量登录完成：成功 <span className="text-green-400 font-bold">{lovartBatchSummary.succeeded}</span>，
+                    失败 <span className="text-red-400 font-bold">{lovartBatchSummary.failed}</span>，共 {lovartBatchSummary.total} 个账号
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowLovartBatchLogin(false);
+                    setLovartBatchStep('idle');
+                    setLovartBatchText('');
+                    setLovartBatchResults({});
+                    setLovartBatchSummary(null);
+                  }}
+                  className="px-4 py-2 rounded-lg text-dark-muted text-sm hover:text-white hover:bg-dark-card/80 transition-colors"
+                >
+                  完成
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         {activePool === 'oiioii' && showOiRegister && (
           <div className="p-4 rounded-xl bg-dark-card border border-green-500/20 space-y-3">
             <div className="flex items-center justify-between">
               <div>
                 <h3 className="text-sm font-medium text-white">批量注册渠道四账号</h3>
-                <p className="text-xs text-dark-muted mt-1">设置注册数量和并发数，系统会自动注册 OiiOii 账号。</p>
+                <p className="text-xs text-dark-muted mt-1">设置数量后，系统从全局邮箱库领取尚未用于渠道四的 Microsoft OAuth 邮箱，用它接收验证码并自动注册。</p>
               </div>
               <button
                 type="button"
@@ -1456,7 +2561,11 @@ export default function WizstarAccounts() {
                 className={`rounded-xl border transition-colors ${
                   acc.status === 'forbidden'
                     ? 'bg-red-950/20 border-red-500/30 opacity-75'
-                    : 'bg-dark-card border-dark-border hover:border-dark-border/80'
+                    : acc.status === 'auth_expired'
+                      ? 'bg-amber-950/20 border-amber-500/30'
+                      : acc.status === 'error'
+                        ? 'bg-orange-950/15 border-orange-500/25'
+                        : 'bg-dark-card border-dark-border hover:border-dark-border/80'
                 }`}
               >
                 <div className="flex items-center justify-between p-4">
@@ -1468,7 +2577,16 @@ export default function WizstarAccounts() {
                     <div className="text-sm font-medium text-white truncate flex items-center gap-2">
                       <span>{acc.email}</span>
                       {acc.status === 'forbidden' && (
-                        <span className="px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/30 text-[10px] font-bold">已禁用</span>
+                        <span className="px-1.5 py-0.5 rounded bg-red-500/15 text-red-400 border border-red-500/30 text-[10px] font-bold">账号受限</span>
+                      )}
+                      {acc.status === 'auth_expired' && (
+                        <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30 text-[10px] font-bold">登录失效</span>
+                      )}
+                      {acc.status === 'error' && (
+                        <span className="px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-400 border border-orange-500/30 text-[10px] font-bold">校验异常</span>
+                      )}
+                      {acc.status === 'daily_limit' && (
+                        <span className="px-1.5 py-0.5 rounded bg-yellow-500/15 text-yellow-400 border border-yellow-500/30 text-[10px] font-bold">今日额度已用完</span>
                       )}
                     </div>
                     <div className="flex items-center gap-3 text-xs text-dark-muted">
@@ -1477,16 +2595,9 @@ export default function WizstarAccounts() {
                       <span>{formatDate(acc.created_at)}</span>
                     </div>
                     <div className="mt-1 flex items-center gap-2 text-[11px] text-dark-muted">
-                      <span className="font-mono bg-dark-bg/70 border border-dark-border/60 rounded px-1.5 py-0.5 text-dark-text">
-                        {visiblePasswords[acc.id] ? (acc.password || '-') : '••••••••••'}
+                      <span>
+                        最近校验：{acc.last_verified_at ? formatDate(acc.last_verified_at) : '尚未校验'}
                       </span>
-                      <button
-                        onClick={() => togglePasswordVisible(acc.id)}
-                        className="p-1 rounded text-dark-muted hover:text-white hover:bg-dark-bg transition-colors"
-                        title={visiblePasswords[acc.id] ? '隐藏密码' : '显示密码'}
-                      >
-                        {visiblePasswords[acc.id] ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                      </button>
                       <button
                         onClick={() => copyText(acc.email, '邮箱')}
                         className="px-1.5 py-0.5 rounded text-dark-muted hover:text-brand hover:bg-brand/10 transition-colors flex items-center gap-1"
@@ -1494,14 +2605,17 @@ export default function WizstarAccounts() {
                       >
                         <Copy className="w-3 h-3" /> 邮箱
                       </button>
-                      <button
-                        onClick={() => copyText(acc.password || 'Wz@2024secure', '密码')}
-                        className="px-1.5 py-0.5 rounded text-dark-muted hover:text-brand hover:bg-brand/10 transition-colors flex items-center gap-1"
-                        title="复制密码"
-                      >
-                        <Copy className="w-3 h-3" /> 密码
-                      </button>
                     </div>
+                    {acc.status === 'auth_expired' && (
+                      <div className="mt-1 text-[11px] text-amber-400">
+                        凭证已失效，请到邮箱库重新登录；系统不会尝试伪造或自动刷新 Token。
+                      </div>
+                    )}
+                    {acc.status === 'error' && (
+                      <div className="mt-1 text-[11px] text-orange-400">
+                        会话校验异常，可先重试查询积分；持续失败时请重新登录。
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div className="flex items-center gap-3 shrink-0">
@@ -1520,6 +2634,17 @@ export default function WizstarAccounts() {
                   >
                     <SlidersHorizontal className="w-4 h-4" />
                   </button>
+                  {acc.status === 'auth_expired' && (
+                    <button
+                      onClick={onOpenGoogleLogin}
+                      disabled={!onOpenGoogleLogin}
+                      className="flex items-center gap-1 px-2 py-1.5 rounded-lg text-xs text-amber-300 bg-amber-500/10 hover:bg-amber-500/20 disabled:opacity-50 transition-colors"
+                      title="前往 Google 登录页重新获取登录态"
+                    >
+                      <Mail className="w-3.5 h-3.5" />
+                      重新登录
+                    </button>
+                  )}
                   <button
                     onClick={() => handleOpenWebLogin(acc.id)}
                     className="p-1.5 rounded-lg text-dark-muted hover:text-sky-400 hover:bg-sky-500/10 transition-colors"
@@ -1643,7 +2768,7 @@ export default function WizstarAccounts() {
               <Sparkles className="w-4 h-4 text-green-400" /> 注册渠道三账号
             </h3>
             <p className="text-xs text-dark-muted">
-              自动生成临时邮箱并完成注册。注册依赖设置中已填写的验证码 Key
+              从全局邮箱库领取 Microsoft OAuth 邮箱并通过小苹果 API 收取验证码。注册依赖设置中已填写的验证码 Key
               {!qfConfigured && <span className="text-amber-400">（当前未检测到 Key，请先到「设置 → 渠道三」填写）</span>}
               ；如需独立美国出口 IP，请在设置中开启动态 IP。
             </p>
@@ -1947,6 +3072,612 @@ export default function WizstarAccounts() {
                   </button>
                   <button
                     onClick={() => handleDolaDelete(acc.id)}
+                    className="p-1.5 rounded-lg text-dark-muted hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                    title="删除"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {activePool === 'oreateai' && (oreateaiLoading ? (
+          <div className="flex items-center justify-center py-20">
+            <Loader2 className="w-6 h-6 text-brand animate-spin" />
+          </div>
+        ) : oreateaiAccounts.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-20 text-dark-muted">
+            <KeyRound className="w-12 h-12 mb-3 opacity-30" />
+            <p className="text-sm">暂无渠道八 OreateAI 账号</p>
+            <p className="text-xs text-dark-subtle mt-2">先在邮箱库导入 Microsoft OAuth 邮箱，再点击右上角「注册账号」</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between rounded-xl border border-dark-border bg-dark-card/60 px-4 py-3 text-xs text-dark-muted">
+              <span>当前共 {oreateaiAccounts.length} 个渠道八 OreateAI 账号。前端只展示登录态摘要，不显示密码和 Cookie 原文。</span>
+              <span>账号由真实浏览器注册流程写入。</span>
+            </div>
+            {oreateaiAccounts.map((acc) => (
+              <div
+                key={acc.id}
+                className={`flex items-center justify-between p-4 rounded-xl border transition-colors ${
+                  acc.configured && acc.status === 'active'
+                    ? 'bg-dark-card border-dark-border hover:border-dark-border/80'
+                    : 'bg-amber-950/20 border-amber-500/30'
+                }`}
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-9 h-9 rounded-lg bg-cyan-500/10 flex items-center justify-center shrink-0">
+                    <Sparkles className="w-4 h-4 text-cyan-300" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white truncate flex items-center gap-2">
+                      <span>{acc.email || '未知 OreateAI 账号'}</span>
+                      <span className={`px-1.5 py-0.5 rounded border text-[10px] font-bold ${
+                        acc.configured
+                          ? 'bg-green-500/15 text-green-400 border-green-500/30'
+                          : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                      }`}>
+                        {acc.configured ? '已保存登录态' : '登录态不完整'}
+                      </span>
+                      {acc.status && (
+                        <span className="px-1.5 py-0.5 rounded bg-dark-muted/15 text-dark-muted border border-dark-border text-[10px] font-bold">
+                          {acc.status}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-dark-muted mt-1">
+                      <span>{formatDate(acc.updated_at || acc.created_at)}</span>
+                      {acc.cookie_masked && <span className="font-mono text-dark-subtle">Cookie {acc.cookie_masked}</span>}
+                      {acc.location && <span className="text-dark-subtle truncate max-w-[300px]" title={acc.location}>{acc.location}</span>}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 mt-2">
+                      <span className="px-2 py-0.5 rounded-lg bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 text-[11px] font-bold">
+                        Cookie {acc.cookie_count ?? 0}
+                      </span>
+                      {Number.isFinite(Number(oreateaiCredits[acc.id]?.rest_points)) && (
+                        <span className="px-2 py-0.5 rounded-lg bg-amber-500/10 text-amber-300 border border-amber-500/20 text-[11px] font-bold">
+                          积分 {oreateaiCredits[acc.id].rest_points}
+                        </span>
+                      )}
+                      {oreateaiCredits[acc.id]?.detail?.daily && (
+                        <span className="text-[11px] text-dark-subtle">
+                          每日 {oreateaiCredits[acc.id].detail.daily.amount}
+                        </span>
+                      )}
+                      {oreateaiCredits[acc.id]?.detail?.bonus && (
+                        <span className="text-[11px] text-dark-subtle">
+                          奖励 {oreateaiCredits[acc.id].detail.bonus.amount}
+                        </span>
+                      )}
+                      {acc.note && (
+                        <span className="text-[11px] text-dark-subtle truncate max-w-[420px]" title={acc.note}>{acc.note}</span>
+                      )}
+                    </div>
+                    {acc.user_agent && (
+                      <div className="mt-1 text-[11px] text-dark-subtle truncate max-w-[620px]" title={acc.user_agent}>
+                        {acc.user_agent}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => requestOreateaiCredits(acc.id, false)}
+                    disabled={oreateaiClaimingAll || !acc.configured || oreateaiCredits[acc.id]?.loading || oreateaiCredits[acc.id]?.claiming}
+                    className="px-1.5 py-1 rounded-lg text-dark-muted hover:text-amber-300 hover:bg-amber-500/10 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
+                    title="实时查询渠道八剩余积分和积分明细"
+                  >
+                    {oreateaiCredits[acc.id]?.loading
+                      ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      : <RefreshCw className="w-3.5 h-3.5" />}
+                    查询积分
+                  </button>
+                  <button
+                    onClick={() => requestOreateaiCredits(acc.id, true)}
+                    disabled={oreateaiClaimingAll || !acc.configured || oreateaiCredits[acc.id]?.loading || oreateaiCredits[acc.id]?.claiming}
+                    className="px-1.5 py-1 rounded-lg text-dark-muted hover:text-green-300 hover:bg-green-500/10 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
+                    title="调用 OreateAI 领取接口；同一天重复调用不会重复增加积分"
+                  >
+                    {oreateaiCredits[acc.id]?.claiming
+                      ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      : <Coins className="w-3.5 h-3.5" />}
+                    领取积分
+                  </button>
+                  <button
+                    onClick={() => handleOreateaiCapture(acc.id)}
+                    disabled={!acc.configured || oreateaiCaptureOpeningId !== null}
+                    className="px-1.5 py-1 rounded-lg text-dark-muted hover:text-cyan-300 hover:bg-cyan-500/10 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
+                    title="注入该账号 Cookie，并记录你在 OreateAI 窗口中的接口操作"
+                  >
+                    {oreateaiCaptureOpeningId === acc.id
+                      ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      : <ExternalLink className="w-3.5 h-3.5" />}
+                    记录操作
+                  </button>
+                  <button
+                    onClick={() => copyText(acc.email || '', '邮箱')}
+                    disabled={!acc.email}
+                    className="px-1.5 py-1 rounded-lg text-dark-muted hover:text-brand hover:bg-brand/10 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
+                    title="复制邮箱"
+                  >
+                    <Copy className="w-3.5 h-3.5" /> 邮箱
+                  </button>
+                  <button
+                    onClick={() => handleOreateaiDelete(acc.id)}
+                    className="p-1.5 rounded-lg text-dark-muted hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                    title="删除"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {activePool === 'tensorart' && showTensorartRegister && (
+          <div className="p-4 rounded-xl bg-dark-card border border-violet-500/20 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-medium text-white">渠道十 Tensor.Art · 邮箱库注册</h3>
+                <p className="text-xs text-dark-muted mt-1">
+                  从全局 Microsoft OAuth 邮箱库领取尚未用于渠道十的邮箱，自动发送 magic-link、读取邮件并保存登录 token。Turnstile 使用设置中已有的 YesCaptcha Key。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => !tensorartRegistering && setShowTensorartRegister(false)}
+                disabled={tensorartRegistering}
+                className="p-1.5 rounded-lg text-dark-muted hover:text-white hover:bg-dark-bg disabled:opacity-50 transition-colors"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="text-xs text-dark-muted">注册数量</label>
+              <input
+                type="number"
+                min="1"
+                max="100"
+                value={tensorartRegCount}
+                onChange={(e) => setTensorartRegCount(Math.max(1, Math.min(100, parseInt(e.target.value, 10) || 1)))}
+                className="w-20 bg-dark-input text-sm border border-dark-border focus:border-violet-500 focus:outline-none rounded-lg p-2 text-white text-center"
+              />
+              <label className="text-xs text-dark-muted">并发数</label>
+              <input
+                type="number"
+                min="1"
+                max="3"
+                value={tensorartRegConcurrency}
+                onChange={(e) => setTensorartRegConcurrency(Math.max(1, Math.min(3, parseInt(e.target.value, 10) || 1)))}
+                className="w-20 bg-dark-input text-sm border border-dark-border focus:border-violet-500 focus:outline-none rounded-lg p-2 text-white text-center"
+              />
+              <span className="text-xs text-dark-muted">建议并发 1，避免邮件和验证码风控。</span>
+              <button
+                type="button"
+                onClick={handleTensorartRegister}
+                disabled={tensorartRegistering}
+                className="ml-auto flex items-center gap-1.5 px-4 py-2 rounded-lg bg-violet-500/15 text-violet-300 text-sm font-medium hover:bg-violet-500/25 disabled:opacity-50 transition-colors"
+              >
+                {tensorartRegistering ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                {tensorartRegistering ? '注册并等待邮件...' : '领取并注册'}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {activePool === 'tensorart' && (tensorartLoading ? (
+          <div className="flex items-center justify-center py-20">
+            <Loader2 className="w-6 h-6 text-brand animate-spin" />
+          </div>
+        ) : tensorartAccounts.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-20 text-dark-muted">
+            <Sparkles className="w-12 h-12 mb-3 opacity-30" />
+            <p className="text-sm">暂无渠道十 Tensor.Art 账号，点击右上角「邮箱库注册」开始</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between rounded-xl border border-dark-border bg-dark-card/60 px-4 py-3 text-xs text-dark-muted">
+              <span>当前共 {tensorartAccounts.length} 个渠道十账号；前端只展示脱敏 token。</span>
+              <span>图生视频完成后直接下载 downloadUrl。</span>
+            </div>
+            {tensorartAccounts.map((acc) => (
+              <div
+                key={acc.id}
+                className={`flex items-center justify-between p-4 rounded-xl border transition-colors ${
+                  acc.configured
+                    ? 'bg-dark-card border-dark-border hover:border-dark-border/80'
+                    : 'bg-amber-950/20 border-amber-500/30'
+                }`}
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-9 h-9 rounded-lg bg-violet-500/10 flex items-center justify-center shrink-0">
+                    <Sparkles className="w-4 h-4 text-violet-300" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white truncate flex items-center gap-2">
+                      <span>{acc.email || '未知 Tensor.Art 账号'}</span>
+                      <span className={`px-1.5 py-0.5 rounded border text-[10px] font-bold ${
+                        acc.configured
+                          ? 'bg-green-500/15 text-green-400 border-green-500/30'
+                          : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                      }`}>
+                        {acc.configured ? '登录态有效' : acc.token_expired ? 'Token 已过期' : 'Token 缺失'}
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-dark-muted mt-1">
+                      <span>{formatDate(acc.updated_at || acc.created_at)}</span>
+                      {acc.user_id && <span className="text-dark-subtle">UID: {acc.user_id}</span>}
+                      {acc.token_masked && <span className="font-mono text-dark-subtle">Token {acc.token_masked}</span>}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => handleTensorartRefreshEnergy(acc.id)}
+                    disabled={!acc.configured || tensorartRefreshingId === acc.id}
+                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-yellow-500/10 text-yellow-400 text-xs font-bold hover:bg-yellow-500/20 disabled:opacity-50 transition-colors"
+                    title="查询 Tensor.Art 能量"
+                  >
+                    {tensorartRefreshingId === acc.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Coins className="w-3.5 h-3.5" />}
+                    {acc.total_balance != null ? `${acc.total_balance} 能量` : '查询能量'}
+                  </button>
+                  <button
+                    onClick={() => copyText(acc.email || '', '邮箱')}
+                    disabled={!acc.email}
+                    className="px-1.5 py-1 rounded-lg text-dark-muted hover:text-brand hover:bg-brand/10 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
+                    title="复制邮箱"
+                  >
+                    <Copy className="w-3.5 h-3.5" /> 邮箱
+                  </button>
+                  <button
+                    onClick={() => handleTensorartDelete(acc.id)}
+                    className="p-1.5 rounded-lg text-dark-muted hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                    title="删除"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {activePool === 'framia' && showFramiaBatchLogin && (
+          <div className="p-4 rounded-xl bg-dark-card border border-purple-500/20 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-medium text-white">渠道九 Framia · Google 批量登录</h3>
+                <p className="text-xs text-dark-muted mt-1">
+                  每行一个账号，格式: 邮箱|密码。系统会打开 Chrome 完成 Framia → Google OAuth，并把 accessToken 保存到渠道九账号池。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (framiaBatchStep !== 'running') setShowFramiaBatchLogin(false);
+                }}
+                disabled={framiaBatchStep === 'running'}
+                className="p-1.5 rounded-lg text-dark-muted hover:text-white hover:bg-dark-bg disabled:opacity-50 transition-colors"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            </div>
+
+            {framiaBatchStep === 'idle' && (
+              <div className="space-y-3">
+                <textarea
+                  placeholder="email1@gmaii.lol|password1&#10;email2@gmaii.lol|password2"
+                  value={framiaBatchText}
+                  onChange={(e) => setFramiaBatchText(e.target.value)}
+                  rows={8}
+                  className="w-full bg-dark-input text-sm border border-dark-border focus:border-purple-500 focus:outline-none rounded-lg p-3 text-white placeholder-dark-subtle font-mono resize-none"
+                />
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-brand/20 bg-brand/5 p-3">
+                  <span className="text-xs text-brand">从全局邮箱库领取</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={framiaPoolCount}
+                    onChange={(e) => setFramiaPoolCount(Math.max(1, Math.min(100, parseInt(e.target.value, 10) || 1)))}
+                    className="w-16 bg-dark-input text-sm border border-dark-border focus:border-brand focus:outline-none rounded-lg p-2 text-white text-center"
+                  />
+                  <span className="text-xs text-dark-muted">个尚未用于渠道九的 Google 密码账号</span>
+                  <button
+                    type="button"
+                    onClick={handleFramiaPoolLogin}
+                    className="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-lg bg-brand/15 text-brand text-sm font-medium hover:bg-brand/25 transition-colors"
+                  >
+                    <Mail className="w-4 h-4" />
+                    领取并登录
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="text-xs text-dark-muted">并发数</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="5"
+                    value={framiaBatchConcurrency}
+                    onChange={(e) => setFramiaBatchConcurrency(Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
+                    className="w-16 bg-dark-input text-sm border border-dark-border focus:border-purple-500 focus:outline-none rounded-lg p-2 text-white text-center"
+                  />
+                  <span className="text-xs text-dark-muted">Framia/Google 风控较敏感，建议 1–2</span>
+                  <label className="flex items-center gap-2 text-xs text-dark-muted">
+                    <input
+                      type="checkbox"
+                      checked={framiaBatchVisible}
+                      onChange={(e) => setFramiaBatchVisible(e.target.checked)}
+                      className="accent-brand"
+                    />
+                    可见浏览器
+                  </label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleFramiaBatchLogin}
+                    disabled={!framiaBatchText.trim()}
+                    className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-purple-500/15 text-purple-300 text-sm font-medium hover:bg-purple-500/25 disabled:opacity-50 transition-colors"
+                  >
+                    <Mail className="w-4 h-4" />
+                    开始登录（{framiaBatchText.trim().split('\n').filter(l => l.trim() && l.includes('|')).length} 个账号）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowFramiaBatchLogin(false)}
+                    className="px-4 py-2 rounded-lg text-dark-muted text-sm hover:text-white hover:bg-dark-card/80 transition-colors"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {framiaBatchStep === 'running' && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2 py-1">
+                  <Loader2 className="w-4 h-4 text-purple-400 animate-spin" />
+                  <span className="text-sm text-white">Framia 批量登录进行中...</span>
+                </div>
+                <div className="space-y-1.5 max-h-72 overflow-y-auto">
+                  {Object.entries(framiaBatchResults)
+                    .sort(([a], [b]) => parseInt(a) - parseInt(b))
+                    .map(([idx, info]) => (
+                      <div key={idx} className="flex items-center justify-between bg-dark-input/50 border border-dark-border/40 rounded-lg px-3 py-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          {info.ok === true ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
+                          ) : info.ok === false ? (
+                            <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                          ) : (
+                            <Loader2 className="w-3.5 h-3.5 text-purple-400 animate-spin shrink-0" />
+                          )}
+                          <span className="text-xs text-white truncate">{info.email}</span>
+                        </div>
+                        <span className="text-[10px] text-dark-muted shrink-0 ml-2">
+                          {info.step === 'starting' ? '启动中' :
+                           info.step === 'saved_to_db' ? '已保存' :
+                           info.step === 'error' ? (info.error || '失败') :
+                           info.step || '处理中'}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
+
+            {framiaBatchStep === 'done' && framiaBatchSummary && (
+              <div className="space-y-3">
+                <div className="flex items-center gap-3 py-2">
+                  {framiaBatchSummary.failed === 0 ? (
+                    <CheckCircle2 className="w-5 h-5 text-green-400" />
+                  ) : (
+                    <AlertCircle className="w-5 h-5 text-orange-400" />
+                  )}
+                  <span className="text-sm text-white">
+                    批量登录完成：成功 <span className="text-green-400 font-bold">{framiaBatchSummary.succeeded}</span>，
+                    失败 <span className="text-red-400 font-bold">{framiaBatchSummary.failed}</span>，共 {framiaBatchSummary.total} 个账号
+                  </span>
+                </div>
+                {framiaBatchSummary.failed > 0 && (
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                    {Object.entries(framiaBatchResults)
+                      .filter(([, info]) => info.ok === false)
+                      .sort(([a], [b]) => parseInt(a) - parseInt(b))
+                      .map(([idx, info]) => (
+                        <div key={idx} className="rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2 text-xs">
+                          <div className="flex items-center gap-2 text-red-300">
+                            <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                            <span className="truncate">{info.email}</span>
+                          </div>
+                          <div className="mt-1 whitespace-pre-wrap break-words text-red-200/80">{info.error || '未返回具体错误信息'}</div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowFramiaBatchLogin(false);
+                    setFramiaBatchStep('idle');
+                    setFramiaBatchText('');
+                    setFramiaBatchResults({});
+                    setFramiaBatchSummary(null);
+                  }}
+                  className="px-4 py-2 rounded-lg text-dark-muted text-sm hover:text-white hover:bg-dark-card/80 transition-colors"
+                >
+                  完成
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activePool === 'framia' && (framiaLoading ? (
+          <div className="flex items-center justify-center py-20">
+            <Loader2 className="w-6 h-6 text-brand animate-spin" />
+          </div>
+        ) : framiaAccounts.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-20 text-dark-muted">
+            <Sparkles className="w-12 h-12 mb-3 opacity-30" />
+            <p className="text-sm">暂无渠道九 Framia 账号，点击右上角「Google 批量登录」开始</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between rounded-xl border border-dark-border bg-dark-card/60 px-4 py-3 text-xs text-dark-muted">
+              <span>当前共 {framiaAccounts.length} 个渠道九 Framia 账号。通过 Google OAuth 登录采集 accessToken。</span>
+              <span>账号可在内容创作中用于视频生成。</span>
+            </div>
+            {framiaAccounts.map((acc) => (
+              <div
+                key={acc.id}
+                className={`flex items-center justify-between p-4 rounded-xl border transition-colors ${
+                  acc.access_token
+                    ? 'bg-dark-card border-dark-border hover:border-dark-border/80'
+                    : 'bg-amber-950/20 border-amber-500/30'
+                }`}
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-9 h-9 rounded-lg bg-purple-500/10 flex items-center justify-center shrink-0">
+                    <Sparkles className="w-4 h-4 text-purple-300" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white truncate flex items-center gap-2">
+                      <span>{acc.email || '未知 Framia 账号'}</span>
+                      <span className={`px-1.5 py-0.5 rounded border text-[10px] font-bold ${
+                        acc.access_token
+                          ? 'bg-green-500/15 text-green-400 border-green-500/30'
+                          : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                      }`}>
+                        {acc.access_token ? '已采集' : 'Token 缺失'}
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-dark-muted mt-1">
+                      <span>{formatDate(acc.updated_at || acc.created_at)}</span>
+                      {acc.user_id && <span className="text-dark-subtle">UID: {acc.user_id}</span>}
+                    </div>
+                    {acc.user_agent && (
+                      <div className="mt-1 text-[11px] text-dark-subtle truncate max-w-[620px]" title={acc.user_agent}>
+                        {acc.user_agent}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => handleFramiaRefreshCredits(acc.id)}
+                    disabled={framiaRefreshingId === acc.id}
+                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-yellow-500/10 text-yellow-400 text-xs font-bold hover:bg-yellow-500/20 disabled:opacity-50 transition-colors"
+                    title="查询积分"
+                  >
+                    {framiaRefreshingId === acc.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Coins className="w-3.5 h-3.5" />}
+                    {acc.credits_balance != null ? `${acc.credits_balance} 积分` : '查询积分'}
+                  </button>
+                  <button
+                    onClick={() => copyText(acc.email || '', '邮箱')}
+                    disabled={!acc.email}
+                    className="px-1.5 py-1 rounded-lg text-dark-muted hover:text-brand hover:bg-brand/10 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
+                    title="复制邮箱"
+                  >
+                    <Copy className="w-3.5 h-3.5" /> 邮箱
+                  </button>
+                  <button
+                    onClick={() => handleFramiaDelete(acc.id)}
+                    className="p-1.5 rounded-lg text-dark-muted hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                    title="删除"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {activePool === 'lovart' && (lovartLoading ? (
+          <div className="flex items-center justify-center py-20">
+            <Loader2 className="w-6 h-6 text-brand animate-spin" />
+          </div>
+        ) : lovartAccounts.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-20 text-dark-muted">
+            <Sparkles className="w-12 h-12 mb-3 opacity-30" />
+            <p className="text-sm">暂无渠道七 Lovart 账号，点击右上角「Google 批量登录」开始</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between rounded-xl border border-dark-border bg-dark-card/60 px-4 py-3 text-xs text-dark-muted">
+              <span>当前共 {lovartAccounts.length} 个渠道七 Lovart 账号。前端只展示登录态摘要，不显示 Cookie 原文。</span>
+              <span>账号池已接入；生图提交协议待抓包接入。</span>
+            </div>
+            {lovartAccounts.map((acc) => (
+              <div
+                key={acc.id}
+                className={`flex items-center justify-between p-4 rounded-xl border transition-colors ${
+                  acc.configured
+                    ? 'bg-dark-card border-dark-border hover:border-dark-border/80'
+                    : 'bg-amber-950/20 border-amber-500/30'
+                }`}
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-9 h-9 rounded-lg bg-blue-500/10 flex items-center justify-center shrink-0">
+                    <Sparkles className="w-4 h-4 text-blue-300" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white truncate flex items-center gap-2">
+                      <span>{acc.email || '未知 Lovart 账号'}</span>
+                      <span className={`px-1.5 py-0.5 rounded border text-[10px] font-bold ${
+                        acc.configured
+                          ? 'bg-green-500/15 text-green-400 border-green-500/30'
+                          : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                      }`}>{acc.configured ? '已保存登录态' : '登录态不完整'}</span>
+                      {acc.status && (
+                        <span className="px-1.5 py-0.5 rounded bg-dark-muted/15 text-dark-muted border border-dark-border text-[10px] font-bold">
+                          {acc.status}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-dark-muted mt-1">
+                      <span>{formatDate(acc.updated_at || acc.created_at)}</span>
+                      {acc.cookie_masked && <span className="font-mono text-dark-subtle">Cookie {acc.cookie_masked}</span>}
+                      {acc.location && <span className="text-dark-subtle truncate max-w-[260px]" title={acc.location}>{acc.location}</span>}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 mt-2">
+                      <span className="px-2 py-0.5 rounded-lg bg-blue-500/10 text-blue-300 border border-blue-500/20 text-[11px] font-bold">
+                        Cookie {acc.cookie_count ?? 0}
+                      </span>
+                      <span className="px-2 py-0.5 rounded-lg bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 text-[11px] font-bold">
+                        localStorage {acc.local_storage_count ?? 0}
+                      </span>
+                      <span className="px-2 py-0.5 rounded-lg bg-purple-500/10 text-purple-300 border border-purple-500/20 text-[11px] font-bold">
+                        sessionStorage {acc.session_storage_count ?? 0}
+                      </span>
+                      <span className="px-2 py-0.5 rounded-lg bg-orange-500/10 text-orange-300 border border-orange-500/20 text-[11px] font-bold">
+                        IndexedDB {acc.indexed_db_count ?? 0}
+                      </span>
+                    </div>
+                    {acc.user_agent && (
+                      <div className="mt-1 text-[11px] text-dark-subtle truncate max-w-[620px]" title={acc.user_agent}>
+                        {acc.user_agent}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => copyText(acc.email || '', '邮箱')}
+                    disabled={!acc.email}
+                    className="px-1.5 py-1 rounded-lg text-dark-muted hover:text-brand hover:bg-brand/10 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
+                    title="复制邮箱"
+                  >
+                    <Copy className="w-3.5 h-3.5" /> 邮箱
+                  </button>
+                  <button
+                    onClick={() => handleLovartDelete(acc.id)}
                     className="p-1.5 rounded-lg text-dark-muted hover:text-red-400 hover:bg-red-500/10 transition-colors"
                     title="删除"
                   >

@@ -68,12 +68,42 @@ _qf_hosts.py
 .env
 .env.*
 **/.env.dola
+mysql.env
+**/mysql.env
 !.env.example
 *.pem
 *.key
 *.crt
 credentials*.json
+*credentials*.json
 secrets*.json
+*-token-test.json
+*storage-state.json
+*Cookie*.txt
+*cookie*.txt
+
+# Browser profiles / local runtime data
+.chrome-devtools-profile/
+.electron-oreateai-account-viewer/
+**/.dola-profiles/
+**/.framia-profiles/
+**/.lovart-profiles/
+generated-media/
+tmp/
+exports/
+aaa文件/
+
+# Local tooling / scratch trees (not part of app package)
+anything-analyzer/
+captures/
+browser_register.py
+collect_tasks.py
+collect_results.json
+framia_test.py
+test_tensorart.py
+framia-network-analysis.md
+*完整接入文档*.md
+*完整代码.md
 
 # OS / editor noise
 .DS_Store
@@ -93,6 +123,9 @@ wizstar.rar
 order_*.txt
 
 # Captured network data / local SDK test artifacts
+capture-*.json
+*.har
+captures/**/*.json
 quickframe-sdk-full/videogen_data/
 quickframe-sdk-full/_*.json
 quickframe-sdk-full/_*.txt
@@ -112,5 +145,7 @@ fix_server_patch.py
 # Local scratch images
 *.顾青.png
 *.白雨雨.png
+*.白凝雨.png
 1.顾青.png
 2.白雨雨.png
+2.白凝雨.png

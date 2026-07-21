@@ -159,9 +159,9 @@ export default function App() {
           />
         );
       case 'wizstar-mailbox':
-        return <MailboxPool />;
+        return <MailboxPool onLoginComplete={() => setActiveTab('wizstar-accounts')} />;
       case 'wizstar-accounts':
-        return <WizstarAccounts />;
+        return <WizstarAccounts onOpenGoogleLogin={() => setActiveTab('wizstar-mailbox')} />;
       case 'accounts':
         return <AccountManagement />;
       case 'settings':

@@ -67,36 +67,18 @@ if (fs.existsSync(envFile)) {
     if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
       val = val.slice(1, -1);
     }
-    process.env[key] = val;
+    if (!process.env[key]) process.env[key] = val;
   }
 }
 
 applyGlobalProxyFromEnv();
 normalizeDolaRuntimeEnv();
 
-const DOLA_KEYS = ['COOKIE', 'USER_AGENT', 'DEVICE_ID', 'WEB_ID', 'TEA_UUID',
-  'WEB_TAB_ID', 'AID', 'VERSION_CODE', 'PC_VERSION', 'FP', 'MS_TOKEN'];
-for (const k of DOLA_KEYS) {
-  if (process.env[`DOLA_${k}`]) {
-    process.env[`DOUBAO_${k}`] = process.env[`DOLA_${k}`];
-  }
-}
-process.env.DOUBAO_AID = process.env.DOLA_AID || process.env.DOUBAO_AID || '495671';
-process.env.DOUBAO_VERSION_CODE = process.env.DOLA_VERSION_CODE || process.env.DOUBAO_VERSION_CODE || '20800';
-process.env.DOUBAO_PC_VERSION = process.env.DOLA_PC_VERSION || process.env.DOUBAO_PC_VERSION || DOLA_BROWSER_PC_VERSION;
-if (process.env.DOLA_MS_TOKEN) process.env.DOUBAO_MS_TOKEN = process.env.DOLA_MS_TOKEN;
-if (process.env.DOLA_DEVICE_ID) process.env.DOUBAO_DEVICE_ID = process.env.DOLA_DEVICE_ID;
-if (process.env.DOLA_WEB_ID) process.env.DOUBAO_WEB_ID = process.env.DOLA_WEB_ID;
-if (process.env.DOLA_TEA_UUID) process.env.DOUBAO_TEA_UUID = process.env.DOLA_TEA_UUID;
-if (process.env.DOLA_WEB_TAB_ID) process.env.DOUBAO_WEB_TAB_ID = process.env.DOLA_WEB_TAB_ID;
-if (process.env.DOLA_FP) process.env.DOUBAO_FP = process.env.DOLA_FP;
-if (process.env.DOLA_USER_AGENT) process.env.DOUBAO_USER_AGENT = process.env.DOLA_USER_AGENT;
+// Dola API runtime uses only DOLA_* values. No legacy credential aliases are read.
 
 const { setPlatform, ensureSignerReady, env, buildSignedUrl,
         parseSseStream, uuid, uuidV1, signedFetchSse } = await import('./src/client.mjs');
-const { bootstrap } = await import('./src/bootstrap.mjs');
 
-await bootstrap({});
 setPlatform('dola');
 await ensureSignerReady();
 
@@ -209,7 +191,11 @@ try {
     body,
   });
 } catch(e) {
-  console.error('Fetch error:', e.message);
+  if (e?.code === 'needs_auth' || /\[needs_auth\]/i.test(String(e?.message || e))) {
+    console.error(`[needs_auth] ${e.message}`);
+  } else {
+    console.error('Fetch error:', e.message);
+  }
   process.exit(1);
 }
 

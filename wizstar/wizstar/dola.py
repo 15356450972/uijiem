@@ -1,14 +1,13 @@
 """Dola 渠道六桥接模块。
 
-当前主链路：
-- 生成：打开浏览器会话，在 Dola 页面完成上传图片、切换视频、点击生成
-- 查询：记录本次提交的会话信息，后续按 conversation_id 采集结果
-- 账号采集：仅保留为历史兼容，不再作为生成前置条件
+默认主链路：
+- 生成：通过签名 API 提交视频任务
+- 查询：按 `conversation_id` 通过 API 轮询并下载结果
+- 浏览器：仅用于用户显式发起的登录、诊断或兼容操作，不参与常规生成和采集
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import mimetypes
 import os
@@ -44,13 +43,14 @@ DEFAULT_RATIOS = [
     {"id": "21:9", "name": "超宽 21:9"},
 ]
 
-DEFAULT_SEND_MODE = "browser"
+DEFAULT_SEND_MODE = "api"
 SEND_MODE_BROWSER = "browser"
 SEND_MODE_API = "api"
+# 常规生成、轮询、采集和下载只允许 API；浏览器仅保留在显式授权/诊断接口中。
 SEND_MODE_OPTIONS = [
-    {"id": SEND_MODE_BROWSER, "label": "浏览器发送"},
-    {"id": SEND_MODE_API, "label": "API发送"},
+    {"id": SEND_MODE_API, "label": "纯 API（默认）"},
 ]
+DEFAULT_BROWSER_HEADLESS = False
 
 CONFIG_PATH = os.path.join(get_wizstar_data_dir(), "dola_config.json")
 RUNTIME_DIR = os.path.join(get_wizstar_data_dir(), "dola")
@@ -168,13 +168,30 @@ def _load_config() -> dict:
 
 
 def _normalize_send_mode(value: str | None) -> str:
-    mode = _clean_str(value).lower()
-    if mode in (SEND_MODE_BROWSER, SEND_MODE_API):
-        return mode
-    return DEFAULT_SEND_MODE
+    # 历史配置可能记录了 browser；默认工作流不再允许它进入生成链路。
+    return SEND_MODE_API
 
 
-def save_config(proxy: str | None = None, env_file: str | None = None, profile_dir: str | None = None, send_mode: str | None = None) -> dict:
+def _normalize_browser_headless(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return DEFAULT_BROWSER_HEADLESS
+    text = _clean_str(value).lower()
+    if text in {"1", "true", "yes", "on", "headless"}:
+        return True
+    if text in {"0", "false", "no", "off", "visible"}:
+        return False
+    return DEFAULT_BROWSER_HEADLESS
+
+
+def save_config(
+    proxy: str | None = None,
+    env_file: str | None = None,
+    profile_dir: str | None = None,
+    send_mode: str | None = None,
+    browser_headless: bool | None = None,
+) -> dict:
     config = _load_config()
     if proxy is not None:
         config["proxy"] = _clean_str(proxy)
@@ -186,6 +203,10 @@ def save_config(proxy: str | None = None, env_file: str | None = None, profile_d
         config["send_mode"] = _normalize_send_mode(send_mode)
     elif "send_mode" not in config:
         config["send_mode"] = DEFAULT_SEND_MODE
+    if browser_headless is not None:
+        config["browser_headless"] = _normalize_browser_headless(browser_headless)
+    elif "browser_headless" not in config:
+        config["browser_headless"] = DEFAULT_BROWSER_HEADLESS
     Path(CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
@@ -196,6 +217,16 @@ def get_send_mode() -> str:
     config = _load_config()
     env_mode = _normalize_send_mode(os.environ.get("DOLA_SEND_MODE"))
     return _normalize_send_mode(config.get("send_mode") or env_mode)
+
+
+def get_browser_headless() -> bool:
+    config = _load_config()
+    if "browser_headless" in config:
+        return _normalize_browser_headless(config.get("browser_headless"))
+    env_value = os.environ.get("DOLA_BROWSER_HEADLESS")
+    if env_value is not None:
+        return _normalize_browser_headless(env_value)
+    return DEFAULT_BROWSER_HEADLESS
 
 
 def use_account(account: dict | None) -> dict:
@@ -406,9 +437,6 @@ def _generate_tea_id() -> str:
     return str((ms << 22) | rand)
 
 
-def _generate_ms_token() -> str:
-    return base64.b64encode(os.urandom(78)).decode("ascii").replace("+", "-").replace("/", "_") + "=="
-
 
 def _normalize_env_value(value: str) -> str:
     return _clean_str(value).replace("\r", " ").replace("\n", " ")
@@ -426,12 +454,15 @@ def _upsert_env_value(content: str, key: str, value: str) -> str:
     return f"{content}{prefix}{line}\n"
 
 
-def write_env_from_cookie(cookie: str, env_file: str = "", profile_dir: str = "") -> dict:
+def write_env_from_cookie(cookie: str, env_file: str = "", profile_dir: str = "", ms_token: str = "") -> dict:
     cookie = _normalize_env_value(cookie)
+    token = _normalize_env_value(ms_token)
     if not cookie:
         raise DolaError("请填写 Dola Cookie", status_code=400)
     if "=" not in cookie:
         raise DolaError("Cookie 格式不正确，请粘贴完整的 name=value; name2=value2 串", status_code=400)
+    if not token:
+        raise DolaError("请填写用户显式提供的 DOLA_MS_TOKEN；系统不会从 Cookie 推导、生成或刷新 Token", status_code=400)
 
     base_dir = os.path.join(RUNTIME_DIR, "accounts", f"manual-{uuid.uuid4().hex[:10]}")
     env_path = _clean_str(env_file) or os.path.join(base_dir, ".env.dola")
@@ -449,7 +480,8 @@ def write_env_from_cookie(cookie: str, env_file: str = "", profile_dir: str = ""
         "DOLA_VERSION_CODE": "20800",
         "DOLA_PC_VERSION": "3.23.5",
         "DOLA_FP": fp,
-        "DOLA_MS_TOKEN": _cookie_value(cookie, "msToken") or _generate_ms_token(),
+        "DOLA_MS_TOKEN": token,
+        "DOLA_MS_TOKEN_SOURCE": "user-provided",
     }
 
     env_target = Path(env_path)
@@ -470,14 +502,18 @@ def account_status(env_file_override: str = "", profile_dir_override: str = "") 
     profile_dir = _clean_str(profile_dir_override) or profile_dir_path()
     values = _read_env_file(env_file)
     cookie = values.get("DOLA_COOKIE", "")
-    required = ["DOLA_COOKIE", "DOLA_USER_AGENT", "DOLA_DEVICE_ID", "DOLA_WEB_ID", "DOLA_TEA_UUID", "DOLA_WEB_TAB_ID", "DOLA_FP", "DOLA_MS_TOKEN"]
-    missing = [key for key in required if not values.get(key)]
+    # API 认证只使用用户手动保存的本地凭证；没有凭证时明确失败，
+    # 不得将缺失状态解释为需要启动浏览器。
+    required = ["DOLA_COOKIE", "DOLA_MS_TOKEN"]
+    missing = [key for key in required if not _clean_str(values.get(key))]
+    has_ms_token = bool(values.get("DOLA_MS_TOKEN"))
     send_mode = get_send_mode()
     configured = not missing
     return {
         "configured": configured,
-        "browser_session_required": True,
-        "account_grab_required": False,
+        "api_only": True,
+        "authentication_required": not configured,
+        "required_credentials": required,
         "env_file": env_file,
         "profile_dir": profile_dir,
         "runner_dir": get_runner_dir(),
@@ -487,10 +523,17 @@ def account_status(env_file_override: str = "", profile_dir_override: str = "") 
         "device_id_masked": _mask(values.get("DOLA_DEVICE_ID", "")),
         "web_id_masked": _mask(values.get("DOLA_WEB_ID", "")),
         "fp_masked": _mask(values.get("DOLA_FP", "")),
+        "ms_token_source": "user-provided" if has_ms_token else "missing",
         "missing": missing,
+        "configuration_hint": (
+            f"请手动填写有效的 {', '.join(missing)}。认证失败后需由用户显式更新凭证；系统不会自动打开浏览器、读取 Cookie 或刷新 Token。"
+            if missing else
+            "纯 API 已就绪。生成、轮询、采集和下载均不会启动或连接浏览器。"
+        ),
         "send_mode": send_mode,
         "send_mode_options": SEND_MODE_OPTIONS,
-        "send_mode_label": next((item["label"] for item in SEND_MODE_OPTIONS if item["id"] == send_mode), send_mode),
+        "send_mode_label": "纯 API（默认）",
+        "browser_headless": False,
         "models": DEFAULT_MODELS,
         "ratios": DEFAULT_RATIOS,
     }
@@ -520,6 +563,23 @@ def _account_env_overrides(env_file: str = "", profile_dir: str = "") -> dict:
     if clean_profile_dir:
         overrides["DOLA_PROFILE_DIR"] = clean_profile_dir
     return overrides
+
+
+def _api_credentials(env_overrides: dict | None = None) -> tuple[str, list[str]]:
+    env_file = _clean_str((env_overrides or {}).get("DOLA_ENV_FILE")) or env_file_path()
+    values = _read_env_file(env_file)
+    required = ("DOLA_COOKIE", "DOLA_MS_TOKEN")
+    missing = [key for key in required if not _clean_str(values.get(key))]
+    return env_file, missing
+
+
+def _require_api_credentials(env_overrides: dict | None = None) -> None:
+    _, missing = _api_credentials(env_overrides)
+    if missing:
+        raise DolaError(
+            f"Dola API 认证未配置：缺少 {', '.join(missing)}。请由用户手动填写有效凭证；系统不会读取 Chrome、刷新 Cookie 或打开浏览器。",
+            status_code=401,
+        )
 
 
 def _sync_env_file_for_runner(env_file: str = "") -> None:
@@ -729,6 +789,7 @@ def open_account_browser(
     proxy: str = "",
     url: str = "",
     persistent: bool = False,
+    headless: bool = False,
 ) -> dict:
     if proxy:
         save_config(proxy=proxy)
@@ -751,11 +812,12 @@ def open_account_browser(
             "port": _find_chrome_debug_port_for_profile(current_profile_dir),
             "url": target_url,
             "reused": True,
+            "headless": bool(headless),
         }
     args = [
         "browser-send-test.mjs",
-        "--visible",
-        "--keep-open",
+        "--headless" if headless else "--visible",
+        *( [] if headless else ["--keep-open"] ),
         "--open-only",
         "--temp-profile" if use_temp_profile else "--persistent-profile",
         "--profile", current_profile_dir,
@@ -806,6 +868,7 @@ def open_account_browser(
         "port": ready_port or launch_port,
         "url": target_url,
         "chrome_ready": bool(ready_port),
+        "headless": bool(headless),
     }
 
 
@@ -1154,11 +1217,18 @@ def _prompt_file_cleanup_flag() -> str:
     return "--cleanup-prompt-file"
 
 
-def _browser_submit_args(prompt: str, refs: list[str], ratio: str, duration: int, output_path: str = "", task_profile_dir: str = "") -> list[str]:
+def _browser_submit_args(
+    prompt: str,
+    refs: list[str],
+    ratio: str,
+    duration: int,
+    output_path: str = "",
+    task_profile_dir: str = "",
+    headless: bool = False,
+) -> list[str]:
     args = [
         "browser-send-test.mjs",
-        "--visible",
-        "--keep-open",
+        "--headless" if headless else "--visible",
         "--persistent-profile",
         "--profile",
         _clean_str(task_profile_dir) or _browser_session_profile_dir(),
@@ -1170,6 +1240,8 @@ def _browser_submit_args(prompt: str, refs: list[str], ratio: str, duration: int
         ratio,
         "--poll-result",
     ]
+    if not headless:
+        args.append("--keep-open")
     if output_path:
         args.extend(["--poll-output", output_path])
     if refs:
@@ -1462,6 +1534,30 @@ def _looks_like_quota_rejection(text: str) -> bool:
     return any(marker in compact for marker in _QUOTA_REJECTION_MARKERS)
 
 
+def _api_authentication_failure_reason(text: str) -> str:
+    compact = _compact_log_text(text or "")
+    if not compact:
+        return ""
+    markers = (
+        "[认证/配置错误]",
+        "HTTP 401",
+        "HTTP 403",
+        "status=401",
+        "status=403",
+        "login_required",
+        "session_expired",
+        "not_login",
+        "unauthorized",
+        "登录态无效",
+        "Cookie 失效",
+        "cookie 过期",
+        "msToken 失效",
+    )
+    if not any(marker.lower() in compact.lower() for marker in markers):
+        return ""
+    return "Dola API 认证失败或凭证已失效。请由用户手动更新 DOLA_COOKIE 和 DOLA_MS_TOKEN 后重试；系统不会读取 Chrome、自动刷新 Cookie 或打开浏览器。"
+
+
 def _extract_observed_quota_cost(output: str) -> int:
     # 先判断这条输出是不是"拒绝/失败"消息。
     # Dola 在额度不足时会回"本次视频生成需要消耗 2 个视频生成额度，今日剩余 1 个
@@ -1691,6 +1787,7 @@ def create_video(
     quota_cost: int = 0,
     retry_account_picker=None,
     max_empty_sse_retries: int = 1,
+    headless: bool | None = None,
 ) -> dict:
     prompt = _clean_str(prompt, "生成一段视频")
     model = _clean_str(model, "seedance-2.0")
@@ -1717,13 +1814,18 @@ def create_video(
     task_id = _clean_str(task_id) or f"dola-{uuid.uuid4().hex[:12]}"
     send_mode = get_send_mode()
     send_mode_label = next((item["label"] for item in SEND_MODE_OPTIONS if item["id"] == send_mode), send_mode)
+    configured_browser_headless = get_browser_headless() if headless is None else bool(headless)
+    browser_headless = configured_browser_headless if send_mode == SEND_MODE_BROWSER else False
     Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
-    Path(TASK_PROFILE_DIR).mkdir(parents=True, exist_ok=True)
+    if send_mode == SEND_MODE_BROWSER:
+        Path(TASK_PROFILE_DIR).mkdir(parents=True, exist_ok=True)
     account_id = int(account.get("id") or 0) if account else 0
     account_name = account.get("name", "") if account else ""
     account_env_file = _clean_str(account.get("env_file") if account else "") or env_file_path()
     account_profile_dir = _clean_str(account.get("profile_dir") if account else "") or profile_dir_path()
-    task_profile_dir = _prepare_task_profile(task_id, account)
+    task_profile_dir = _prepare_task_profile(task_id, account) if send_mode == SEND_MODE_BROWSER else ""
+    account_env_overrides = _account_env_overrides(account_env_file, account_profile_dir)
+    _require_api_credentials(account_env_overrides)
     _set_task(
         task_id,
         task_id=task_id,
@@ -1746,6 +1848,7 @@ def create_video(
         browser_base_profile_dir=task_profile_dir,
         browser_temp_profile=False,
         browser_persistent_profile=True,
+        browser_headless=browser_headless,
         browser_pid=0,
         browser_session={},
         send_mode=send_mode,
@@ -1828,6 +1931,10 @@ def create_video(
                     "progress": 100,
                 }
                 _reserve_observed_quota_once(task_id, output)
+                authentication_failure = _api_authentication_failure_reason(output)
+                if authentication_failure:
+                    _fail_task(task_id, authentication_failure, **updates)
+                    return
                 if result.returncode != 0 and conversation_id and not video_url and not local_path and not parsed.get("failure_reason"):
                     _set_task(
                         task_id,
@@ -1892,8 +1999,13 @@ def create_video(
                     ).start()
                 return
 
+            raise DolaError(
+                "普通 Dola 生成仅支持 API-only；浏览器提交只允许通过手动授权/诊断入口触发。",
+                status_code=400,
+            )
+
             browser_output_path = os.path.join(DOWNLOAD_DIR, f"dola-browser-{task_id}.mp4")
-            args = _browser_submit_args(prompt, refs, ratio, duration, browser_output_path, task_profile_dir)
+            args = _browser_submit_args(prompt, refs, ratio, duration, browser_output_path, task_profile_dir, headless=browser_headless)
 
             def _on_output(output: str) -> None:
                 parsed = _parse_browser_submit_output(output)
@@ -2041,6 +2153,15 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
     try:
         current_task = _get_task(task_id)
         try:
+            _require_api_credentials(env_overrides)
+        except DolaError as error:
+            try:
+                current_progress = int(current_task.get("progress") or 0)
+            except (TypeError, ValueError):
+                current_progress = 20
+            _fail_task(task_id, str(error), progress=max(20, current_progress))
+            return
+        try:
             current_progress = int(current_task.get("progress") or 0)
         except (TypeError, ValueError):
             current_progress = 0
@@ -2069,7 +2190,10 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
             "progress": 100 if result.returncode == 0 or parsed.get("failure_reason") else 90,
             "collect_finished_at": time.time(),
         }
-        if parsed.get("video_url") or parsed.get("local_path"):
+        authentication_failure = _api_authentication_failure_reason(output)
+        if authentication_failure:
+            _fail_task(task_id, authentication_failure, **updates)
+        elif parsed.get("video_url") or parsed.get("local_path"):
             local_path = _clean_str(parsed.get("local_path", ""))
             video_url = _clean_str(parsed.get("video_url", ""))
             if video_url and not local_path:
@@ -2083,8 +2207,6 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
                         f"视频已生成但下载到本地失败，远程链接可能已过期。可尝试重新采集或打开浏览器查看。远程地址: {video_url[:200]}",
                         **updates,
                     )
-                    if manual_collect:
-                        _close_task_browser(task_id)
                     return
             _set_task(
                 task_id,
@@ -2095,17 +2217,11 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
                 collect_fail_count=0,
             )
             _sync_task_db_status(task_id, "completed", local_path or video_url or "")
-            if manual_collect:
-                _close_task_browser(task_id)
         elif parsed.get("failure_reason") and any(marker in parsed.get("failure_reason", "") for marker in ("侵权", "违规", "违法", "违禁", "无法生成", "无法返回", "生成失败", "内容未通过", "抱歉", "时长超过", "拒绝生成", "达到上限", "已达上限", "cannot be generated", "longer than")):
             _fail_task(task_id, parsed.get("failure_reason", ""), **updates)
-            if manual_collect:
-                _close_task_browser(task_id)
         elif _looks_like_quota_rejection(output):
             quota_reason = _compact_log_text(output)[:500]
             _fail_task(task_id, f"额度不足或被拒绝生成: {quota_reason}", **updates)
-            if manual_collect:
-                _close_task_browser(task_id)
         elif result.returncode == 0:
             _set_task(
                 task_id,
@@ -2115,8 +2231,6 @@ def _poll_task_result(task_id: str, conversation_id: str, env_overrides: dict | 
                 fail_reason="",
             )
             _sync_task_db_status(task_id, "completed", parsed.get("local_path") or parsed.get("video_url") or "")
-            if manual_collect:
-                _close_task_browser(task_id)
         else:
             collectable_updates = _task_update_payload(updates, "status", "error", "fail_reason")
             retry_reason = parsed.get("failure_reason", "") or "暂未拿到视频，已保留会话，可稍后继续采集。"
@@ -2297,6 +2411,7 @@ def _reopen_account_browser_and_collect(task_id: str, conversation_id: str) -> b
             wait_ms=8000,
             url=page_url,
             persistent=True,
+            headless=bool(task.get("browser_headless")),
         )
         account_payload = {"env_file": account_env_file, "profile_dir": task_profile_dir}
         remember_browser_session_for_conversation(conv, result, account_payload)
@@ -2343,6 +2458,7 @@ def collect_task(task_id: str = "", conversation_id: str = "", account: dict | N
     account_env_file = _clean_str(account.get("env_file") if account else "") or _clean_str(task.get("account_env_file"))
     account_profile_dir = _clean_str(account.get("profile_dir") if account else "") or _clean_str(task.get("account_profile_dir"))
     env_overrides = _account_env_overrides(account_env_file, account_profile_dir)
+    _require_api_credentials(env_overrides)
     task_id = task_id or f"dola-collect-{uuid.uuid4().hex[:12]}"
     task = _get_task(task_id)
     if not task:
@@ -2391,7 +2507,7 @@ def collect_task(task_id: str = "", conversation_id: str = "", account: dict | N
     _sync_task_db_status(task_id, "processing")
 
     def _run_collect() -> None:
-        # 同一账号的采集任务串行执行，避免多个浏览器实例争抢同一个 Chrome profile。
+        # 同一账号的 API 轮询串行执行，避免短时间内对同一登录态发起过多请求。
         account_id_for_lock = int(account.get("id") or 0) if account else 0
         account_lock = _get_account_collect_lock(account_id_for_lock) if account_id_for_lock else None
         if account_lock:
@@ -2401,17 +2517,9 @@ def collect_task(task_id: str = "", conversation_id: str = "", account: dict | N
             _do_collect(task_id, conv, env_overrides)
 
     def _do_collect(task_id: str, conv: str, env_overrides: dict) -> None:
-        # 采集结果优先走浏览器路径（能用页面真实签名参数，更稳定），
-        # 浏览器路径都失败时再回退到纯 API 轮询。
-        try:
-            if _collect_task_result_browser_context(task_id, conv):
-                return
-            if _reopen_account_browser_and_collect(task_id, conv):
-                return
-            _poll_task_result(task_id, conv, env_overrides, True)
-        finally:
-            # 采集结束后统一关闭浏览器，无论成功还是失败
-            _close_task_browser(task_id)
+        # 常规采集只调用 /im/chain/single，绝不启动或复用浏览器。
+        # 浏览器诊断保留在显式的 open-browser 接口中，避免采集动作产生副作用。
+        _poll_task_result(task_id, conv, env_overrides, True)
 
     threading.Thread(target=_run_collect, daemon=True).start()
     return _get_task(task_id)
@@ -2443,6 +2551,7 @@ def list_tasks(limit: int = 100) -> list[dict]:
         repaired_cache: dict[str, dict] = {}
         for key, value in _task_cache.items():
             repaired = _repair_internal_state_error(dict(value))
+            repaired = _repair_stale_collecting_task(key, repaired)
             repaired_cache[key] = repaired
             changed = changed or repaired != value
         if changed:

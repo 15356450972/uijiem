@@ -21,6 +21,7 @@
  *   --no-account          不读写账号文件
  *   --no-proxy            直连，不走本地代理
  *   --proxy=host:port     指定本地代理（默认 127.0.0.1:7890）
+ *   --mail-provider=<name> 注册邮箱来源：gptmail 或 10minutemail
  *   --output=<dir>        下载目录（默认 ./downloads）
  *   --debug               输出调试信息
  *
@@ -126,6 +127,7 @@ const commands = {
       password: args.password,
       inviteCode: args.invite || '',
       language: args.lang || 'zh',
+      mailProvider: args['mail-provider'] || args.mailProvider || args.mail_provider,
       maxWait: args.maxWait ? parseInt(args.maxWait) : undefined
     });
     persist(client);
@@ -199,6 +201,7 @@ const commands = {
       aspectRatio: args.ratio || args.aspectRatio,
       duration: args.duration ? parseInt(args.duration) : undefined,
       resolution: args.resolution,
+      generateMode: args.generateMode || args.generate_mode || args['generate-mode'],
       referenceImages: refs,
       download: bool(args.download),
       filename: args.filename,

@@ -159,20 +159,34 @@ export default function Settings({ focusSection = '' }) {
   const [oiUseProxy, setOiUseProxy] = useState(true);
   const [oiProxyHost, setOiProxyHost] = useState('127.0.0.1');
   const [oiProxyPort, setOiProxyPort] = useState(7890);
+  const [oiMailProvider, setOiMailProvider] = useState('applemail');
+  const [oiMailProviderOptions, setOiMailProviderOptions] = useState([
+    { id: 'applemail', label: '全局邮箱库（默认）' },
+    { id: 'gptmail', label: 'GPTMail' },
+    { id: '10minutemail', label: '10MinuteMail.one' },
+  ]);
   const [oiAccountCount, setOiAccountCount] = useState(0);
   const [oiSaving, setOiSaving] = useState(false);
   const [oiTesting, setOiTesting] = useState(false);
   const [oiResult, setOiResult] = useState(null); // { ok, msg }
   const [oiRegistering, setOiRegistering] = useState(false);
   const [dolaConfigured, setDolaConfigured] = useState(false);
-  const [dolaSendMode, setDolaSendMode] = useState('browser');
-  const [dolaSendModeLabel, setDolaSendModeLabel] = useState('浏览器发送');
-  const [dolaSendModeOptions, setDolaSendModeOptions] = useState([
-    { id: 'browser', label: '浏览器发送' },
-    { id: 'api', label: 'API发送' },
-  ]);
+  const [dolaSendModeLabel, setDolaSendModeLabel] = useState('纯 API（默认）');
+  const [dolaConfigHint, setDolaConfigHint] = useState('请手动配置有效的 DOLA_COOKIE 和 DOLA_MS_TOKEN。');
   const [dolaSaving, setDolaSaving] = useState(false);
   const [dolaResult, setDolaResult] = useState(null);
+  const [oreateaiRegistering, setOreateaiRegistering] = useState(false);
+  const [oreateaiAccountCount, setOreateaiAccountCount] = useState(0);
+  const [oreateaiResult, setOreateaiResult] = useState(null);
+  const [oreateaiProgress, setOreateaiProgress] = useState('');
+  const [framiaAccountCount, setFramiaAccountCount] = useState(0);
+  const [framiaLoginEmail, setFramiaLoginEmail] = useState('');
+  const [framiaLoginPassword, setFramiaLoginPassword] = useState('');
+  const [framiaLoggingIn, setFramiaLoggingIn] = useState(false);
+  const [framiaResult, setFramiaResult] = useState(null);
+  const [tensorartAccountCount, setTensorartAccountCount] = useState(0);
+  const [tensorartRegistering, setTensorartRegistering] = useState(false);
+  const [tensorartResult, setTensorartResult] = useState(null);
   const oiioiiSectionRef = useRef(null);
 
   const loadOiConfig = async () => {
@@ -185,6 +199,14 @@ export default function Settings({ focusSection = '' }) {
       setOiUseProxy(d.use_proxy !== undefined ? d.use_proxy : true);
       setOiProxyHost(d.proxy_host || '127.0.0.1');
       setOiProxyPort(d.proxy_port || 7890);
+      setOiMailProvider(['applemail', 'gptmail', '10minutemail'].includes(d.mail_provider) ? d.mail_provider : 'applemail');
+      setOiMailProviderOptions(Array.isArray(d.mail_provider_options) && d.mail_provider_options.length > 0
+        ? d.mail_provider_options
+        : [
+            { id: 'applemail', label: '全局邮箱库（默认）' },
+            { id: 'gptmail', label: 'GPTMail' },
+            { id: '10minutemail', label: '10MinuteMail.one' },
+          ]);
       setOiAccountCount(d.account_count || 0);
     } catch (_) { /* backend offline */ }
   };
@@ -195,15 +217,93 @@ export default function Settings({ focusSection = '' }) {
       const data = await res.json();
       const d = data.data || {};
       setDolaConfigured(!!d.configured);
-      setDolaSendMode(d.send_mode === 'api' ? 'api' : 'browser');
-      setDolaSendModeLabel(d.send_mode_label || (d.send_mode === 'api' ? 'API发送' : '浏览器发送'));
-      setDolaSendModeOptions(Array.isArray(d.send_mode_options) && d.send_mode_options.length > 0
-        ? d.send_mode_options
-        : [
-            { id: 'browser', label: '浏览器发送' },
-            { id: 'api', label: 'API发送' },
-          ]);
+      setDolaSendModeLabel(d.send_mode_label || '纯 API（默认）');
+      setDolaConfigHint(d.configuration_hint || '请手动配置有效的 DOLA_COOKIE 和 DOLA_MS_TOKEN。');
     } catch (_) { /* backend offline */ }
+  };
+
+  const loadOreateaiAccounts = async () => {
+    try {
+      const res = await fetchLocalApi('/oreateai/accounts');
+      const data = await res.json();
+      setOreateaiAccountCount(Array.isArray(data.data) ? data.data.length : 0);
+    } catch (_) { /* backend offline */ }
+  };
+
+  const loadFramiaAccounts = async () => {
+    try {
+      const res = await fetchLocalApi('/framia/accounts');
+      const data = await res.json();
+      setFramiaAccountCount(Array.isArray(data.data) ? data.data.length : 0);
+    } catch (_) { /* backend offline */ }
+  };
+
+  const loginFramiaAccount = async () => {
+    if (!framiaLoginEmail.trim() || !framiaLoginPassword.trim()) {
+      setFramiaResult({ ok: false, msg: '请输入邮箱和密码' });
+      return;
+    }
+    setFramiaLoggingIn(true);
+    setFramiaResult(null);
+    try {
+      const res = await fetchLocalApi('/framia/accounts/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: framiaLoginEmail.trim(),
+          password: framiaLoginPassword.trim(),
+          visible: true,
+          keep_open: false,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || '登录失败');
+      setFramiaResult({
+        ok: true,
+        msg: `已登录 ${framiaLoginEmail.trim()}，accessToken 已采集`,
+      });
+      setFramiaLoginEmail('');
+      setFramiaLoginPassword('');
+      await loadFramiaAccounts();
+    } catch (error) {
+      setFramiaResult({ ok: false, msg: error.message || String(error) });
+    } finally {
+      setFramiaLoggingIn(false);
+    }
+  };
+
+  const loadTensorartAccounts = async () => {
+    try {
+      const res = await fetchLocalApi('/tensorart/accounts');
+      const data = await res.json();
+      const accounts = Array.isArray(data.data) ? data.data : [];
+      setTensorartAccountCount(accounts.filter(account => account.configured).length);
+    } catch (_) { /* backend offline */ }
+  };
+
+  const registerTensorartAccount = async () => {
+    setTensorartRegistering(true);
+    setTensorartResult(null);
+    try {
+      const res = await fetchLocalApi('/tensorart/accounts/register-pool', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ count: 1, concurrency: 1 }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || '注册失败');
+      const result = data.data || {};
+      if (!result.succeeded) {
+        const error = (result.results || []).find(item => !item.ok)?.error;
+        throw new Error(error || '注册失败');
+      }
+      setTensorartResult({ ok: true, msg: '渠道十账号注册并登录成功' });
+      await loadTensorartAccounts();
+    } catch (error) {
+      setTensorartResult({ ok: false, msg: error.message || String(error) });
+    } finally {
+      setTensorartRegistering(false);
+    }
   };
 
   useEffect(() => {
@@ -211,6 +311,27 @@ export default function Settings({ focusSection = '' }) {
     loadCgConfig();
     loadOiConfig();
     loadDolaConfig();
+    loadOreateaiAccounts();
+    loadFramiaAccounts();
+    loadTensorartAccounts();
+  }, []);
+
+  useEffect(() => {
+    if (!window.electronAPI?.onOreateaiLoginProgress) return undefined;
+    const labels = {
+      mailbox_connecting: '正在连接小苹果邮件 API...',
+      browser_opening: '正在启动真实 Chromium...',
+      ticket_request: '正在获取注册票据...',
+      risk_request: '正在由页面风控运行时生成凭证...',
+      signup_submit: '正在提交注册...',
+      email_wait: '正在等待验证邮件...',
+      email_verify: '正在打开邮箱验证链接...',
+      login_check: '正在确认登录状态...',
+      complete: '登录成功，正在导出 Cookie...',
+    };
+    return window.electronAPI.onOreateaiLoginProgress(({ step }) => {
+      setOreateaiProgress(labels[step] || step || '');
+    });
   }, []);
 
   useEffect(() => {
@@ -229,6 +350,7 @@ export default function Settings({ focusSection = '' }) {
         use_proxy: oiUseProxy,
         proxy_host: oiProxyHost,
         proxy_port: parseInt(oiProxyPort) || 7890,
+        mail_provider: oiMailProvider,
         test: !!withTest,
       };
       const res = await fetchLocalApi('/oiioii/config', {
@@ -246,6 +368,8 @@ export default function Settings({ focusSection = '' }) {
       setOiConfigured(!!d.configured);
       setOiSdkAvailable(!!d.sdk_available);
       setOiAccountCount(d.account_count || 0);
+      setOiMailProvider(['applemail', 'gptmail', '10minutemail'].includes(d.mail_provider) ? d.mail_provider : 'applemail');
+      setOiMailProviderOptions(Array.isArray(d.mail_provider_options) && d.mail_provider_options.length > 0 ? d.mail_provider_options : oiMailProviderOptions);
       if (d.test) {
         setOiResult(d.test.ok
           ? { ok: true, msg: `SDK 可用，支持模型：图片 ${Object.keys(d.test.models?.image || {}).join(', ')}；视频 ${Object.keys(d.test.models?.video || {}).join(', ')}` }
@@ -268,7 +392,7 @@ export default function Settings({ focusSection = '' }) {
       const res = await fetchLocalApi('/dola/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ send_mode: dolaSendMode }),
+        body: JSON.stringify({ send_mode: 'api' }),
       });
       if (!res.ok) {
         let msg = `HTTP ${res.status}`;
@@ -277,11 +401,10 @@ export default function Settings({ focusSection = '' }) {
       }
       const data = await res.json();
       const d = data.data || {};
-      const nextMode = d.send_mode === 'api' ? 'api' : 'browser';
       setDolaConfigured(!!d.configured);
-      setDolaSendMode(nextMode);
-      setDolaSendModeLabel(d.send_mode_label || (nextMode === 'api' ? 'API发送' : '浏览器发送'));
-      setDolaResult({ ok: true, msg: `已切换为${nextMode === 'api' ? 'API发送' : '浏览器发送'}` });
+      setDolaSendModeLabel(d.send_mode_label || '纯 API（默认）');
+      setDolaConfigHint(d.configuration_hint || '请手动配置有效的 DOLA_COOKIE 和 DOLA_MS_TOKEN。');
+      setDolaResult({ ok: true, msg: d.configured ? '已保存：纯 API 模式已启用。' : (d.configuration_hint || '已保存：请手动配置有效的 DOLA_COOKIE 和 DOLA_MS_TOKEN。') });
     } catch (e) {
       setDolaResult({ ok: false, msg: e.message || String(e) });
     } finally {
@@ -293,7 +416,11 @@ export default function Settings({ focusSection = '' }) {
     setOiRegistering(true);
     setOiResult(null);
     try {
-      const res = await fetchLocalApi('/oiioii/register', { method: 'POST' });
+      const res = await fetchLocalApi('/oiioii/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mail_provider: oiMailProvider }),
+      });
       if (!res.ok) {
         let msg = `HTTP ${res.status}`;
         try { const e = await res.json(); msg = e.detail || msg; } catch (_) {}
@@ -311,6 +438,31 @@ export default function Settings({ focusSection = '' }) {
       setOiResult({ ok: false, msg: e.message || String(e) });
     } finally {
       setOiRegistering(false);
+    }
+  };
+
+  const registerOreateaiAccount = async () => {
+    if (!window.electronAPI?.oreateaiRegisterLogin) {
+      setOreateaiResult({ ok: false, msg: '请在 Electron 桌面端中使用真实浏览器注册' });
+      return;
+    }
+    setOreateaiRegistering(true);
+    setOreateaiResult(null);
+    setOreateaiProgress('正在准备注册...');
+    try {
+      const result = await window.electronAPI.oreateaiRegisterLogin({ visible: true, keepOpen: false });
+      if (!result?.ok) throw new Error(result?.error || 'OreateAI 注册登录失败');
+      const single = result.results?.[0] || result;
+      if (!single?.ok) throw new Error(single?.error || 'OreateAI 注册登录失败');
+      setOreateaiResult({
+        ok: true,
+        msg: `已登录 ${single.email}，导出 ${single.cookieCount} 个 Cookie`,
+      });
+      await loadOreateaiAccounts();
+    } catch (error) {
+      setOreateaiResult({ ok: false, msg: error.message || String(error) });
+    } finally {
+      setOreateaiRegistering(false);
     }
   };
 
@@ -621,6 +773,39 @@ export default function Settings({ focusSection = '' }) {
               <span className="text-[9px] text-dark-subtle block">OiiOii API 需要海外出口，默认通过本地 Clash 代理（127.0.0.1:7890）访问。关闭则直连。</span>
             </div>
 
+            <div className="space-y-2.5">
+              <div className="flex items-center space-x-2">
+                <KeyRound className="w-3.5 h-3.5 text-dark-muted" />
+                <span className="text-[10px] font-bold text-dark-muted uppercase">注册邮箱来源</span>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {oiMailProviderOptions.map((option) => {
+                  const active = oiMailProvider === option.id;
+                  return (
+                    <button
+                      key={option.id}
+                      type="button"
+                      onClick={() => setOiMailProvider(option.id)}
+                      className={`rounded-xl border px-4 py-3 text-left transition-all ${active ? 'border-brand bg-brand/10 text-white' : 'border-dark-border bg-dark-card text-dark-muted hover:border-brand/40 hover:text-white'}`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-sm font-bold">{option.label}</span>
+                        {active && <CheckCircle2 className="w-4 h-4 text-brand" />}
+                      </div>
+                      <div className="mt-1 text-[10px] leading-relaxed text-current/70">
+                        {option.id === 'applemail'
+                          ? '从全局邮箱库领取尚未用于渠道四的 Microsoft OAuth 邮箱，并通过小苹果 API 收取验证码。'
+                          : option.id === '10minutemail'
+                            ? '使用 10MinuteMail.one 的 .com 临时邮箱接收渠道四注册验证邮件。'
+                            : '使用原有 GPTMail 临时邮箱流程。'}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+              <span className="text-[9px] text-dark-subtle block">保存后，设置页自动注册和账号库批量注册都会使用这里选择的邮箱来源。</span>
+            </div>
+
             <div className="flex items-center flex-wrap gap-3">
               <button
                 type="button"
@@ -678,30 +863,21 @@ export default function Settings({ focusSection = '' }) {
             </div>
 
             <div className="space-y-2.5">
-              <div className="text-[10px] text-dark-subtle leading-relaxed">
-                浏览器发送会直接在页面里点击提交，API发送会走直发链路。这里切换后，渠道六的所有生成请求都会按这个模式执行。
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {dolaSendModeOptions.map((option) => {
-                  const active = dolaSendMode === option.id;
-                  return (
-                    <button
-                      key={option.id}
-                      type="button"
-                      onClick={() => setDolaSendMode(option.id)}
-                      className={`rounded-xl border px-4 py-3 text-left transition-all ${active ? 'border-brand bg-brand/10 text-white' : 'border-dark-border bg-dark-card text-dark-muted hover:border-brand/40 hover:text-white'}`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-sm font-bold">{option.label}</span>
-                        {active && <CheckCircle2 className="w-4 h-4 text-brand" />}
-                      </div>
-                      <div className="mt-1 text-[10px] leading-relaxed text-current/70">
-                        {option.id === 'browser' ? '通过浏览器会话完成上传、切换视频和点击生成。' : '通过后端直发 Dola 接口，直接返回会话与结果信息。'}
-                      </div>
-                    </button>
-                  );
-                })}
+              <div className="rounded-xl border border-dark-border bg-dark-card px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-bold text-white">纯 API 模式</div>
+                    <div className="mt-1 text-[10px] leading-relaxed text-dark-subtle">
+                      渠道六的生成、轮询、URL 解析、下载、单项/批量采集和失败恢复只走后端 Dola API。浏览器入口仅保留给用户手动授权、登录或诊断，不作为自动回退。
+                    </div>
+                  </div>
+                  <span className="shrink-0 rounded-full border border-brand/30 bg-brand/10 px-2.5 py-1 text-[10px] font-bold text-brand">
+                    API-only
+                  </span>
+                </div>
+                <div className="mt-2 text-[10px] leading-relaxed text-dark-subtle">
+                  {dolaConfigHint}
+                </div>
               </div>
             </div>
 
@@ -720,6 +896,144 @@ export default function Settings({ focusSection = '' }) {
                 <span className={`flex items-center space-x-1.5 text-[11px] font-medium ${dolaResult.ok ? 'text-brand' : 'text-red-400'}`}>
                   {dolaResult.ok ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <XCircle className="w-3.5 h-3.5 shrink-0" />}
                   <span>{dolaResult.msg}</span>
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* SECTION 6: OreateAI 渠道八 — 真实 Chromium 注册登录 */}
+          <div className="space-y-4">
+            <div className="flex items-center justify-between border-b border-dark-border/40 pb-1.5">
+              <div className="flex items-center space-x-2">
+                <Globe className="w-4 h-4 text-brand" />
+                <h3 className="text-xs font-bold text-white uppercase tracking-wider">渠道八（OreateAI）</h3>
+              </div>
+              <span className={`flex items-center space-x-1 text-[10px] font-bold ${oreateaiAccountCount > 0 ? 'text-brand' : 'text-amber-400'}`}>
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>{oreateaiAccountCount > 0 ? `${oreateaiAccountCount} 个账号` : '未配置'}</span>
+              </span>
+            </div>
+
+            <div className="rounded-xl border border-dark-border bg-dark-card px-4 py-3">
+              <div className="text-sm font-bold text-white">独立真实浏览器注册</div>
+              <div className="mt-1 text-[10px] leading-relaxed text-dark-subtle">
+                从邮箱库自动选择一个尚未注册的 Microsoft OAuth 邮箱，通过小苹果取件 API 接收验证邮件。Electron 自带 Chromium 完成页面风控和登录确认，成功后 Cookie 自动写入渠道8账号库。
+              </div>
+            </div>
+
+            <div className="flex items-center flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={registerOreateaiAccount}
+                disabled={oreateaiRegistering}
+                className="flex items-center space-x-1.5 px-4 py-2 bg-brand hover:bg-brand-dark disabled:opacity-50 rounded-lg text-xs text-black font-bold transition-all"
+              >
+                {oreateaiRegistering ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
+                <span>{oreateaiRegistering ? '浏览器注册中' : '注册并登录'}</span>
+              </button>
+              {oreateaiRegistering && oreateaiProgress && (
+                <span className="text-[11px] text-dark-muted">{oreateaiProgress}</span>
+              )}
+              {oreateaiResult && (
+                <span className={`flex items-center space-x-1.5 text-[11px] font-medium ${oreateaiResult.ok ? 'text-brand' : 'text-red-400'}`}>
+                  {oreateaiResult.ok ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <XCircle className="w-3.5 h-3.5 shrink-0" />}
+                  <span>{oreateaiResult.msg}</span>
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* SECTION 7: Framia 渠道九 — Google OAuth 登录采集 */}
+          <div className="space-y-4">
+            <div className="flex items-center justify-between border-b border-dark-border/40 pb-1.5">
+              <div className="flex items-center space-x-2">
+                <Globe className="w-4 h-4 text-brand" />
+                <h3 className="text-xs font-bold text-white uppercase tracking-wider">渠道九（Framia）</h3>
+              </div>
+              <span className={`flex items-center space-x-1 text-[10px] font-bold ${framiaAccountCount > 0 ? 'text-brand' : 'text-amber-400'}`}>
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>{framiaAccountCount > 0 ? `${framiaAccountCount} 个账号` : '未配置'}</span>
+              </span>
+            </div>
+
+            <div className="rounded-xl border border-dark-border bg-dark-card px-4 py-3">
+              <div className="text-sm font-bold text-white">Google OAuth 自动登录</div>
+              <div className="mt-1 text-[10px] leading-relaxed text-dark-subtle">
+                输入 Google 账号邮箱和密码，自动启动 Chrome 完成 Framia Google OAuth 登录流程，采集 accessToken 和 cookie。登录成功后账号自动加入渠道九账号库，可用于视频生成任务。
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <input
+                  type="email"
+                  placeholder="Google 邮箱"
+                  value={framiaLoginEmail}
+                  onChange={(e) => setFramiaLoginEmail(e.target.value)}
+                  className="flex-1 px-3 py-2 bg-dark-bg border border-dark-border rounded-lg text-xs text-white placeholder:text-dark-muted focus:outline-none focus:border-brand"
+                />
+                <input
+                  type="password"
+                  placeholder="Google 密码"
+                  value={framiaLoginPassword}
+                  onChange={(e) => setFramiaLoginPassword(e.target.value)}
+                  className="flex-1 px-3 py-2 bg-dark-bg border border-dark-border rounded-lg text-xs text-white placeholder:text-dark-muted focus:outline-none focus:border-brand"
+                />
+              </div>
+              <div className="flex items-center flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={loginFramiaAccount}
+                  disabled={framiaLoggingIn}
+                  className="flex items-center space-x-1.5 px-4 py-2 bg-brand hover:bg-brand-dark disabled:opacity-50 rounded-lg text-xs text-black font-bold transition-all"
+                >
+                  {framiaLoggingIn ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
+                  <span>{framiaLoggingIn ? '登录中...' : '登录并采集'}</span>
+                </button>
+                {framiaResult && (
+                  <span className={`flex items-center space-x-1.5 text-[11px] font-medium ${framiaResult.ok ? 'text-brand' : 'text-red-400'}`}>
+                    {framiaResult.ok ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <XCircle className="w-3.5 h-3.5 shrink-0" />}
+                    <span>{framiaResult.msg}</span>
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* SECTION 8: Tensor.Art 渠道十 — 邮箱 magic-link 注册 */}
+          <div className="space-y-4">
+            <div className="flex items-center justify-between border-b border-dark-border/40 pb-1.5">
+              <div className="flex items-center space-x-2">
+                <Globe className="w-4 h-4 text-violet-300" />
+                <h3 className="text-xs font-bold text-white uppercase tracking-wider">渠道十（Tensor.Art）</h3>
+              </div>
+              <span className={`flex items-center space-x-1 text-[10px] font-bold ${tensorartAccountCount > 0 ? 'text-brand' : 'text-amber-400'}`}>
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>{tensorartAccountCount > 0 ? `${tensorartAccountCount} 个账号` : '未配置'}</span>
+              </span>
+            </div>
+
+            <div className="rounded-xl border border-dark-border bg-dark-card px-4 py-3">
+              <div className="text-sm font-bold text-white">Microsoft OAuth 邮箱纯 API 注册</div>
+              <div className="mt-1 text-[10px] leading-relaxed text-dark-subtle">
+                自动从全局邮箱库领取一个尚未用于渠道十的 Microsoft OAuth 邮箱，发送 Tensor.Art magic-link、读取邮件并保存 token。遇到 Turnstile 时复用「渠道三」中配置的 YesCaptcha Key。
+              </div>
+            </div>
+
+            <div className="flex items-center flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={registerTensorartAccount}
+                disabled={tensorartRegistering}
+                className="flex items-center space-x-1.5 px-4 py-2 bg-violet-500 hover:bg-violet-400 disabled:opacity-50 rounded-lg text-xs text-white font-bold transition-all"
+              >
+                {tensorartRegistering ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
+                <span>{tensorartRegistering ? '注册并等待邮件...' : '领取邮箱并注册'}</span>
+              </button>
+              {tensorartResult && (
+                <span className={`flex items-center space-x-1.5 text-[11px] font-medium ${tensorartResult.ok ? 'text-brand' : 'text-red-400'}`}>
+                  {tensorartResult.ok ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <XCircle className="w-3.5 h-3.5 shrink-0" />}
+                  <span>{tensorartResult.msg}</span>
                 </span>
               )}
             </div>

@@ -25,13 +25,8 @@ const ENV_KEYS = [
   'DOLA_PC_VERSION',
   'DOLA_FP',
   'DOLA_MS_TOKEN',
+  'DOLA_MS_TOKEN_SOURCE',
 ];
-
-function generateFallbackMsToken() {
-  return crypto.randomBytes(78).toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_') + '==';
-}
 
 function defaultGrabPaths(baseDir) {
   return {
@@ -716,7 +711,24 @@ function extractStorageValue(storage, names) {
   return '';
 }
 
-function buildAccountState({ cookie, cookieSource, pageState }) {
+function readQueryParameter(url, key) {
+  try {
+    return new URL(String(url || '')).searchParams.get(key) || '';
+  } catch {
+    return '';
+  }
+}
+
+function firstValueWithSource(candidates) {
+  for (const { value, source } of candidates) {
+    if (typeof value === 'string' && value.trim()) {
+      return { value: value.trim(), source };
+    }
+  }
+  return { value: '', source: '' };
+}
+
+function buildAccountState({ cookie, cookieSource, requestCookie, pageState }) {
   const local = pageState.local_storage || {};
   const session = pageState.session_storage || {};
   const fromUrl = pageState.from_url || {};
@@ -726,13 +738,14 @@ function buildAccountState({ cookie, cookieSource, pageState }) {
   const deviceId = firstValue(fromUrl.device_id, extractStorageValue(local, ['device_id']), extractStorageValue(session, ['device_id']), webId, teaUuid, cookieFp);
   const fp = firstValue(cookieFp, extractStorageValue(local, ['s_v_web_id', 'fp']), extractStorageValue(session, ['s_v_web_id', 'fp']), webId, teaUuid, deviceId);
 
-  const msToken = firstValue(
-    pageState.cookie_ms_token,
-    extractStorageValue(local, ['ms_token', 'mstoken', 'msToken']),
-    extractStorageValue(session, ['ms_token', 'mstoken', 'msToken']),
-    cookieValue(cookie, 'msToken'),
-    generateFallbackMsToken()
-  );
+  const msToken = firstValueWithSource([
+    { value: readQueryParameter(requestCookie?.url, 'msToken'), source: 'user-provided-browser-request' },
+    { value: fromUrl.msToken, source: 'user-provided-browser-resource' },
+    { value: pageState.cookie_ms_token, source: 'user-provided-browser-cookie' },
+    { value: extractStorageValue(local, ['ms_token', 'mstoken']), source: 'user-provided-browser-local-storage' },
+    { value: extractStorageValue(session, ['ms_token', 'mstoken']), source: 'user-provided-browser-session-storage' },
+    { value: cookieValue(cookie, 'msToken'), source: 'user-provided-browser-cookie' },
+  ]);
 
   return {
     cookie,
@@ -743,7 +756,8 @@ function buildAccountState({ cookie, cookieSource, pageState }) {
     tea_uuid: teaUuid,
     web_tab_id: firstValue(fromUrl.web_tab_id, extractStorageValue(session, ['web_tab_id']), extractStorageValue(local, ['web_tab_id'])),
     fp,
-    ms_token: msToken,
+    ms_token: msToken.value,
+    ms_token_source: msToken.source,
     aid: '495671',
     version_code: '20800',
     pc_version: '3.17.3',
@@ -774,6 +788,7 @@ function writeDolaEnv(envFile, state) {
     DOLA_PC_VERSION: state.pc_version,
     DOLA_FP: state.fp,
     DOLA_MS_TOKEN: state.ms_token,
+    DOLA_MS_TOKEN_SOURCE: state.ms_token_source,
   };
 
   for (const key of ENV_KEYS) content = upsertEnv(content, key, values[key]);
@@ -788,6 +803,7 @@ function validateAccount(state) {
   if (!state.cookie || !state.cookie.includes('ttwid=')) missing.push('DOLA_COOKIE(ttwid)');
   if (!state.user_agent) missing.push('DOLA_USER_AGENT');
   if (!state.fp) missing.push('DOLA_FP');
+  if (!state.ms_token || !state.ms_token_source) missing.push('DOLA_MS_TOKEN(用户授权捕获)');
   return missing;
 }
 
@@ -913,6 +929,7 @@ function printResult(result) {
     web_tab_id: Boolean(state.web_tab_id),
     fp: Boolean(state.fp),
     ms_token: Boolean(state.ms_token),
+    ms_token_source: state.ms_token_source || 'missing',
   };
 
   console.log('[grab-account] dola account grabbed');
@@ -920,6 +937,7 @@ function printResult(result) {
   console.log(`[grab-account] profile: ${result.profileDir}`);
   console.log(`[grab-account] fields: ${Object.entries(present).map(([key, ok]) => `${key}=${ok ? 'ok' : 'missing'}`).join(', ')}`);
   console.log(`[grab-account] cookie-source: ${state.cookie_source || 'unknown'}`);
+  console.log(`[grab-account] ms-token-source: ${state.ms_token_source || 'missing'}`);
   if (result.actions?.sendHi) {
     const action = result.actions.sendHi;
     if (action.cookieNotice?.found) {
