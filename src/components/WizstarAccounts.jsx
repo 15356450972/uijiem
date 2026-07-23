@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   KeyRound,
   Trash2,
@@ -16,11 +16,34 @@ import {
   BarChart3,
   SlidersHorizontal,
   Mail,
+  Download,
+  Square,
+  RotateCcw,
+  Calendar,
 } from 'lucide-react';
 import { WIZSTAR_API as API_BASE } from '../config';
 
+/** Normalize account created_at / updated_at into local YYYY-MM-DD. */
+function accountDateKey(value) {
+  if (value == null || value === '') return '';
+  let date;
+  if (typeof value === 'number') {
+    date = new Date(value < 1e12 ? value * 1000 : value);
+  } else if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+    const num = Number(value);
+    date = new Date(num < 1e12 ? num * 1000 : num);
+  } else {
+    date = new Date(value);
+  }
+  if (Number.isNaN(date.getTime())) return '';
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 export default function WizstarAccounts({ onOpenGoogleLogin }) {
-  const [activePool, setActivePool] = useState('wizstar'); // 'wizstar' | 'quickframe' | 'oiioii' | 'dola' | 'lovart' | 'oreateai' | 'framia' | 'tensorart'
+  const [activePool, setActivePool] = useState('wizstar'); // 'wizstar' | 'quickframe' | 'oiioii' | 'dola' | 'lovart' | 'oreateai' | 'framia' | 'tensorart' | 'happyhorse' | 'insmind'
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshingId, setRefreshingId] = useState(null);
@@ -139,6 +162,48 @@ export default function WizstarAccounts({ onOpenGoogleLogin }) {
   const [showTensorartRegister, setShowTensorartRegister] = useState(false);
   const [tensorartRegCount, setTensorartRegCount] = useState(1);
   const [tensorartRegConcurrency, setTensorartRegConcurrency] = useState(1);
+
+  // ---- HappyHorse 渠道十一账号池状态 ----
+  const [happyhorseAccounts, setHappyhorseAccounts] = useState([]);
+  const [happyhorseLoading, setHappyhorseLoading] = useState(false);
+  const [happyhorseRefreshingId, setHappyhorseRefreshingId] = useState(null);
+  const [happyhorseSigningId, setHappyhorseSigningId] = useState(null);
+  const [showHappyhorseBatchLogin, setShowHappyhorseBatchLogin] = useState(false);
+  const [happyhorseBatchText, setHappyhorseBatchText] = useState('');
+  const [happyhorseBatchVisible, setHappyhorseBatchVisible] = useState(true);
+  const [happyhorseBatchConcurrency, setHappyhorseBatchConcurrency] = useState(1);
+  const [happyhorsePoolCount, setHappyhorsePoolCount] = useState(1);
+  const [happyhorseBatchStep, setHappyhorseBatchStep] = useState('idle');
+  const [happyhorseBatchResults, setHappyhorseBatchResults] = useState({});
+  const [happyhorseBatchSummary, setHappyhorseBatchSummary] = useState(null);
+  const [happyhorseBatchMode, setHappyhorseBatchMode] = useState('text'); // 'text' | 'pool'
+  const [happyhorseCancelling, setHappyhorseCancelling] = useState(false);
+  const [happyhorseBatchProgress, setHappyhorseBatchProgress] = useState(null);
+  // { total, done, succeeded, failed, skipped, cancelled, currentEmail }
+  const [happyhorseSelectedIds, setHappyhorseSelectedIds] = useState([]);
+  const [happyhorseExporting, setHappyhorseExporting] = useState(false);
+  // 按添加账号日期筛选，格式 YYYY-MM-DD；空字符串表示不过滤
+  const [happyhorseCreatedDateFilter, setHappyhorseCreatedDateFilter] = useState('');
+  const happyhorseDateFilterRef = useRef(null);
+  const happyhorseBatchCancelRef = useRef(false);
+  const happyhorseBatchAccountsRef = useRef([]); // [{email,password,mailbox_id?}]
+
+  const happyhorseFilteredAccounts = happyhorseCreatedDateFilter
+    ? happyhorseAccounts.filter((acc) => accountDateKey(acc.created_at || acc.updated_at) === happyhorseCreatedDateFilter)
+    : happyhorseAccounts;
+
+  // ---- insMind 渠道十二账号池状态 ----
+  const [insmindAccounts, setInsmindAccounts] = useState([]);
+  const [insmindLoading, setInsmindLoading] = useState(false);
+  const [insmindRegistering, setInsmindRegistering] = useState(false);
+  const [showInsmindRegister, setShowInsmindRegister] = useState(false);
+  const [insmindRegCount, setInsmindRegCount] = useState(1);
+  const [insmindRegConcurrency, setInsmindRegConcurrency] = useState(1);
+  const [insmindSelectedIds, setInsmindSelectedIds] = useState([]);
+  const [insmindExporting, setInsmindExporting] = useState(false);
+  const [insmindDeleting, setInsmindDeleting] = useState(false);
+  // { total, done, succeeded, failed, currentEmail, use_proxy }
+  const [insmindRegProgress, setInsmindRegProgress] = useState(null);
 
   const fetchAccounts = async () => {
     try {
@@ -1209,6 +1274,733 @@ export default function WizstarAccounts({ onOpenGoogleLogin }) {
     }
   };
 
+  const fetchHappyhorseAccounts = async () => {
+    try {
+      setHappyhorseLoading(true);
+      const res = await fetch(`${API_BASE}/happyhorse/accounts`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const nextAccounts = data.data || [];
+      setHappyhorseAccounts(nextAccounts);
+      setHappyhorseSelectedIds(prev => prev.filter(id => nextAccounts.some(acc => acc.id === id)));
+      setError('');
+    } catch (e) {
+      setError(e.message || '无法连接到渠道十一服务，请确认 Python 服务已启动');
+    } finally {
+      setHappyhorseLoading(false);
+    }
+  };
+
+  const toggleHappyhorseSelection = (id) => {
+    const accountId = Number(id);
+    if (!accountId) return;
+    setHappyhorseSelectedIds(prev => (
+      prev.includes(accountId)
+        ? prev.filter(item => item !== accountId)
+        : [...prev, accountId]
+    ));
+  };
+
+  const toggleHappyhorseSelectAll = () => {
+    const visibleIds = happyhorseFilteredAccounts.map(acc => Number(acc.id)).filter(Boolean);
+    const allVisibleSelected = visibleIds.length > 0 && visibleIds.every(id => happyhorseSelectedIds.includes(id));
+    if (allVisibleSelected) {
+      setHappyhorseSelectedIds(prev => prev.filter(id => !visibleIds.includes(id)));
+      return;
+    }
+    setHappyhorseSelectedIds(prev => Array.from(new Set([...prev, ...visibleIds])));
+  };
+
+  const handleHappyhorseExportSelected = async () => {
+    if (!happyhorseSelectedIds.length) {
+      setError('请先勾选要导出的渠道十一账号');
+      return;
+    }
+    setHappyhorseExporting(true);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/happyhorse/accounts/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account_ids: happyhorseSelectedIds }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || '导出失败');
+      const accounts = payload.data || [];
+      if (!accounts.length) throw new Error('未找到可导出的账号');
+
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const jsonBlob = new Blob([JSON.stringify(accounts, null, 2)], { type: 'application/json;charset=utf-8' });
+      const jsonUrl = URL.createObjectURL(jsonBlob);
+      const jsonLink = document.createElement('a');
+      jsonLink.href = jsonUrl;
+      jsonLink.download = `happyhorse-accounts-${stamp}.json`;
+      document.body.appendChild(jsonLink);
+      jsonLink.click();
+      jsonLink.remove();
+      URL.revokeObjectURL(jsonUrl);
+
+      const txtLines = accounts.flatMap((acc) => ([
+        `=== id=${acc.id} | ${acc.email || ''} | ${acc.status || ''} ===`,
+        `cookie: ${acc.cookie || ''}`,
+        `access_token: ${acc.access_token || ''}`,
+        `refresh_token: ${acc.refresh_token || ''}`,
+        `device_id: ${acc.device_id || ''}`,
+        `user_agent: ${acc.user_agent || ''}`,
+        `password: ${acc.password || ''}`,
+        '',
+      ]));
+      const txtBlob = new Blob([txtLines.join('\n')], { type: 'text/plain;charset=utf-8' });
+      const txtUrl = URL.createObjectURL(txtBlob);
+      const txtLink = document.createElement('a');
+      txtLink.href = txtUrl;
+      txtLink.download = `happyhorse-accounts-${stamp}.txt`;
+      document.body.appendChild(txtLink);
+      txtLink.click();
+      txtLink.remove();
+      URL.revokeObjectURL(txtUrl);
+
+      setSuccessMsg(`已导出 ${accounts.length} 个渠道十一账号（JSON + TXT）`);
+    } catch (e) {
+      setError(e.message || '导出失败');
+    } finally {
+      setHappyhorseExporting(false);
+    }
+  };
+
+  const handleHappyhorseDelete = async (id) => {
+    if (!confirm('确定删除该渠道十一 HappyHorse 账号？')) return;
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/happyhorse/accounts/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || '删除失败');
+      }
+      setHappyhorseSelectedIds(prev => prev.filter(item => item !== Number(id)));
+      setSuccessMsg('渠道十一账号已删除');
+      fetchHappyhorseAccounts();
+    } catch (e) {
+      setError(e.message || '删除失败');
+    }
+  };
+
+  const handleHappyhorseRefreshCredits = async (id) => {
+    setHappyhorseRefreshingId(id);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/happyhorse/credits?account_id=${id}`);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || '查询积分失败');
+      }
+      const data = await res.json();
+      const credits = data.data || {};
+      const balance = credits.credits_balance ?? credits.available_count ?? null;
+      setHappyhorseAccounts(prev => prev.map(a => a.id === id ? {
+        ...a,
+        credits_balance: balance,
+        play_code_details: credits.play_code_details || [],
+      } : a));
+      setSuccessMsg(`渠道十一可用积分：${balance ?? '-'}`);
+    } catch (e) {
+      setError(e.message || '查询积分失败');
+    } finally {
+      setHappyhorseRefreshingId(null);
+    }
+  };
+
+  const handleHappyhorseDailySignin = async (id) => {
+    setHappyhorseSigningId(id);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/happyhorse/credits/daily-signin?account_id=${id}`, { method: 'POST' });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || '每日签到失败');
+      const result = payload.data || {};
+      const balance = result.credits_balance ?? result.available_count ?? null;
+      setHappyhorseAccounts(prev => prev.map(a => a.id === id ? {
+        ...a,
+        credits_balance: balance,
+        play_code_details: result.play_code_details || a.play_code_details || [],
+      } : a));
+      setSuccessMsg(`签到成功：+${result.grant_points ?? 0}，当前可用 ${balance ?? '-'}`);
+    } catch (e) {
+      setError(e.message || '每日签到失败');
+    } finally {
+      setHappyhorseSigningId(null);
+    }
+  };
+
+  const handleHappyhorseBatchCredits = async () => {
+    if (!happyhorseFilteredAccounts.length) return;
+    setError('');
+    setSuccessMsg('');
+    let ok = 0;
+    let fail = 0;
+    for (const acc of happyhorseFilteredAccounts) {
+      try {
+        setHappyhorseRefreshingId(acc.id);
+        const res = await fetch(`${API_BASE}/happyhorse/credits?account_id=${acc.id}`);
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || `HTTP ${res.status}`);
+        const credits = payload.data || {};
+        const balance = credits.credits_balance ?? credits.available_count ?? null;
+        setHappyhorseAccounts(prev => prev.map(a => a.id === acc.id ? {
+          ...a,
+          credits_balance: balance,
+          play_code_details: credits.play_code_details || [],
+        } : a));
+        ok += 1;
+      } catch (_) {
+        fail += 1;
+      }
+    }
+    setHappyhorseRefreshingId(null);
+    setSuccessMsg(`渠道十一积分查询完成：成功 ${ok}，失败 ${fail}`);
+  };
+
+  const handleHappyhorseBatchDailySignin = async () => {
+    if (!happyhorseFilteredAccounts.length) return;
+    setError('');
+    setSuccessMsg('');
+    let ok = 0;
+    let fail = 0;
+    let gained = 0;
+    for (const acc of happyhorseFilteredAccounts) {
+      try {
+        setHappyhorseSigningId(acc.id);
+        const res = await fetch(`${API_BASE}/happyhorse/credits/daily-signin?account_id=${acc.id}`, { method: 'POST' });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || `HTTP ${res.status}`);
+        const result = payload.data || {};
+        const balance = result.credits_balance ?? result.available_count ?? null;
+        gained += Number(result.grant_points || 0);
+        setHappyhorseAccounts(prev => prev.map(a => a.id === acc.id ? {
+          ...a,
+          credits_balance: balance,
+          play_code_details: result.play_code_details || a.play_code_details || [],
+        } : a));
+        ok += 1;
+      } catch (_) {
+        fail += 1;
+      }
+    }
+    setHappyhorseSigningId(null);
+    setSuccessMsg(`渠道十一每日签到完成：成功 ${ok}，失败 ${fail}，共领取 +${gained}`);
+  };
+
+  const cancelHappyhorseBatchLogin = async () => {
+    if (happyhorseBatchStep !== 'running' || happyhorseCancelling) return;
+    setHappyhorseCancelling(true);
+    happyhorseBatchCancelRef.current = true;
+    try {
+      await fetch(`${API_BASE}/happyhorse/accounts/login/cancel`, { method: 'POST' });
+      setSuccessMsg('已请求取消渠道十一登录任务，正在停止进行中的浏览器登录...');
+    } catch (e) {
+      setError(e.message || '取消请求失败');
+    } finally {
+      setHappyhorseCancelling(false);
+    }
+  };
+
+  const runHappyhorseTextBatchLogin = async (accountsInput, { isRetry = false } = {}) => {
+    const accounts = (accountsInput || []).filter((a) => a?.email && a?.password);
+    if (accounts.length === 0) {
+      setError(isRetry ? '没有可重试的失败账号' : '请输入有效的 HappyHorse Google 账号密码，每行一个，格式: email|password');
+      return;
+    }
+    const existingEmails = new Set(
+      happyhorseAccounts
+        .filter((acc) => acc?.has_token || acc?.configured)
+        .map((acc) => String(acc.email || '').trim().toLowerCase())
+        .filter(Boolean)
+    );
+    const toLogin = [];
+    const skippedAccounts = [];
+    for (const account of accounts) {
+      if (!isRetry && existingEmails.has(account.email.toLowerCase())) {
+        skippedAccounts.push(account);
+      } else {
+        toLogin.push(account);
+      }
+    }
+    happyhorseBatchCancelRef.current = false;
+    happyhorseBatchAccountsRef.current = accounts;
+    setHappyhorseBatchMode('text');
+    const concurrency = Math.max(1, Math.min(parseInt(happyhorseBatchConcurrency, 10) || 1, 5, Math.max(toLogin.length, 1)));
+    setHappyhorseBatchStep('running');
+    setHappyhorseBatchResults({});
+    setHappyhorseBatchSummary(null);
+    setHappyhorseBatchProgress({
+      total: accounts.length,
+      done: skippedAccounts.length,
+      succeeded: 0,
+      failed: 0,
+      skipped: skippedAccounts.length,
+      cancelled: 0,
+      currentEmail: toLogin[0]?.email || '',
+    });
+    setError('');
+    setSuccessMsg('');
+    try {
+      await fetch(`${API_BASE}/happyhorse/accounts/login/begin`, { method: 'POST' });
+    } catch (_) { /* ignore */ }
+    const initialResults = {};
+    skippedAccounts.forEach((account, index) => {
+      initialResults[`skip-${index}`] = {
+        email: account.email,
+        password: account.password,
+        ok: true,
+        step: 'skipped',
+        error: '已登录过，已跳过',
+      };
+    });
+    setHappyhorseBatchResults(initialResults);
+    if (toLogin.length === 0) {
+      setHappyhorseBatchSummary({
+        succeeded: 0,
+        failed: 0,
+        skipped: skippedAccounts.length,
+        cancelled: 0,
+        total: accounts.length,
+      });
+      setHappyhorseBatchProgress({
+        total: accounts.length,
+        done: accounts.length,
+        succeeded: 0,
+        failed: 0,
+        skipped: skippedAccounts.length,
+        cancelled: 0,
+        currentEmail: '',
+      });
+      setHappyhorseBatchStep('done');
+      setSuccessMsg(`渠道十一批量登录：全部 ${skippedAccounts.length} 个账号此前已登录，已跳过`);
+      return;
+    }
+    let succeeded = 0;
+    let failed = 0;
+    let skipped = skippedAccounts.length;
+    let cancelled = 0;
+    let done = skippedAccounts.length;
+    let cursor = 0;
+    const started = new Set();
+    const bumpProgress = (currentEmail = '') => {
+      setHappyhorseBatchProgress({
+        total: accounts.length,
+        done,
+        succeeded,
+        failed,
+        skipped,
+        cancelled,
+        currentEmail,
+      });
+    };
+    const runOne = async (i) => {
+      const { email, password } = toLogin[i];
+      started.add(i);
+      if (happyhorseBatchCancelRef.current) {
+        cancelled++;
+        done++;
+        setHappyhorseBatchResults((prev) => ({
+          ...prev,
+          [i]: { email, password, ok: false, step: 'cancelled', error: '已取消' },
+        }));
+        bumpProgress(email);
+        return;
+      }
+      setHappyhorseBatchResults((prev) => ({
+        ...prev,
+        [i]: { email, password, ok: null, step: 'starting' },
+      }));
+      bumpProgress(email);
+      try {
+        const res = await fetch(`${API_BASE}/happyhorse/accounts/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email,
+            password,
+            visible: happyhorseBatchVisible,
+            keep_open: false,
+            part_of_batch: true,
+          }),
+        });
+        const responseText = await res.text();
+        let data = {};
+        try {
+          data = responseText ? JSON.parse(responseText) : {};
+        } catch {
+          data = { detail: responseText };
+        }
+        if (happyhorseBatchCancelRef.current || res.status === 409) {
+          cancelled++;
+          done++;
+          setHappyhorseBatchResults((prev) => ({
+            ...prev,
+            [i]: { email, password, ok: false, step: 'cancelled', error: data.detail || '已取消' },
+          }));
+          bumpProgress(email);
+          return;
+        }
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        if (data?.data?.skipped) {
+          skipped++;
+          done++;
+          setHappyhorseBatchResults((prev) => ({
+            ...prev,
+            [i]: { email, password, ok: true, step: 'skipped', error: '已登录过，已跳过' },
+          }));
+        } else {
+          succeeded++;
+          done++;
+          setHappyhorseBatchResults((prev) => ({
+            ...prev,
+            [i]: { email, password, ok: true, step: 'saved_to_db' },
+          }));
+        }
+        bumpProgress(email);
+      } catch (e) {
+        if (happyhorseBatchCancelRef.current) {
+          cancelled++;
+          done++;
+          setHappyhorseBatchResults((prev) => ({
+            ...prev,
+            [i]: { email, password, ok: false, step: 'cancelled', error: '已取消' },
+          }));
+        } else {
+          failed++;
+          done++;
+          setHappyhorseBatchResults((prev) => ({
+            ...prev,
+            [i]: { email, password, ok: false, step: 'error', error: e.message },
+          }));
+        }
+        bumpProgress(email);
+      }
+    };
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (true) {
+        if (happyhorseBatchCancelRef.current) break;
+        const i = cursor++;
+        if (i >= toLogin.length) break;
+        await runOne(i);
+      }
+    });
+    await Promise.all(workers);
+    // 取消后尚未启动的账号标记为已取消
+    if (happyhorseBatchCancelRef.current) {
+      const pending = {};
+      for (let i = 0; i < toLogin.length; i++) {
+        if (started.has(i)) continue;
+        cancelled++;
+        done++;
+        pending[i] = {
+          email: toLogin[i].email,
+          password: toLogin[i].password,
+          ok: false,
+          step: 'cancelled',
+          error: '已取消',
+        };
+      }
+      if (Object.keys(pending).length) {
+        setHappyhorseBatchResults((prev) => ({ ...prev, ...pending }));
+      }
+    }
+    bumpProgress('');
+    setHappyhorseBatchSummary({
+      succeeded,
+      failed,
+      skipped,
+      cancelled,
+      total: accounts.length,
+    });
+    setHappyhorseBatchStep('done');
+    if (cancelled > 0) {
+      setSuccessMsg(
+        `渠道十一登录已取消：成功 ${succeeded}，跳过 ${skipped}，失败 ${failed}，取消 ${cancelled}`
+      );
+      if (succeeded > 0) fetchHappyhorseAccounts();
+    } else if (succeeded > 0 || skipped > 0) {
+      setSuccessMsg(
+        `渠道十一 HappyHorse 批量登录完成：成功 ${succeeded}，跳过已登录 ${skipped}，失败 ${failed}`
+      );
+      fetchHappyhorseAccounts();
+    } else {
+      setError('渠道十一 HappyHorse 批量登录全部失败，请查看下方每个账号的失败原因。');
+    }
+  };
+
+  const handleHappyhorseBatchLogin = async () => {
+    const lines = happyhorseBatchText.trim().split('\n').filter((l) => l.trim());
+    const accounts = lines.map((line) => {
+      const [email, password] = line.trim().split('|');
+      return { email: (email || '').trim(), password: (password || '').trim() };
+    }).filter((a) => a.email && a.password);
+    await runHappyhorseTextBatchLogin(accounts);
+  };
+
+  const runHappyhorsePoolLogin = async ({ count, mailboxIds = [] } = {}) => {
+    const resolvedCount = mailboxIds.length
+      ? mailboxIds.length
+      : Math.max(1, Math.min(parseInt(count ?? happyhorsePoolCount, 10) || 1, 100));
+    const concurrency = Math.max(
+      1,
+      Math.min(parseInt(happyhorseBatchConcurrency, 10) || 1, 5, resolvedCount)
+    );
+    happyhorseBatchCancelRef.current = false;
+    setHappyhorseBatchMode('pool');
+    setHappyhorseBatchStep('running');
+    setHappyhorseBatchResults({});
+    setHappyhorseBatchSummary(null);
+    setHappyhorseBatchProgress({
+      total: resolvedCount,
+      done: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: 0,
+      cancelled: 0,
+      currentEmail: '正在领取邮箱...',
+    });
+    setError('');
+    setSuccessMsg('');
+    try {
+      const body = {
+        count: resolvedCount,
+        concurrency,
+        visible: happyhorseBatchVisible,
+        keep_open: false,
+      };
+      if (mailboxIds.length) body.mailbox_ids = mailboxIds;
+      const res = await fetch(`${API_BASE}/happyhorse/accounts/login-pool`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        throw new Error(payload.detail || `HTTP ${res.status}`);
+      }
+
+      const items = [];
+      let succeeded = 0;
+      let failed = 0;
+      let skipped = 0;
+      let cancelled = 0;
+      let total = resolvedCount;
+      let done = 0;
+      let finalSummary = null;
+
+      const applyItem = (item, index) => {
+        items[index] = item;
+        setHappyhorseBatchResults((prev) => ({
+          ...prev,
+          [index]: {
+            email: item.email,
+            mailbox_id: item.mailbox_id,
+            ok: Boolean(item.ok),
+            step: item.ok
+              ? (item.skipped ? 'skipped' : 'saved_to_db')
+              : (item.cancelled ? 'cancelled' : 'error'),
+            error: item.skipped
+              ? '已登录过，已跳过'
+              : (item.error || ''),
+          },
+        }));
+      };
+
+      if (!res.body || !res.body.getReader) {
+        // 兼容非流式回退
+        const payload = await res.json().catch(() => ({}));
+        const result = payload.data || {};
+        const list = Array.isArray(result.results) ? result.results : [];
+        list.forEach((item, index) => applyItem(item, index));
+        finalSummary = result;
+      } else {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { value, done: streamDone } = await reader.read();
+          if (streamDone) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            let event;
+            try {
+              event = JSON.parse(trimmed);
+            } catch {
+              continue;
+            }
+            if (event.event === 'start') {
+              total = Number(event.total) || total;
+              const emails = Array.isArray(event.emails) ? event.emails : [];
+              const pending = {};
+              emails.forEach((email, index) => {
+                pending[index] = {
+                  email,
+                  ok: null,
+                  step: 'queued',
+                  error: '',
+                };
+              });
+              setHappyhorseBatchResults(pending);
+              setHappyhorseBatchProgress({
+                total,
+                done: 0,
+                succeeded: 0,
+                failed: 0,
+                skipped: 0,
+                cancelled: 0,
+                currentEmail: emails[0] || '准备登录...',
+              });
+            } else if (event.event === 'item') {
+              const item = event.result || {};
+              const index = Math.max(0, Number(event.index || items.length + 1) - 1);
+              applyItem(item, index);
+              done = Number(event.done) || (done + 1);
+              if (item.ok && item.skipped) skipped += 1;
+              else if (item.ok) succeeded += 1;
+              else if (item.cancelled) cancelled += 1;
+              else failed += 1;
+              setHappyhorseBatchProgress({
+                total,
+                done,
+                succeeded,
+                failed,
+                skipped,
+                cancelled,
+                currentEmail: item.email || '',
+              });
+            } else if (event.event === 'done') {
+              finalSummary = event;
+            } else if (event.event === 'error') {
+              throw new Error(event.error || '邮箱库登录失败');
+            }
+          }
+        }
+      }
+
+      const result = finalSummary || {
+        results: items,
+        succeeded,
+        failed: failed + cancelled,
+        cancelled,
+        total,
+      };
+      const resultItems = Array.isArray(result.results) ? result.results : items;
+      happyhorseBatchAccountsRef.current = resultItems.map((item) => ({
+        email: item.email,
+        mailbox_id: item.mailbox_id,
+        password: '',
+      }));
+      const skippedCount = resultItems.filter((item) => item.ok && item.skipped).length;
+      const cancelledCount = Number(result.cancelled) || resultItems.filter((item) => item.cancelled).length;
+      const succeededCount = Math.max(0, (result.succeeded || 0) - skippedCount);
+      const failedCount = Math.max(0, (result.failed || 0) - cancelledCount);
+      setHappyhorseBatchProgress({
+        total: result.total || total,
+        done: result.total || total,
+        succeeded: succeededCount,
+        failed: failedCount,
+        skipped: skippedCount,
+        cancelled: cancelledCount,
+        currentEmail: '',
+      });
+      setHappyhorseBatchSummary({
+        succeeded: succeededCount,
+        failed: failedCount,
+        skipped: skippedCount,
+        cancelled: cancelledCount,
+        total: result.total || resultItems.length,
+      });
+      setHappyhorseBatchStep('done');
+      if (cancelledCount > 0) {
+        setSuccessMsg(
+          `渠道十一邮箱库登录已取消：成功 ${succeededCount}，跳过 ${skippedCount}，失败 ${failedCount}，取消 ${cancelledCount}`
+        );
+        if (succeededCount > 0) fetchHappyhorseAccounts();
+      } else if ((result.succeeded || 0) > 0) {
+        setSuccessMsg(
+          `渠道十一从邮箱库登录完成：成功 ${succeededCount}，跳过已登录 ${skippedCount}，失败 ${failedCount}`
+        );
+        fetchHappyhorseAccounts();
+      } else {
+        setError('渠道十一邮箱库账号登录全部失败，请查看失败原因。');
+      }
+    } catch (e) {
+      setHappyhorseBatchStep(happyhorseBatchCancelRef.current ? 'done' : 'idle');
+      setError(e.message || String(e));
+    }
+  };
+
+  const handleHappyhorsePoolLogin = async () => {
+    await runHappyhorsePoolLogin({ count: happyhorsePoolCount });
+  };
+
+  const retryHappyhorseFailedLogins = async () => {
+    const failedItems = Object.values(happyhorseBatchResults || {}).filter(
+      (item) => item && item.ok === false && item.step !== 'cancelled'
+    );
+    if (!failedItems.length) {
+      setError('没有可重试的失败账号');
+      return;
+    }
+    if (happyhorseBatchMode === 'pool') {
+      const mailboxIds = failedItems
+        .map((item) => Number(item.mailbox_id))
+        .filter((id) => id > 0);
+      if (!mailboxIds.length) {
+        setError('失败账号缺少邮箱库 ID，无法重试，请重新领取');
+        return;
+      }
+      await runHappyhorsePoolLogin({ mailboxIds });
+      return;
+    }
+    const accounts = failedItems
+      .map((item) => ({
+        email: String(item.email || '').trim(),
+        password: String(item.password || '').trim(),
+      }))
+      .filter((item) => item.email && item.password);
+    if (!accounts.length) {
+      // 从原始文本里按邮箱找回密码
+      const passwordByEmail = new Map(
+        happyhorseBatchText
+          .trim()
+          .split('\n')
+          .map((line) => {
+            const [email, password] = line.trim().split('|');
+            return [(email || '').trim().toLowerCase(), (password || '').trim()];
+          })
+          .filter(([email, password]) => email && password)
+      );
+      const recovered = failedItems
+        .map((item) => {
+          const email = String(item.email || '').trim();
+          return { email, password: passwordByEmail.get(email.toLowerCase()) || '' };
+        })
+        .filter((item) => item.email && item.password);
+      if (!recovered.length) {
+        setError('失败账号缺少密码，无法重试');
+        return;
+      }
+      await runHappyhorseTextBatchLogin(recovered, { isRetry: true });
+      return;
+    }
+    await runHappyhorseTextBatchLogin(accounts, { isRetry: true });
+  };
+
   const fetchTensorartAccounts = async () => {
     try {
       setTensorartLoading(true);
@@ -1290,6 +2082,297 @@ export default function WizstarAccounts({ onOpenGoogleLogin }) {
     }
   };
 
+  const fetchInsmindAccounts = async () => {
+    try {
+      setInsmindLoading(true);
+      const res = await fetch(`${API_BASE}/insmind/accounts`);
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = typeof payload.detail === 'string' ? payload.detail : `HTTP ${res.status}`;
+        if (res.status === 404) {
+          throw new Error('渠道十二接口未找到，请重启本地 Python 后端后再试');
+        }
+        throw new Error(detail || `HTTP ${res.status}`);
+      }
+      setInsmindAccounts(payload.data || []);
+      setError('');
+    } catch (e) {
+      setError(e.message || '无法连接到渠道十二服务，请确认 Python 服务已启动');
+    } finally {
+      setInsmindLoading(false);
+    }
+  };
+
+  const handleInsmindRegister = async () => {
+    const total = Math.max(1, Math.min(parseInt(insmindRegCount, 10) || 1, 999));
+    const concurrency = Math.max(1, Math.min(parseInt(insmindRegConcurrency, 10) || 1, 999));
+    setInsmindRegistering(true);
+    setError('');
+    setSuccessMsg('');
+    setInsmindRegProgress({
+      total,
+      done: 0,
+      succeeded: 0,
+      failed: 0,
+      currentEmail: '准备注册...',
+      use_proxy: null,
+    });
+    try {
+      const res = await fetch(`${API_BASE}/insmind/accounts/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson, application/json' },
+        body: JSON.stringify({ count: total, concurrency }),
+      });
+      if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error('渠道十二注册接口未找到，请重启本地 Python 后端后再试');
+        }
+        const payload = await res.json().catch(() => ({}));
+        const detail = typeof payload.detail === 'string'
+          ? payload.detail
+          : (Array.isArray(payload.detail) ? payload.detail.map((d) => d.msg || JSON.stringify(d)).join('; ') : `HTTP ${res.status}`);
+        throw new Error(detail || `HTTP ${res.status}`);
+      }
+
+      let succeeded = 0;
+      let failed = 0;
+      let done = 0;
+      let finalSummary = null;
+      const failSamples = [];
+
+      const contentType = String(res.headers.get('content-type') || '');
+      if (!res.body || !res.body.getReader || contentType.includes('application/json')) {
+        // 兼容旧后端非流式 JSON
+        const payload = await res.json().catch(() => ({}));
+        const result = payload.data || {};
+        finalSummary = result;
+        succeeded = Number(result.succeeded) || 0;
+        failed = Number(result.failed) || 0;
+        done = Number(result.total) || (succeeded + failed);
+        setInsmindRegProgress({
+          total: done || total,
+          done: done || total,
+          succeeded,
+          failed,
+          currentEmail: '',
+          use_proxy: result.use_proxy,
+        });
+      } else {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { value, done: streamDone } = await reader.read();
+          if (streamDone) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            let event;
+            try {
+              event = JSON.parse(trimmed);
+            } catch {
+              continue;
+            }
+            if (event.event === 'start') {
+              setInsmindRegProgress({
+                total: Number(event.total) || total,
+                done: 0,
+                succeeded: 0,
+                failed: 0,
+                currentEmail: event.use_proxy
+                  ? `动态代理 ${event.proxy_host || ''} · 开始注册...`
+                  : '直连注册（易限流）...',
+                use_proxy: event.use_proxy,
+              });
+            } else if (event.event === 'item') {
+              const item = event.result || {};
+              done = Number(event.done) || (done + 1);
+              if (item.ok) succeeded += 1;
+              else {
+                failed += 1;
+                if (item.error && failSamples.length < 5) failSamples.push(item.error);
+              }
+              setInsmindRegProgress({
+                total: Number(event.total) || total,
+                done,
+                succeeded,
+                failed,
+                currentEmail: item.ok
+                  ? (item.email || `第 ${item.index || done} 个成功`)
+                  : (item.error || `第 ${item.index || done} 个失败`),
+                use_proxy: null,
+              });
+              // 成功入库后偶尔刷新列表，避免最后才看到账号
+              if (item.ok && (done === 1 || done % 3 === 0)) {
+                fetchInsmindAccounts();
+              }
+            } else if (event.event === 'done') {
+              finalSummary = event;
+            } else if (event.event === 'error') {
+              throw new Error(event.error || '渠道十二注册失败');
+            }
+          }
+        }
+      }
+
+      const result = finalSummary || { succeeded, failed, total: done || total };
+      const okCount = Number(result.succeeded) || succeeded;
+      const failCount = Number(result.failed) || failed;
+      const totalCount = Number(result.total) || (okCount + failCount) || total;
+      setInsmindRegProgress({
+        total: totalCount,
+        done: totalCount,
+        succeeded: okCount,
+        failed: failCount,
+        currentEmail: '',
+        use_proxy: result.use_proxy,
+      });
+
+      if (!okCount) {
+        throw new Error(failSamples[0] || '渠道十二注册全部失败');
+      }
+      setSuccessMsg(`渠道十二注册完成：成功 ${okCount}，失败 ${failCount}`);
+      if (failCount > 0 && failSamples.length) {
+        setError(failSamples.map((msg, i) => `#${i + 1}: ${msg}`).join('\n'));
+      }
+      await fetchInsmindAccounts();
+    } catch (e) {
+      setError(e.message || '渠道十二注册失败');
+    } finally {
+      setInsmindRegistering(false);
+    }
+  };
+
+  const handleInsmindDelete = async (id) => {
+    if (!confirm('确定删除该渠道十二 insMind 账号？')) return;
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/insmind/accounts/${id}`, { method: 'DELETE' });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || '删除失败');
+      setSuccessMsg('渠道十二账号已删除');
+      setInsmindSelectedIds((prev) => prev.filter((item) => item !== Number(id)));
+      await fetchInsmindAccounts();
+    } catch (e) {
+      setError(e.message || '删除失败');
+    }
+  };
+
+  const handleInsmindDeleteSelected = async () => {
+    const accountIds = insmindSelectedIds.map((id) => Number(id)).filter(Boolean);
+    if (!accountIds.length) {
+      setError('请先勾选要删除的渠道十二账号');
+      return;
+    }
+    if (!confirm(`确定删除选中的 ${accountIds.length} 个渠道十二账号？此操作不可恢复。`)) return;
+    setInsmindDeleting(true);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/insmind/accounts/batch-delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account_ids: accountIds }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || '批量删除失败');
+      const deleted = Number(payload?.data?.deleted || 0);
+      setInsmindSelectedIds([]);
+      setSuccessMsg(`已删除 ${deleted || accountIds.length} 个渠道十二账号`);
+      await fetchInsmindAccounts();
+    } catch (e) {
+      setError(e.message || '批量删除失败');
+    } finally {
+      setInsmindDeleting(false);
+    }
+  };
+
+  const toggleInsmindSelect = (accountId) => {
+    setInsmindSelectedIds((prev) => (
+      prev.includes(accountId)
+        ? prev.filter((item) => item !== accountId)
+        : [...prev, accountId]
+    ));
+  };
+
+  const toggleInsmindSelectAll = () => {
+    const visibleIds = insmindAccounts.map((acc) => Number(acc.id)).filter(Boolean);
+    const allSelected = visibleIds.length > 0 && visibleIds.every((id) => insmindSelectedIds.includes(id));
+    if (allSelected) {
+      setInsmindSelectedIds([]);
+      return;
+    }
+    setInsmindSelectedIds(visibleIds);
+  };
+
+  const handleInsmindExport = async ({ all = false } = {}) => {
+    const accountIds = all ? [] : insmindSelectedIds;
+    if (!all && !accountIds.length) {
+      setError('请先勾选要导出的渠道十二账号，或点「导出全部」');
+      return;
+    }
+    if (all && !insmindAccounts.length) {
+      setError('暂无渠道十二账号可导出');
+      return;
+    }
+    setInsmindExporting(true);
+    setError('');
+    setSuccessMsg('');
+    try {
+      const res = await fetch(`${API_BASE}/insmind/accounts/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account_ids: accountIds }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.detail || '导出失败');
+      const accounts = payload.data || [];
+      if (!accounts.length) throw new Error('未找到可导出的账号');
+
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const jsonBlob = new Blob([JSON.stringify(accounts, null, 2)], { type: 'application/json;charset=utf-8' });
+      const jsonUrl = URL.createObjectURL(jsonBlob);
+      const jsonLink = document.createElement('a');
+      jsonLink.href = jsonUrl;
+      jsonLink.download = `insmind-accounts-${stamp}.json`;
+      document.body.appendChild(jsonLink);
+      jsonLink.click();
+      jsonLink.remove();
+      URL.revokeObjectURL(jsonUrl);
+
+      const txtLines = accounts.flatMap((acc) => ([
+        `=== id=${acc.id} | ${acc.email || ''} | ${acc.status || ''} ===`,
+        `access_token: ${acc.access_token || ''}`,
+        `refresh_token: ${acc.refresh_token || ''}`,
+        `cookie: ${acc.cookie || ''}`,
+        `user_id: ${acc.user_id || ''}`,
+        `org_id: ${acc.org_id || ''}`,
+        `expires_at: ${acc.expires_at || ''}`,
+        `note: ${acc.note || ''}`,
+        '',
+      ]));
+      const txtBlob = new Blob([txtLines.join('\n')], { type: 'text/plain;charset=utf-8' });
+      const txtUrl = URL.createObjectURL(txtBlob);
+      const txtLink = document.createElement('a');
+      txtLink.href = txtUrl;
+      txtLink.download = `insmind-accounts-${stamp}.txt`;
+      document.body.appendChild(txtLink);
+      txtLink.click();
+      txtLink.remove();
+      URL.revokeObjectURL(txtUrl);
+
+      setSuccessMsg(`已导出 ${accounts.length} 个渠道十二账号（JSON + TXT）`);
+    } catch (e) {
+      setError(e.message || '导出失败');
+    } finally {
+      setInsmindExporting(false);
+    }
+  };
+
   useEffect(() => {
     if (activePool === 'quickframe') {
       fetchQfAccounts();
@@ -1312,6 +2395,12 @@ export default function WizstarAccounts({ onOpenGoogleLogin }) {
     }
     if (activePool === 'tensorart') {
       fetchTensorartAccounts();
+    }
+    if (activePool === 'happyhorse') {
+      fetchHappyhorseAccounts();
+    }
+    if (activePool === 'insmind') {
+      fetchInsmindAccounts();
     }
   }, [activePool]);
 
@@ -1558,6 +2647,18 @@ export default function WizstarAccounts({ onOpenGoogleLogin }) {
             >
               渠道十
             </button>
+            <button
+              onClick={() => setActivePool('happyhorse')}
+              className={`px-3 py-1 text-xs font-medium transition-all ${activePool === 'happyhorse' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+            >
+              渠道十一
+            </button>
+            <button
+              onClick={() => setActivePool('insmind')}
+              className={`px-3 py-1 text-xs font-medium transition-all ${activePool === 'insmind' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+            >
+              渠道十二
+            </button>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -1756,6 +2857,139 @@ export default function WizstarAccounts({ onOpenGoogleLogin }) {
                 title="刷新渠道十账号"
               >
                 <RefreshCw className={`w-4 h-4 ${tensorartLoading ? 'animate-spin' : ''}`} />
+              </button>
+            </>
+          ) : activePool === 'happyhorse' ? (
+            <>
+              <button
+                onClick={() => setShowHappyhorseBatchLogin(prev => !prev)}
+                disabled={happyhorseBatchStep === 'running'}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-300 text-sm font-medium hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
+              >
+                {happyhorseBatchStep === 'running' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mail className="w-4 h-4" />}
+                Google 批量登录
+              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const input = happyhorseDateFilterRef.current;
+                    if (!input) return;
+                    if (typeof input.showPicker === 'function') {
+                      try { input.showPicker(); return; } catch (_) { /* fall through */ }
+                    }
+                    input.focus();
+                    input.click();
+                  }}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                    happyhorseCreatedDateFilter
+                      ? 'bg-sky-500/20 text-sky-300 hover:bg-sky-500/30'
+                      : 'bg-dark-card text-dark-muted hover:text-white hover:bg-dark-card/80 border border-dark-border'
+                  }`}
+                  title="按添加账号日期筛选"
+                >
+                  <Calendar className="w-4 h-4" />
+                  {happyhorseCreatedDateFilter ? `添加日期 ${happyhorseCreatedDateFilter}` : '筛选添加日期'}
+                </button>
+                <input
+                  ref={happyhorseDateFilterRef}
+                  type="date"
+                  value={happyhorseCreatedDateFilter}
+                  onChange={(e) => setHappyhorseCreatedDateFilter(e.target.value || '')}
+                  className="sr-only"
+                  tabIndex={-1}
+                  aria-label="筛选添加账号日期"
+                />
+                {happyhorseCreatedDateFilter && (
+                  <button
+                    type="button"
+                    onClick={() => setHappyhorseCreatedDateFilter('')}
+                    className="px-2 py-1.5 rounded-lg text-xs text-dark-muted hover:text-white hover:bg-dark-card/50 transition-colors"
+                    title="清除日期筛选"
+                  >
+                    清除
+                  </button>
+                )}
+              </div>
+              <button
+                onClick={handleHappyhorseBatchCredits}
+                disabled={happyhorseLoading || happyhorseBatchStep === 'running' || !!happyhorseRefreshingId || !!happyhorseSigningId || happyhorseFilteredAccounts.length === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-yellow-500/10 text-yellow-400 text-sm font-medium hover:bg-yellow-500/20 disabled:opacity-50 transition-colors"
+              >
+                {happyhorseRefreshingId ? <Loader2 className="w-4 h-4 animate-spin" /> : <Coins className="w-4 h-4" />}
+                查询积分
+              </button>
+              <button
+                onClick={handleHappyhorseBatchDailySignin}
+                disabled={happyhorseLoading || happyhorseBatchStep === 'running' || !!happyhorseRefreshingId || !!happyhorseSigningId || happyhorseFilteredAccounts.length === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-300 text-sm font-medium hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
+                title="批量每日签到领取 DAILY_SIGNIN"
+              >
+                {happyhorseSigningId ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                每日签到
+              </button>
+              <button
+                onClick={handleHappyhorseExportSelected}
+                disabled={happyhorseExporting || happyhorseSelectedIds.length === 0 || happyhorseBatchStep === 'running'}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-500/10 text-sky-300 text-sm font-medium hover:bg-sky-500/20 disabled:opacity-50 transition-colors"
+                title="导出勾选账号的 cookie / accessToken"
+              >
+                {happyhorseExporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                导出选中{happyhorseSelectedIds.length ? ` (${happyhorseSelectedIds.length})` : ''}
+              </button>
+              <button
+                onClick={fetchHappyhorseAccounts}
+                disabled={happyhorseLoading || happyhorseBatchStep === 'running'}
+                className="p-2 rounded-lg text-dark-muted hover:text-white hover:bg-dark-card/50 disabled:opacity-50 transition-colors"
+                title="刷新渠道十一账号"
+              >
+                <RefreshCw className={`w-4 h-4 ${happyhorseLoading ? 'animate-spin' : ''}`} />
+              </button>
+            </>
+          ) : activePool === 'insmind' ? (
+            <>
+              <button
+                onClick={() => setShowInsmindRegister((prev) => !prev)}
+                disabled={insmindRegistering}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-500/10 text-sky-300 text-sm font-medium hover:bg-sky-500/20 disabled:opacity-50 transition-colors"
+              >
+                {insmindRegistering ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                {insmindRegistering ? '注册中' : 'GPTMail 注册'}
+              </button>
+              <button
+                onClick={() => handleInsmindExport({ all: false })}
+                disabled={insmindExporting || insmindDeleting || insmindRegistering || insmindSelectedIds.length === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-sky-500/10 text-sky-300 text-sm font-medium hover:bg-sky-500/20 disabled:opacity-50 transition-colors"
+                title="导出勾选账号的 access_token / cookie"
+              >
+                {insmindExporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                导出选中{insmindSelectedIds.length ? ` (${insmindSelectedIds.length})` : ''}
+              </button>
+              <button
+                onClick={handleInsmindDeleteSelected}
+                disabled={insmindDeleting || insmindExporting || insmindRegistering || insmindSelectedIds.length === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-500/10 text-red-300 text-sm font-medium hover:bg-red-500/20 disabled:opacity-50 transition-colors"
+                title="删除勾选的渠道十二账号"
+              >
+                {insmindDeleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                删除选中{insmindSelectedIds.length ? ` (${insmindSelectedIds.length})` : ''}
+              </button>
+              <button
+                onClick={() => handleInsmindExport({ all: true })}
+                disabled={insmindExporting || insmindDeleting || insmindRegistering || insmindAccounts.length === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-300 text-sm font-medium hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
+                title="导出全部渠道十二账号"
+              >
+                {insmindExporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                导出全部
+              </button>
+              <button
+                onClick={fetchInsmindAccounts}
+                disabled={insmindLoading || insmindRegistering || insmindDeleting}
+                className="p-2 rounded-lg text-dark-muted hover:text-white hover:bg-dark-card/50 disabled:opacity-50 transition-colors"
+                title="刷新渠道十二账号"
+              >
+                <RefreshCw className={`w-4 h-4 ${insmindLoading ? 'animate-spin' : ''}`} />
               </button>
             </>
           ) : (
@@ -3588,6 +4822,605 @@ export default function WizstarAccounts({ onOpenGoogleLogin }) {
                   </button>
                   <button
                     onClick={() => handleFramiaDelete(acc.id)}
+                    className="p-1.5 rounded-lg text-dark-muted hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                    title="删除"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {activePool === 'happyhorse' && showHappyhorseBatchLogin && (
+          <div className="p-4 rounded-xl bg-dark-card border border-emerald-500/20 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-medium text-white">渠道十一 HappyHorse · Google 批量登录</h3>
+                <p className="text-xs text-dark-muted mt-1">
+                  每行一个账号，格式: 邮箱|密码。系统会打开 Chrome 完成 HappyHorse → Google OAuth，并把 accessToken 保存到渠道十一账号池。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  if (happyhorseBatchStep !== 'running') setShowHappyhorseBatchLogin(false);
+                }}
+                disabled={happyhorseBatchStep === 'running'}
+                className="p-1.5 rounded-lg text-dark-muted hover:text-white hover:bg-dark-bg disabled:opacity-50 transition-colors"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            </div>
+
+            {happyhorseBatchStep === 'idle' && (
+              <div className="space-y-3">
+                <textarea
+                  placeholder="email1@gmaii.lol|password1&#10;email2@gmaii.lol|password2"
+                  value={happyhorseBatchText}
+                  onChange={(e) => setHappyhorseBatchText(e.target.value)}
+                  rows={8}
+                  className="w-full bg-dark-input text-sm border border-dark-border focus:border-emerald-500 focus:outline-none rounded-lg p-3 text-white placeholder-dark-subtle font-mono resize-none"
+                />
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-brand/20 bg-brand/5 p-3">
+                  <span className="text-xs text-brand">从全局邮箱库领取</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={happyhorsePoolCount}
+                    onChange={(e) => setHappyhorsePoolCount(Math.max(1, Math.min(100, parseInt(e.target.value, 10) || 1)))}
+                    className="w-16 bg-dark-input text-sm border border-dark-border focus:border-brand focus:outline-none rounded-lg p-2 text-white text-center"
+                  />
+                  <span className="text-xs text-dark-muted">个尚未用于渠道十一的 Google 密码账号</span>
+                  <button
+                    type="button"
+                    onClick={handleHappyhorsePoolLogin}
+                    className="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-lg bg-brand/15 text-brand text-sm font-medium hover:bg-brand/25 transition-colors"
+                  >
+                    <Mail className="w-4 h-4" />
+                    领取并登录
+                  </button>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="text-xs text-dark-muted">并发数</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="5"
+                    value={happyhorseBatchConcurrency}
+                    onChange={(e) => setHappyhorseBatchConcurrency(Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
+                    className="w-16 bg-dark-input text-sm border border-dark-border focus:border-emerald-500 focus:outline-none rounded-lg p-2 text-white text-center"
+                  />
+                  <span className="text-xs text-dark-muted">Google 风控较敏感，建议 1–2</span>
+                  <label className="flex items-center gap-2 text-xs text-dark-muted">
+                    <input
+                      type="checkbox"
+                      checked={happyhorseBatchVisible}
+                      onChange={(e) => setHappyhorseBatchVisible(e.target.checked)}
+                      className="accent-brand"
+                    />
+                    可见浏览器
+                  </label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleHappyhorseBatchLogin}
+                    disabled={!happyhorseBatchText.trim()}
+                    className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-emerald-500/15 text-emerald-300 text-sm font-medium hover:bg-emerald-500/25 disabled:opacity-50 transition-colors"
+                  >
+                    <Mail className="w-4 h-4" />
+                    开始登录（{happyhorseBatchText.trim().split('\n').filter(l => l.trim() && l.includes('|')).length} 个账号）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowHappyhorseBatchLogin(false)}
+                    className="px-4 py-2 rounded-lg text-dark-muted text-sm hover:text-white hover:bg-dark-card/80 transition-colors"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {happyhorseBatchStep === 'running' && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3 py-1">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Loader2 className="w-4 h-4 text-emerald-400 animate-spin shrink-0" />
+                    <span className="text-sm text-white truncate">
+                      {happyhorseCancelling
+                        ? '正在取消渠道十一登录...'
+                        : happyhorseBatchProgress
+                          ? `进度 ${happyhorseBatchProgress.done}/${happyhorseBatchProgress.total}`
+                          : 'HappyHorse 批量登录进行中...'}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={cancelHappyhorseBatchLogin}
+                    disabled={happyhorseCancelling}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-red-500/15 text-red-300 text-xs font-medium hover:bg-red-500/25 disabled:opacity-50 transition-colors shrink-0"
+                  >
+                    {happyhorseCancelling ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />}
+                    取消任务
+                  </button>
+                </div>
+                {happyhorseBatchProgress && (
+                  <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 space-y-2">
+                    <div className="flex items-center justify-between gap-3 text-[11px]">
+                      <span className="text-emerald-200/90 truncate">
+                        {happyhorseBatchProgress.currentEmail
+                          ? `当前：${happyhorseBatchProgress.currentEmail}`
+                          : '处理中...'}
+                      </span>
+                      <span className="text-white font-medium shrink-0">
+                        {happyhorseBatchProgress.total
+                          ? `${Math.min(100, Math.round((happyhorseBatchProgress.done / happyhorseBatchProgress.total) * 100))}%`
+                          : '0%'}
+                      </span>
+                    </div>
+                    <div className="h-1.5 rounded-full bg-dark-border/60 overflow-hidden">
+                      <div
+                        className="h-full rounded-full bg-emerald-400 transition-all duration-300"
+                        style={{
+                          width: `${happyhorseBatchProgress.total
+                            ? Math.min(100, Math.round((happyhorseBatchProgress.done / happyhorseBatchProgress.total) * 100))
+                            : 0}%`,
+                        }}
+                      />
+                    </div>
+                    <div className="flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-dark-muted">
+                      <span>成功 <span className="text-green-400">{happyhorseBatchProgress.succeeded}</span></span>
+                      <span>跳过 <span className="text-amber-300">{happyhorseBatchProgress.skipped}</span></span>
+                      <span>失败 <span className="text-red-400">{happyhorseBatchProgress.failed}</span></span>
+                      {(happyhorseBatchProgress.cancelled || 0) > 0 && (
+                        <span>取消 <span className="text-amber-200">{happyhorseBatchProgress.cancelled}</span></span>
+                      )}
+                      <span className="ml-auto text-dark-subtle">
+                        已完成 {happyhorseBatchProgress.done}/{happyhorseBatchProgress.total}
+                      </span>
+                    </div>
+                  </div>
+                )}
+                <div className="space-y-1.5 max-h-72 overflow-y-auto">
+                  {Object.entries(happyhorseBatchResults)
+                    .sort(([a], [b]) => {
+                      const na = Number.parseInt(a, 10);
+                      const nb = Number.parseInt(b, 10);
+                      if (Number.isNaN(na) || Number.isNaN(nb)) return String(a).localeCompare(String(b));
+                      return na - nb;
+                    })
+                    .map(([idx, info]) => (
+                      <div key={idx} className="flex items-center justify-between bg-dark-input/50 border border-dark-border/40 rounded-lg px-3 py-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          {info.ok === true ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-green-400 shrink-0" />
+                          ) : info.ok === false ? (
+                            <AlertCircle className={`w-3.5 h-3.5 shrink-0 ${info.step === 'cancelled' ? 'text-amber-300' : 'text-red-400'}`} />
+                          ) : info.step === 'queued' ? (
+                            <div className="w-3.5 h-3.5 rounded-full border border-dark-muted/50 shrink-0" />
+                          ) : (
+                            <Loader2 className="w-3.5 h-3.5 text-emerald-400 animate-spin shrink-0" />
+                          )}
+                          <span className="text-xs text-white truncate">{info.email}</span>
+                        </div>
+                        <span className="text-[10px] text-dark-muted shrink-0 ml-2">
+                          {info.step === 'queued' ? '排队中' :
+                           info.step === 'starting' ? '启动中' :
+                           info.step === 'saved_to_db' ? '已保存' :
+                           info.step === 'skipped' ? '已跳过（已登录）' :
+                           info.step === 'cancelled' ? '已取消' :
+                           info.step === 'error' ? (info.error || '失败') :
+                           info.step || '处理中'}
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
+
+            {happyhorseBatchStep === 'done' && happyhorseBatchSummary && (
+              <div className="space-y-3">
+                <div className="flex items-center gap-3 py-2">
+                  {happyhorseBatchSummary.failed === 0 && !(happyhorseBatchSummary.cancelled > 0) ? (
+                    <CheckCircle2 className="w-5 h-5 text-green-400" />
+                  ) : (
+                    <AlertCircle className="w-5 h-5 text-orange-400" />
+                  )}
+                  <span className="text-sm text-white">
+                    批量登录完成：成功 <span className="text-green-400 font-bold">{happyhorseBatchSummary.succeeded}</span>，
+                    跳过 <span className="text-amber-300 font-bold">{happyhorseBatchSummary.skipped || 0}</span>，
+                    失败 <span className="text-red-400 font-bold">{happyhorseBatchSummary.failed}</span>
+                    {(happyhorseBatchSummary.cancelled || 0) > 0 && (
+                      <>
+                        ，取消 <span className="text-amber-200 font-bold">{happyhorseBatchSummary.cancelled}</span>
+                      </>
+                    )}
+                    ，共 {happyhorseBatchSummary.total} 个账号
+                  </span>
+                </div>
+                {happyhorseBatchSummary.failed > 0 && (
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                    {Object.entries(happyhorseBatchResults)
+                      .filter(([, info]) => info.ok === false && info.step !== 'cancelled')
+                      .sort(([a], [b]) => parseInt(a) - parseInt(b))
+                      .map(([idx, info]) => (
+                        <div key={idx} className="rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2 text-xs">
+                          <div className="flex items-center gap-2 text-red-300">
+                            <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                            <span className="truncate">{info.email}</span>
+                          </div>
+                          <div className="mt-1 whitespace-pre-wrap break-words text-red-200/80">{info.error || '未返回具体错误信息'}</div>
+                        </div>
+                      ))}
+                  </div>
+                )}
+                <div className="flex items-center gap-2">
+                  {happyhorseBatchSummary.failed > 0 && (
+                    <button
+                      type="button"
+                      onClick={retryHappyhorseFailedLogins}
+                      className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-amber-500/15 text-amber-200 text-sm font-medium hover:bg-amber-500/25 transition-colors"
+                    >
+                      <RotateCcw className="w-4 h-4" />
+                      重试失败（{happyhorseBatchSummary.failed}）
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowHappyhorseBatchLogin(false);
+                      setHappyhorseBatchStep('idle');
+                      setHappyhorseBatchText('');
+                      setHappyhorseBatchResults({});
+                      setHappyhorseBatchSummary(null);
+                      happyhorseBatchAccountsRef.current = [];
+                    }}
+                    className="px-4 py-2 rounded-lg text-dark-muted text-sm hover:text-white hover:bg-dark-card/80 transition-colors"
+                  >
+                    完成
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activePool === 'happyhorse' && (happyhorseLoading ? (
+          <div className="flex items-center justify-center py-20">
+            <Loader2 className="w-6 h-6 text-brand animate-spin" />
+          </div>
+        ) : happyhorseAccounts.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-20 text-dark-muted">
+            <Sparkles className="w-12 h-12 mb-3 opacity-30" />
+            <p className="text-sm">暂无渠道十一 HappyHorse 账号，点击右上角「Google 批量登录」开始</p>
+          </div>
+        ) : happyhorseFilteredAccounts.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-20 text-dark-muted">
+            <Calendar className="w-12 h-12 mb-3 opacity-30" />
+            <p className="text-sm">没有添加日期为 {happyhorseCreatedDateFilter} 的账号</p>
+            <button
+              type="button"
+              onClick={() => setHappyhorseCreatedDateFilter('')}
+              className="mt-3 px-3 py-1.5 rounded-lg bg-sky-500/10 text-sky-300 text-xs font-medium hover:bg-sky-500/20 transition-colors"
+            >
+              清除日期筛选
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between rounded-xl border border-dark-border bg-dark-card/60 px-4 py-3 text-xs text-dark-muted">
+              <div className="flex items-center gap-3 min-w-0">
+                <label className="flex items-center gap-2 cursor-pointer select-none shrink-0">
+                  <input
+                    type="checkbox"
+                    checked={
+                      happyhorseFilteredAccounts.length > 0
+                      && happyhorseFilteredAccounts.every(acc => happyhorseSelectedIds.includes(Number(acc.id)))
+                    }
+                    onChange={toggleHappyhorseSelectAll}
+                    className="rounded border-dark-border text-brand focus:ring-brand/50"
+                  />
+                  <span className="text-white">
+                    {happyhorseFilteredAccounts.length > 0
+                      && happyhorseFilteredAccounts.every(acc => happyhorseSelectedIds.includes(Number(acc.id)))
+                      ? '取消全选'
+                      : '全选'}
+                  </span>
+                </label>
+                <label className="flex items-center gap-1.5 shrink-0 cursor-pointer" title="按添加账号日期筛选">
+                  <Calendar className="w-3.5 h-3.5 text-sky-300" />
+                  <input
+                    type="date"
+                    value={happyhorseCreatedDateFilter}
+                    onChange={(e) => setHappyhorseCreatedDateFilter(e.target.value || '')}
+                    className="bg-dark-input border border-dark-border rounded-lg px-2 py-1 text-[11px] text-white focus:outline-none focus:border-sky-400/50"
+                  />
+                </label>
+                {happyhorseCreatedDateFilter && (
+                  <button
+                    type="button"
+                    onClick={() => setHappyhorseCreatedDateFilter('')}
+                    className="px-2 py-1 rounded-lg text-[11px] text-dark-muted hover:text-white hover:bg-dark-card transition-colors shrink-0"
+                  >
+                    清除
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleHappyhorseExportSelected}
+                  disabled={happyhorseExporting || happyhorseSelectedIds.length === 0 || happyhorseBatchStep === 'running'}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-sky-500/10 text-sky-300 text-[11px] font-bold hover:bg-sky-500/20 disabled:opacity-50 transition-colors shrink-0"
+                  title="导出勾选账号的 cookie / accessToken"
+                >
+                  {happyhorseExporting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                  导出选中{happyhorseSelectedIds.length ? ` (${happyhorseSelectedIds.length})` : ''}
+                </button>
+                <span className="truncate">
+                  {happyhorseCreatedDateFilter
+                    ? `筛选 ${happyhorseCreatedDateFilter}：${happyhorseFilteredAccounts.length} / 共 ${happyhorseAccounts.length} 个`
+                    : `当前共 ${happyhorseAccounts.length} 个渠道十一账号`}
+                  {happyhorseSelectedIds.length > 0 ? `，已选 ${happyhorseSelectedIds.length} 个` : ''}。
+                  勾选后可导出 cookie / accessToken。
+                </span>
+              </div>
+              <span className="shrink-0">账号可在内容创作中用于图生视频。</span>
+            </div>
+            {happyhorseFilteredAccounts.map((acc) => (
+              <div
+                key={acc.id}
+                className={`flex items-center justify-between p-4 rounded-xl border transition-colors ${
+                  happyhorseSelectedIds.includes(Number(acc.id))
+                    ? 'bg-sky-950/20 border-sky-500/40'
+                    : acc.has_token || acc.configured
+                      ? 'bg-dark-card border-dark-border hover:border-dark-border/80'
+                      : 'bg-amber-950/20 border-amber-500/30'
+                }`}
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <input
+                    type="checkbox"
+                    checked={happyhorseSelectedIds.includes(Number(acc.id))}
+                    onChange={() => toggleHappyhorseSelection(acc.id)}
+                    className="rounded border-dark-border text-brand focus:ring-brand/50 shrink-0"
+                    title="选中后导出"
+                  />
+                  <div className="w-9 h-9 rounded-lg bg-emerald-500/10 flex items-center justify-center shrink-0">
+                    <Sparkles className="w-4 h-4 text-emerald-300" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white truncate flex items-center gap-2">
+                      <span>{acc.email || '未知 HappyHorse 账号'}</span>
+                      <span className={`px-1.5 py-0.5 rounded border text-[10px] font-bold ${
+                        acc.has_token || acc.configured
+                          ? 'bg-green-500/15 text-green-400 border-green-500/30'
+                          : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                      }`}>
+                        {acc.has_token || acc.configured ? '已采集' : 'Token 缺失'}
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-dark-muted mt-1">
+                      <span>{formatDate(acc.updated_at || acc.created_at)}</span>
+                      {acc.user_id && <span className="text-dark-subtle">UID: {acc.user_id}</span>}
+                      {acc.device_id && <span className="text-dark-subtle truncate max-w-[180px]" title={acc.device_id}>device: {acc.device_id}</span>}
+                    </div>
+                    {acc.user_agent && (
+                      <div className="mt-1 text-[11px] text-dark-subtle truncate max-w-[620px]" title={acc.user_agent}>
+                        {acc.user_agent}
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => handleHappyhorseRefreshCredits(acc.id)}
+                    disabled={happyhorseRefreshingId === acc.id || happyhorseSigningId === acc.id}
+                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-yellow-500/10 text-yellow-400 text-xs font-bold hover:bg-yellow-500/20 disabled:opacity-50 transition-colors"
+                    title="查询积分 availableCount"
+                  >
+                    {happyhorseRefreshingId === acc.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Coins className="w-3.5 h-3.5" />}
+                    {acc.credits_balance != null ? `${acc.credits_balance} 积分` : '查询积分'}
+                  </button>
+                  <button
+                    onClick={() => handleHappyhorseDailySignin(acc.id)}
+                    disabled={happyhorseSigningId === acc.id || happyhorseRefreshingId === acc.id || !(acc.has_token || acc.configured)}
+                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-500/10 text-emerald-300 text-xs font-bold hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
+                    title="每日签到领取 DAILY_SIGNIN"
+                  >
+                    {happyhorseSigningId === acc.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+                    每日签到
+                  </button>
+                  <button
+                    onClick={() => copyText(acc.email || '', '邮箱')}
+                    disabled={!acc.email}
+                    className="px-1.5 py-1 rounded-lg text-dark-muted hover:text-brand hover:bg-brand/10 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
+                    title="复制邮箱"
+                  >
+                    <Copy className="w-3.5 h-3.5" /> 邮箱
+                  </button>
+                  <button
+                    onClick={() => handleHappyhorseDelete(acc.id)}
+                    className="p-1.5 rounded-lg text-dark-muted hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                    title="删除"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {activePool === 'insmind' && showInsmindRegister && (
+          <div className="p-4 rounded-xl bg-dark-card border border-sky-500/20 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-medium text-white">渠道十二 insMind · GPTMail 注册</h3>
+                <p className="text-xs text-dark-muted mt-1">
+                  使用 GPTMail 临时邮箱 + 图形验证码完成 UMS 注册并绑定个人租户。需配置 YesCaptcha Key（与渠道三共用）。注册默认走设置里的动态代理（ipwo），可缓解发码 IP 限流。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => !insmindRegistering && setShowInsmindRegister(false)}
+                disabled={insmindRegistering}
+                className="p-1.5 rounded-lg text-dark-muted hover:text-white hover:bg-dark-bg disabled:opacity-50 transition-colors"
+              >
+                <XCircle className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="text-xs text-dark-muted">注册数量</label>
+              <input
+                type="number"
+                min="1"
+                max="999"
+                value={insmindRegCount}
+                onChange={(e) => setInsmindRegCount(Math.max(1, Math.min(999, parseInt(e.target.value, 10) || 1)))}
+                className="w-24 bg-dark-input text-sm border border-dark-border focus:border-sky-500 focus:outline-none rounded-lg p-2 text-white text-center"
+              />
+              <label className="text-xs text-dark-muted">并发数</label>
+              <input
+                type="number"
+                min="1"
+                max="999"
+                value={insmindRegConcurrency}
+                onChange={(e) => setInsmindRegConcurrency(Math.max(1, Math.min(999, parseInt(e.target.value, 10) || 1)))}
+                className="w-24 bg-dark-input text-sm border border-dark-border focus:border-sky-500 focus:outline-none rounded-lg p-2 text-white text-center"
+              />
+              <span className="text-xs text-dark-muted">数量/并发 1–999；过高并发可能触发验证码风控。</span>
+              <button
+                type="button"
+                onClick={handleInsmindRegister}
+                disabled={insmindRegistering}
+                className="ml-auto flex items-center gap-1.5 px-4 py-2 rounded-lg bg-sky-500/15 text-sky-300 text-sm font-medium hover:bg-sky-500/25 disabled:opacity-50 transition-colors"
+              >
+                {insmindRegistering ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                {insmindRegistering
+                  ? (insmindRegProgress
+                    ? `注册中 ${insmindRegProgress.done}/${insmindRegProgress.total}`
+                    : '注册中...')
+                  : '开始注册'}
+              </button>
+            </div>
+            {insmindRegProgress && (insmindRegistering || insmindRegProgress.done > 0) && (
+              <div className="rounded-lg border border-sky-500/20 bg-sky-500/5 px-3 py-2 space-y-2">
+                <div className="flex items-center justify-between gap-3 text-[11px]">
+                  <span className="text-sky-200/90 truncate">
+                    {insmindRegistering
+                      ? (insmindRegProgress.currentEmail || '处理中...')
+                      : '本轮注册已结束'}
+                  </span>
+                  <span className="text-white font-medium shrink-0">
+                    {insmindRegProgress.total
+                      ? `${Math.min(100, Math.round((insmindRegProgress.done / insmindRegProgress.total) * 100))}%`
+                      : '0%'}
+                  </span>
+                </div>
+                <div className="h-1.5 rounded-full bg-dark-border/60 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-sky-400 transition-all duration-300"
+                    style={{
+                      width: `${insmindRegProgress.total
+                        ? Math.min(100, Math.round((insmindRegProgress.done / insmindRegProgress.total) * 100))
+                        : 0}%`,
+                    }}
+                  />
+                </div>
+                <div className="flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-dark-muted">
+                  <span>成功 <span className="text-green-400">{insmindRegProgress.succeeded}</span></span>
+                  <span>失败 <span className="text-red-400">{insmindRegProgress.failed}</span></span>
+                  <span className="ml-auto text-dark-subtle">
+                    已完成 {insmindRegProgress.done}/{insmindRegProgress.total}
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activePool === 'insmind' && (insmindLoading ? (
+          <div className="flex items-center justify-center py-20">
+            <Loader2 className="w-6 h-6 text-brand animate-spin" />
+          </div>
+        ) : insmindAccounts.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-20 text-dark-muted">
+            <Sparkles className="w-12 h-12 mb-3 opacity-30" />
+            <p className="text-sm">暂无渠道十二 insMind 账号，点击右上角「GPTMail 注册」或在设置页导入 token</p>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between rounded-xl border border-dark-border bg-dark-card/60 px-4 py-3 text-xs text-dark-muted">
+              <div className="flex items-center gap-3">
+                <label className="flex items-center gap-1.5 cursor-pointer select-none text-white">
+                  <input
+                    type="checkbox"
+                    checked={insmindAccounts.length > 0 && insmindAccounts.every((acc) => insmindSelectedIds.includes(Number(acc.id)))}
+                    onChange={toggleInsmindSelectAll}
+                    className="rounded border-dark-border"
+                  />
+                  全选
+                </label>
+                <span>
+                  当前共 {insmindAccounts.length} 个渠道十二账号；前端只展示脱敏 token。
+                  {insmindSelectedIds.length > 0 ? `，已选 ${insmindSelectedIds.length} 个` : ''}
+                </span>
+              </div>
+              <span>图生视频 · Seedance 2.0 Mini · 5/10/15s · 480P/720P</span>
+            </div>
+            {insmindAccounts.map((acc) => (
+              <div
+                key={acc.id}
+                className={`flex items-center justify-between p-4 rounded-xl border transition-colors ${
+                  acc.configured
+                    ? 'bg-dark-card border-dark-border hover:border-dark-border/80'
+                    : 'bg-amber-950/20 border-amber-500/30'
+                }`}
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <input
+                    type="checkbox"
+                    checked={insmindSelectedIds.includes(Number(acc.id))}
+                    onChange={() => toggleInsmindSelect(Number(acc.id))}
+                    className="rounded border-dark-border shrink-0"
+                    title="勾选导出"
+                  />
+                  <div className="w-9 h-9 rounded-lg bg-sky-500/10 flex items-center justify-center shrink-0">
+                    <Sparkles className="w-4 h-4 text-sky-300" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-white truncate flex items-center gap-2">
+                      <span>{acc.email || '未知 insMind 账号'}</span>
+                      <span className={`px-1.5 py-0.5 rounded border text-[10px] font-bold ${
+                        acc.configured
+                          ? 'bg-green-500/15 text-green-400 border-green-500/30'
+                          : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                      }`}>
+                        {acc.configured ? '登录态有效' : acc.token_expired ? 'Token 已过期' : 'Token 缺失'}
+                      </span>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-dark-muted mt-1">
+                      <span>{formatDate(acc.updated_at || acc.created_at)}</span>
+                      {acc.user_id && <span className="text-dark-subtle">UID: {acc.user_id}</span>}
+                      {acc.org_id && <span className="text-dark-subtle">org: {acc.org_id}</span>}
+                      {acc.token_masked && <span className="font-mono text-dark-subtle">Token {acc.token_masked}</span>}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3 shrink-0">
+                  <button
+                    onClick={() => copyText(acc.email || '', '邮箱')}
+                    disabled={!acc.email}
+                    className="px-1.5 py-1 rounded-lg text-dark-muted hover:text-brand hover:bg-brand/10 disabled:opacity-40 transition-colors flex items-center gap-1 text-xs"
+                    title="复制邮箱"
+                  >
+                    <Copy className="w-3.5 h-3.5" /> 邮箱
+                  </button>
+                  <button
+                    onClick={() => handleInsmindDelete(acc.id)}
                     className="p-1.5 rounded-lg text-dark-muted hover:text-red-400 hover:bg-red-500/10 transition-colors"
                     title="删除"
                   >

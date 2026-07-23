@@ -1407,6 +1407,47 @@ def _extract_session_token(session: Any, responses: list[Any]) -> str:
     return ""
 
 
+def _resolve_register_proxy() -> str:
+    """curl_cffi 不走 macOS 系统代理，注册时需显式指定。"""
+    for key in (
+        "TENSORART_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ):
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value
+    try:
+        from .quickframe_bridge import get_proxy_settings
+
+        configured = str(get_proxy_settings().get("requests_proxy") or "").strip()
+    except Exception:
+        configured = ""
+    candidates = []
+    if configured:
+        candidates.append(configured)
+    for port in (7892, 7890, 1087, 7897, 10809):
+        candidates.append(f"http://127.0.0.1:{port}")
+    seen = set()
+    for proxy in candidates:
+        if not proxy or proxy in seen:
+            continue
+        seen.add(proxy)
+        parsed = urlparse(proxy)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            with socket.create_connection((host, port), timeout=0.4):
+                return proxy
+        except OSError:
+            continue
+    return ""
+
+
 def register_with_mailbox(
     email_address: str,
     client_id: str,
@@ -1415,6 +1456,7 @@ def register_with_mailbox(
     *,
     max_wait: int = 210,
     user_agent: str = "",
+    proxy: str = "",
 ) -> dict:
     """使用 Microsoft OAuth 邮箱完成 Tensor.Art magic-link 注册/登录。"""
     from .mailbox import OutlookMailbox
@@ -1432,7 +1474,14 @@ def register_with_mailbox(
         raise TensorArtError(
             "Tensor.Art 邮件注册缺少 curl_cffi，请安装后重启后端"
         )
-    session = curl_requests.Session(impersonate="chrome")
+    resolved_proxy = str(proxy or "").strip() or _resolve_register_proxy()
+    session_kwargs: dict[str, Any] = {"impersonate": "chrome"}
+    if resolved_proxy:
+        session_kwargs["proxies"] = {
+            "http": resolved_proxy,
+            "https": resolved_proxy,
+        }
+    session = curl_requests.Session(**session_kwargs)
     try:
         session.get(LOGIN_PAGE, timeout=30)
     except _HTTP_REQUEST_ERRORS:

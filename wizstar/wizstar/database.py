@@ -368,6 +368,28 @@ _SCHEMA = [
     ) {_TABLE_OPTIONS}
     """,
     f"""
+    CREATE TABLE IF NOT EXISTS happyhorse_accounts (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        password LONGTEXT NULL,
+        access_token LONGTEXT NULL,
+        refresh_token LONGTEXT NULL,
+        expires_at BIGINT NOT NULL DEFAULT 0,
+        cookie_masked TEXT NULL,
+        cookie LONGTEXT NULL,
+        user_agent TEXT NULL,
+        user_id VARCHAR(255) NULL,
+        device_id VARCHAR(128) NULL,
+        bx_umidtoken TEXT NULL,
+        location TEXT NULL,
+        status VARCHAR(64) NOT NULL DEFAULT 'active',
+        note TEXT NULL,
+        created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        UNIQUE KEY uq_happyhorse_accounts_email (email)
+    ) {_TABLE_OPTIONS}
+    """,
+    f"""
     CREATE TABLE IF NOT EXISTS tensorart_accounts (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
         email VARCHAR(255) NOT NULL,
@@ -382,6 +404,25 @@ _SCHEMA = [
         created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
         updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
         UNIQUE KEY uq_tensorart_accounts_email (email)
+    ) {_TABLE_OPTIONS}
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS insmind_accounts (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        email VARCHAR(255) NOT NULL,
+        access_token LONGTEXT NULL,
+        refresh_token LONGTEXT NULL,
+        token_masked TEXT NULL,
+        cookie LONGTEXT NULL,
+        cookie_masked TEXT NULL,
+        expires_at BIGINT NOT NULL DEFAULT 0,
+        user_id VARCHAR(255) NULL,
+        org_id VARCHAR(255) NULL,
+        status VARCHAR(64) NOT NULL DEFAULT 'active',
+        note TEXT NULL,
+        created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        UNIQUE KEY uq_insmind_accounts_email (email)
     ) {_TABLE_OPTIONS}
     """,
     f"""
@@ -430,6 +471,20 @@ def _ensure_column(conn: MySQLConnection, table_name: str, column_name: str, def
         conn.execute(f"ALTER TABLE `{table_name}` ADD COLUMN `{column_name}` {definition}")
 
 
+# channel -> (account_table, email_column)，用于占用同步 / 领取时排除已登录账号
+CHANNEL_ACCOUNT_TABLES = {
+    "wizstar": ("accounts", "email"),
+    "quickframe": ("qf_accounts", "email"),
+    "dola": ("dola_accounts", "name"),
+    "lovart": ("lovart_accounts", "email"),
+    "oreateai": ("oreateai_accounts", "email"),
+    "framia": ("framia_accounts", "email"),
+    "happyhorse": ("happyhorse_accounts", "email"),
+    "tensorart": ("tensorart_accounts", "email"),
+    "insmind": ("insmind_accounts", "email"),
+}
+
+
 def init_db():
     conn = get_connection()
     try:
@@ -475,16 +530,7 @@ def init_db():
         _ensure_column(conn, "accounts", "last_error", "TEXT NULL")
         _ensure_column(conn, "tasks", "video_duration", "INT NOT NULL DEFAULT 0")
 
-        channel_account_tables = (
-            ("wizstar", "accounts", "email"),
-            ("quickframe", "qf_accounts", "email"),
-            ("dola", "dola_accounts", "name"),
-            ("lovart", "lovart_accounts", "email"),
-            ("oreateai", "oreateai_accounts", "email"),
-            ("framia", "framia_accounts", "email"),
-            ("tensorart", "tensorart_accounts", "email"),
-        )
-        for channel, table_name, email_column in channel_account_tables:
+        for channel, (table_name, email_column) in CHANNEL_ACCOUNT_TABLES.items():
             conn.execute(
                 f"""INSERT INTO mailbox_channel_usage
                         (mailbox_id, channel, status, account_email, last_error,
@@ -691,6 +737,17 @@ class MailboxDB:
         if selected_ids:
             id_sql = f"AND m.id IN ({','.join('?' for _ in selected_ids)})"
             params.extend(selected_ids)
+        # 已在对应渠道账号库中的邮箱，领取时直接排除，避免重复登录
+        account_exclude_sql = ""
+        account_table = CHANNEL_ACCOUNT_TABLES.get(normalized_channel)
+        if account_table:
+            table_name, email_column = account_table
+            account_exclude_sql = f"""
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM `{table_name}` a
+                          WHERE LOWER(a.`{email_column}`) = LOWER(m.email)
+                      )"""
         params.extend((normalized_channel, now, now, requested_count))
 
         conn = get_connection()
@@ -703,6 +760,7 @@ class MailboxDB:
                       AND {credential_sql}
                       {provider_sql}
                       {id_sql}
+                      {account_exclude_sql}
                       AND NOT EXISTS (
                           SELECT 1
                           FROM mailbox_channel_usage u
@@ -1709,6 +1767,159 @@ class FramiaAccountDB:
         return count
 
 
+class HappyhorseAccountDB:
+    """HappyHorse 渠道十一账号库。"""
+
+    SENSITIVE_FIELDS = {"password", "access_token", "refresh_token", "cookie", "bx_umidtoken"}
+
+    @staticmethod
+    def _row_to_account(row: dict) -> dict:
+        return dict(row) if row else {}
+
+    @staticmethod
+    def _public(data: dict) -> dict:
+        public = {k: v for k, v in data.items() if k not in HappyhorseAccountDB.SENSITIVE_FIELDS}
+        public["has_token"] = bool(data.get("access_token"))
+        public["token_expired"] = HappyhorseAccountDB._is_token_expired(data)
+        public["configured"] = public["has_token"] and not public["token_expired"]
+        return public
+
+    @staticmethod
+    def _is_token_expired(account: dict) -> bool:
+        expires_at = int(account.get("expires_at") or 0)
+        if not expires_at:
+            return False
+        return expires_at < int(time.time() * 1000)
+
+    @staticmethod
+    def list_all() -> list[dict]:
+        conn = get_connection()
+        rows = conn.execute("SELECT * FROM happyhorse_accounts ORDER BY updated_at DESC, created_at DESC").fetchall()
+        conn.close()
+        return [HappyhorseAccountDB._public(HappyhorseAccountDB._row_to_account(row)) for row in rows]
+
+    @staticmethod
+    def list_all_internal() -> list[dict]:
+        conn = get_connection()
+        rows = conn.execute("SELECT * FROM happyhorse_accounts ORDER BY updated_at DESC, created_at DESC").fetchall()
+        conn.close()
+        return [HappyhorseAccountDB._row_to_account(row) for row in rows]
+
+    @staticmethod
+    def get(account_id: int) -> dict | None:
+        conn = get_connection()
+        row = conn.execute("SELECT * FROM happyhorse_accounts WHERE id = ?", (account_id,)).fetchone()
+        conn.close()
+        return HappyhorseAccountDB._row_to_account(row) if row else None
+
+    @staticmethod
+    def get_by_email(email: str) -> dict | None:
+        normalized = str(email or "").strip()
+        if not normalized:
+            return None
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT * FROM happyhorse_accounts WHERE LOWER(email) = LOWER(?) LIMIT 1",
+            (normalized,),
+        ).fetchone()
+        conn.close()
+        return HappyhorseAccountDB._row_to_account(row) if row else None
+
+    @staticmethod
+    def get_many(account_ids: list[int]) -> list[dict]:
+        ids = []
+        seen = set()
+        for raw in account_ids or []:
+            try:
+                account_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if account_id <= 0 or account_id in seen:
+                continue
+            seen.add(account_id)
+            ids.append(account_id)
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        conn = get_connection()
+        rows = conn.execute(
+            f"SELECT * FROM happyhorse_accounts WHERE id IN ({placeholders}) ORDER BY updated_at DESC, created_at DESC",
+            ids,
+        ).fetchall()
+        conn.close()
+        by_id = {int(row["id"]): HappyhorseAccountDB._row_to_account(row) for row in rows}
+        return [by_id[account_id] for account_id in ids if account_id in by_id]
+
+    @staticmethod
+    def get_public(account_id: int) -> dict | None:
+        account = HappyhorseAccountDB.get(account_id)
+        return HappyhorseAccountDB._public(account) if account else None
+
+    @staticmethod
+    def upsert(
+        email: str,
+        password: str = "",
+        access_token: str = "",
+        refresh_token: str = "",
+        expires_at: int = 0,
+        cookie: str = "",
+        user_agent: str = "",
+        user_id: str = "",
+        device_id: str = "",
+        bx_umidtoken: str = "",
+        location: str = "",
+        status: str = "active",
+        note: str = "",
+    ) -> dict:
+        email = (email or "").strip()
+        if not email:
+            raise ValueError("email is required")
+        cookie_masked = cookie[:20] + "..." if len(cookie) > 23 else (cookie[:8] + "..." if cookie else "")
+        conn = get_connection()
+        existing = conn.execute("SELECT id FROM happyhorse_accounts WHERE email = ?", (email,)).fetchone()
+        if existing:
+            conn.execute(
+                """UPDATE happyhorse_accounts
+                   SET password = ?, access_token = ?, refresh_token = ?, expires_at = ?,
+                       cookie_masked = ?, cookie = ?, user_agent = ?, user_id = ?,
+                       device_id = ?, bx_umidtoken = ?, location = ?, status = ?, note = ?,
+                       updated_at = strftime('%s','now')
+                   WHERE email = ?""",
+                (password, access_token, refresh_token, expires_at, cookie_masked, cookie,
+                 user_agent, user_id, device_id, bx_umidtoken, location, status, note, email),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO happyhorse_accounts
+                   (email, password, access_token, refresh_token, expires_at, cookie_masked, cookie,
+                    user_agent, user_id, device_id, bx_umidtoken, location, status, note, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'))""",
+                (email, password, access_token, refresh_token, expires_at, cookie_masked, cookie,
+                 user_agent, user_id, device_id, bx_umidtoken, location, status, note),
+            )
+        conn.commit()
+        row = conn.execute("SELECT * FROM happyhorse_accounts WHERE email = ?", (email,)).fetchone()
+        conn.close()
+        return HappyhorseAccountDB._row_to_account(row)
+
+    @staticmethod
+    def delete(account_id: int):
+        conn = get_connection()
+        conn.execute("DELETE FROM happyhorse_accounts WHERE id = ?", (account_id,))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def delete_all() -> int:
+        conn = get_connection()
+        count_row = conn.execute("SELECT COUNT(*) AS cnt FROM happyhorse_accounts").fetchone()
+        count = int(count_row["cnt"] if count_row else 0)
+        conn.execute("DELETE FROM happyhorse_accounts")
+        conn.commit()
+        conn.close()
+        return count
+
+
 class TensorArtAccountDB:
     """Tensor.Art 渠道十账号库。"""
 
@@ -1851,6 +2062,246 @@ class TensorArtAccountDB:
         ).fetchone()
         count = int(count_row["cnt"] if count_row else 0)
         conn.execute("DELETE FROM tensorart_accounts")
+        conn.commit()
+        conn.close()
+        return count
+
+
+class InsmindAccountDB:
+    """insMind 渠道十二账号库。"""
+
+    SENSITIVE_FIELDS = {"access_token", "refresh_token", "cookie", "token_masked", "cookie_masked"}
+
+    @staticmethod
+    def _row_to_account(row: dict) -> dict:
+        return dict(row) if row else {}
+
+    @staticmethod
+    def _is_token_expired(account: dict) -> bool:
+        expires_at = int(account.get("expires_at") or 0)
+        if not expires_at:
+            return False
+        # 兼容秒 / 毫秒时间戳
+        now_ms = int(time.time() * 1000)
+        if expires_at < 10_000_000_000:
+            expires_at *= 1000
+        return expires_at < now_ms
+
+    @staticmethod
+    def _mask_token(token: str) -> str:
+        token = str(token or "")
+        if len(token) > 28:
+            return token[:16] + "..." + token[-6:]
+        return "***" if token else ""
+
+    @staticmethod
+    def _mask_cookie(cookie: str) -> str:
+        cookie = str(cookie or "")
+        if len(cookie) > 24:
+            return cookie[:10] + "..." + cookie[-6:]
+        return "***" if cookie else ""
+
+    @staticmethod
+    def _public(data: dict) -> dict:
+        public = {
+            key: value
+            for key, value in data.items()
+            if key not in InsmindAccountDB.SENSITIVE_FIELDS
+        }
+        public["has_token"] = bool(data.get("access_token"))
+        public["has_cookie"] = bool(data.get("cookie"))
+        public["token_masked"] = data.get("token_masked") or InsmindAccountDB._mask_token(
+            data.get("access_token") or ""
+        )
+        public["token_expired"] = InsmindAccountDB._is_token_expired(data)
+        public["configured"] = (
+            public["has_token"]
+            and not public["token_expired"]
+            and str(data.get("status") or "active").lower() == "active"
+        )
+        return public
+
+    @staticmethod
+    def list_all() -> list[dict]:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT * FROM insmind_accounts ORDER BY updated_at DESC, created_at DESC"
+        ).fetchall()
+        conn.close()
+        return [
+            InsmindAccountDB._public(InsmindAccountDB._row_to_account(row))
+            for row in rows
+        ]
+
+    @staticmethod
+    def list_all_internal() -> list[dict]:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT * FROM insmind_accounts ORDER BY updated_at DESC, created_at DESC"
+        ).fetchall()
+        conn.close()
+        return [InsmindAccountDB._row_to_account(row) for row in rows]
+
+    @staticmethod
+    def get(account_id: int) -> dict | None:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT * FROM insmind_accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        conn.close()
+        return InsmindAccountDB._row_to_account(row) if row else None
+
+    @staticmethod
+    def get_public(account_id: int) -> dict | None:
+        account = InsmindAccountDB.get(account_id)
+        return InsmindAccountDB._public(account) if account else None
+
+    @staticmethod
+    def get_many(account_ids: list[int]) -> list[dict]:
+        ids = []
+        seen = set()
+        for raw in account_ids or []:
+            try:
+                account_id = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if account_id <= 0 or account_id in seen:
+                continue
+            seen.add(account_id)
+            ids.append(account_id)
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        conn = get_connection()
+        rows = conn.execute(
+            f"SELECT * FROM insmind_accounts WHERE id IN ({placeholders}) "
+            "ORDER BY updated_at DESC, created_at DESC",
+            tuple(ids),
+        ).fetchall()
+        conn.close()
+        by_id = {
+            int(row["id"]): InsmindAccountDB._row_to_account(row)
+            for row in rows
+            if row and row.get("id") is not None
+        }
+        return [by_id[account_id] for account_id in ids if account_id in by_id]
+
+    @staticmethod
+    def get_by_email(email: str) -> dict | None:
+        email = str(email or "").strip()
+        if not email:
+            return None
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT * FROM insmind_accounts WHERE LOWER(email) = LOWER(?) LIMIT 1",
+            (email,),
+        ).fetchone()
+        conn.close()
+        return InsmindAccountDB._row_to_account(row) if row else None
+
+    @staticmethod
+    def upsert(
+        email: str,
+        access_token: str = "",
+        refresh_token: str = "",
+        cookie: str = "",
+        expires_at: int = 0,
+        user_id: str = "",
+        org_id: str = "",
+        status: str = "active",
+        note: str = "",
+    ) -> dict:
+        email = str(email or "").strip()
+        if not email:
+            raise ValueError("email is required")
+        access_token = str(access_token or "").strip()
+        refresh_token = str(refresh_token or "").strip()
+        cookie = str(cookie or "").strip()
+        token_masked = InsmindAccountDB._mask_token(access_token)
+        cookie_masked = InsmindAccountDB._mask_cookie(cookie)
+        conn = get_connection()
+        conn.execute(
+            """INSERT INTO insmind_accounts
+                   (email, access_token, refresh_token, token_masked, cookie, cookie_masked,
+                    expires_at, user_id, org_id, status, note, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       strftime('%s','now'), strftime('%s','now'))
+               ON DUPLICATE KEY UPDATE
+                   access_token = IF(VALUES(access_token) != '', VALUES(access_token), access_token),
+                   refresh_token = IF(VALUES(refresh_token) != '', VALUES(refresh_token), refresh_token),
+                   token_masked = IF(VALUES(token_masked) != '', VALUES(token_masked), token_masked),
+                   cookie = IF(VALUES(cookie) != '', VALUES(cookie), cookie),
+                   cookie_masked = IF(VALUES(cookie_masked) != '', VALUES(cookie_masked), cookie_masked),
+                   expires_at = IF(VALUES(expires_at) > 0, VALUES(expires_at), expires_at),
+                   user_id = IF(VALUES(user_id) != '', VALUES(user_id), user_id),
+                   org_id = IF(VALUES(org_id) != '', VALUES(org_id), org_id),
+                   status = VALUES(status),
+                   note = VALUES(note),
+                   updated_at = strftime('%s','now')""",
+            (
+                email,
+                access_token,
+                refresh_token,
+                token_masked,
+                cookie,
+                cookie_masked,
+                int(expires_at or 0),
+                str(user_id or ""),
+                str(org_id or ""),
+                str(status or "active"),
+                str(note or ""),
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM insmind_accounts WHERE email = ?",
+            (email,),
+        ).fetchone()
+        conn.close()
+        return InsmindAccountDB._row_to_account(row)
+
+    @staticmethod
+    def delete(account_id: int):
+        conn = get_connection()
+        conn.execute("DELETE FROM insmind_accounts WHERE id = ?", (account_id,))
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def delete_many(account_ids: list[int]) -> int:
+        """按 id 批量删除；返回实际删除条数。"""
+        ids = []
+        for raw in account_ids or []:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                ids.append(value)
+        # 去重，避免占位符膨胀
+        ids = list(dict.fromkeys(ids))
+        if not ids:
+            return 0
+        conn = get_connection()
+        placeholders = ",".join("?" for _ in ids)
+        cur = conn.execute(
+            f"DELETE FROM insmind_accounts WHERE id IN ({placeholders})",
+            ids,
+        )
+        deleted = int(cur.rowcount or 0)
+        conn.commit()
+        conn.close()
+        return deleted
+
+    @staticmethod
+    def delete_all() -> int:
+        conn = get_connection()
+        count_row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM insmind_accounts"
+        ).fetchone()
+        count = int(count_row["cnt"] if count_row else 0)
+        conn.execute("DELETE FROM insmind_accounts")
         conn.commit()
         conn.close()
         return count

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "insmind-sdk"
+version = "0.1.0"
+description = "insMind pure-protocol SDK: register, upload, Seedance generate"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+insmind = "insmind.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["insmind*"]

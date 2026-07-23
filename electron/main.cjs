@@ -1,4 +1,12 @@
-const { app, BrowserWindow, ipcMain, dialog, session, Menu, nativeImage, shell } = require('electron');
+const electronApi = require('electron');
+// Cursor/部分环境会注入 ELECTRON_RUN_AS_NODE=1，此时 require('electron') 不是 API，会秒退
+if (!electronApi || typeof electronApi !== 'object' || !electronApi.app) {
+  console.error(
+    '[main] Electron 以 Node 模式启动（检测到 ELECTRON_RUN_AS_NODE）。请 unset ELECTRON_RUN_AS_NODE 后重开，或使用: npm run electron:dev'
+  );
+  process.exit(1);
+}
+const { app, BrowserWindow, ipcMain, dialog, session, Menu, nativeImage, shell } = electronApi;
 const path = require('path');
 const { fileURLToPath, pathToFileURL } = require('url');
 const fs = require('fs');
@@ -1053,6 +1061,10 @@ async function startPythonServer(options = {}) {
       ? path.join(process.resourcesPath, 'framia-google-login')
       : path.join(__dirname, '..', 'framia-google-login');
 
+    const insmindDir = app.isPackaged
+      ? path.join(process.resourcesPath, 'insmind-sdk')
+      : path.join(__dirname, '..', 'insmind-sdk');
+
     const env = {
       ...process.env,
       WIZSTAR_PORT: String(WIZSTAR_PORT),
@@ -1060,6 +1072,7 @@ async function startPythonServer(options = {}) {
       OIIOII_SDK_DIR: sdkDir,
       DOLA_STANDALONE_DIR: dolaDir,
       FRAMIA_LOGIN_MODULE_DIR: framiaDir,
+      INSMIND_SDK_DIR: insmindDir,
     };
 
     if (app.isPackaged) {
@@ -1087,9 +1100,21 @@ async function startPythonServer(options = {}) {
     });
   } else {
     const pythonBin = process.env.PYTHON || 'python3';
-    pythonProcess = spawn(pythonBin, ['-m', 'wizstar.wizstar', 'serve', '--port', String(WIZSTAR_PORT)], {
-      cwd: path.join(__dirname, '..'),
-      env: getOiiOiiEnv(),
+    const repoRoot = path.join(__dirname, '..');
+    const env = getOiiOiiEnv();
+    // 后端是 Python，不能继承 ELECTRON_RUN_AS_NODE
+    delete env.ELECTRON_RUN_AS_NODE;
+    const pathParts = [
+      repoRoot,
+      path.join(repoRoot, 'insmind-sdk'),
+      path.join(repoRoot, 'wizstar'),
+      env.PYTHONPATH || '',
+    ].filter(Boolean);
+    env.PYTHONPATH = pathParts.join(path.delimiter);
+    // 包入口是 wizstar/wizstar → PYTHONPATH 含 wizstar 目录时用 -m wizstar
+    pythonProcess = spawn(pythonBin, ['-m', 'wizstar', 'serve', '--port', String(WIZSTAR_PORT)], {
+      cwd: repoRoot,
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: false,
     });

@@ -81,6 +81,11 @@ secrets*.json
 *storage-state.json
 *Cookie*.txt
 *cookie*.txt
+*_cookies.json
+*cookies*.json
+happyhorse_cookies.json
+**/_yescap_key.txt
+**/_yescap*.txt
 
 # Browser profiles / local runtime data
 .chrome-devtools-profile/
@@ -88,6 +93,8 @@ secrets*.json
 **/.dola-profiles/
 **/.framia-profiles/
 **/.lovart-profiles/
+**/.happyhorse-profiles/
+**/.insmind-profiles/
 generated-media/
 tmp/
 exports/

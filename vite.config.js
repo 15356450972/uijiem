@@ -23,6 +23,7 @@ export default defineConfig({
         '**/.cache/**',
         '**/oiioii-sdk/**',
         '**/quickframe-sdk-full/**',
+        '**/insmind-sdk/**',
         '**/dola-video-standalone/**',
         '**/dola-send-task-kit/**',
         '**/*.db',

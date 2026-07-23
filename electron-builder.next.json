@@ -42,6 +42,15 @@
         "index.mjs",
         "node_modules/**/*"
       ]
+    },
+    {
+      "from": "insmind-sdk",
+      "to": "insmind-sdk",
+      "filter": [
+        "**/*",
+        "!**/__pycache__/**/*",
+        "!**/.DS_Store"
+      ]
     }
   ],
   "win": {

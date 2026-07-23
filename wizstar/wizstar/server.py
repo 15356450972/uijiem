@@ -22,7 +22,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
 
-from .database import init_db, MailboxDB, AccountDB, TaskDB, ProjectDB, QfAccountDB, DolaAccountDB, LovartAccountDB, OreateAIAccountDB, FramiaAccountDB, TensorArtAccountDB
+from .database import init_db, MailboxDB, AccountDB, TaskDB, ProjectDB, QfAccountDB, DolaAccountDB, LovartAccountDB, OreateAIAccountDB, FramiaAccountDB, TensorArtAccountDB, HappyhorseAccountDB, InsmindAccountDB
 from .client import WizstarClient, WizstarCredentials
 from .mailbox import OutlookMailbox
 from .enums import TaskType, Model, Ratio, Resolution
@@ -35,6 +35,8 @@ from . import lovart as lv
 from . import chatgpt2api as cg
 from . import framia as fm
 from . import tensorart as ta
+from . import happyhorse as hh
+from . import insmind as im
 
 
 @asynccontextmanager
@@ -414,6 +416,113 @@ class FramiaTaskCreate(BaseModel):
     resolution: str = "720p"
     duration: float = 4
     image_paths: list[str] = []
+
+
+class HappyhorseAccountImport(BaseModel):
+    """把 HappyHorse Google OAuth 登录态加入渠道十一账号库。"""
+    email: str
+    password: str = ""
+    access_token: str = ""
+    refresh_token: str = ""
+    expires_at: int = 0
+    cookie: str = ""
+    user_agent: str = ""
+    user_id: str = ""
+    device_id: str = ""
+    bx_umidtoken: str = ""
+    location: str = ""
+    status: str = "active"
+    note: str = ""
+
+
+class HappyhorseAccountLogin(BaseModel):
+    """通过 Google OAuth 自动登录 HappyHorse 并采集账号。"""
+    email: str
+    password: str
+    visible: bool = True
+    proxy: str = ""
+    keep_open: bool = False
+    # 批量登录中的单次请求：不要清掉取消标记
+    part_of_batch: bool = False
+
+
+class HappyhorseMailboxBatchLogin(BaseModel):
+    """从全局邮箱库领取账号并批量登录 HappyHorse。"""
+    count: int = 1
+    concurrency: int = 1
+    mailbox_ids: list[int] = []
+    visible: bool = True
+    proxy: str = ""
+    keep_open: bool = False
+
+
+class HappyhorseTaskCreate(BaseModel):
+    """HappyHorse 视频生成提交参数（渠道十一）。"""
+    account_id: int = 0
+    prompt: str = ""
+    image_path: str = ""
+    image_paths: list[str] = []
+    aspect_ratio: str = "16:9"
+    resolution: str = "720p"
+    duration: float = 3
+    model: str = "HappyHorse R2V 1.5"
+
+
+class HappyhorseAccountExport(BaseModel):
+    """导出选中的渠道十一账号（含 cookie / token）。"""
+    account_ids: list[int] = []
+
+
+class InsMindTaskCreate(BaseModel):
+    """insMind 视频生成提交参数（渠道十二）。"""
+    account_id: int = 0
+    prompt: str = ""
+    image_path: str = ""
+    image_paths: list[str] = []
+    image_url: str = ""
+    image_urls: list[str] = []
+    aspect_ratio: str = "original"
+    resolution: str = "480P"
+    duration: float = 5
+
+
+class InsMindAccountImport(BaseModel):
+    """手动导入 insMind access_token / cookie。"""
+    email: str
+    access_token: str
+    refresh_token: str = ""
+    cookie: str = ""
+    expires_at: int = 0
+    user_id: str = ""
+    org_id: str = ""
+    status: str = "active"
+    note: str = ""
+
+
+class InsMindRegister(BaseModel):
+    """GPTMail 邮箱验证码批量注册 insMind。"""
+    count: int = 1
+    concurrency: int = 1
+    max_wait: int = 90
+
+
+class InsMindAccountExport(BaseModel):
+    """导出渠道十二账号（含 token / cookie）。空列表表示导出全部。"""
+    account_ids: list[int] = []
+
+
+class InsMindAccountBatchDelete(BaseModel):
+    """批量删除渠道十二账号（按 id）。"""
+    account_ids: list[int] = []
+
+
+class InsMindConfigUpdate(BaseModel):
+    """渠道十二动态代理配置（注册绕开 IP 限流）。"""
+    use_proxy: bool | None = None
+    proxy_host: str | None = None
+    proxy_port: int | None = None
+    proxy_user: str | None = None
+    proxy_pass: str | None = None
 
 
 class TensorArtAccountImport(BaseModel):
@@ -3574,6 +3683,558 @@ def framia_get_credits(account_id: int = 0):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== HappyHorse 渠道十一账号池与任务 ====================
+
+def _happyhorse_public_account(account: dict) -> dict:
+    return HappyhorseAccountDB._public(account)
+
+
+def _happyhorse_client_from_account(account: dict) -> hh.HappyHorseClient:
+    return hh.HappyHorseClient(
+        access_token=account.get("access_token", ""),
+        cookie=account.get("cookie", ""),
+        user_agent=account.get("user_agent", ""),
+        device_id=account.get("device_id", ""),
+        bx_umidtoken=account.get("bx_umidtoken", ""),
+    )
+
+
+@app.get("/happyhorse/accounts")
+def happyhorse_list_accounts():
+    return {"data": HappyhorseAccountDB.list_all()}
+
+
+@app.post("/happyhorse/accounts/export")
+def happyhorse_export_accounts(body: HappyhorseAccountExport):
+    """导出选中账号的完整登录态（含 cookie、access_token 等敏感字段）。"""
+    account_ids = body.account_ids or []
+    if not account_ids:
+        raise HTTPException(status_code=400, detail="请先选择要导出的账号")
+    accounts = HappyhorseAccountDB.get_many(account_ids)
+    if not accounts:
+        raise HTTPException(status_code=404, detail="未找到选中的渠道十一账号")
+    export_fields = (
+        "id",
+        "email",
+        "password",
+        "access_token",
+        "refresh_token",
+        "expires_at",
+        "cookie",
+        "user_agent",
+        "user_id",
+        "device_id",
+        "bx_umidtoken",
+        "location",
+        "status",
+        "note",
+        "created_at",
+        "updated_at",
+    )
+    data = [{field: account.get(field) for field in export_fields} for account in accounts]
+    return {"data": data, "count": len(data)}
+
+
+@app.post("/happyhorse/accounts")
+def happyhorse_import_account(body: HappyhorseAccountImport):
+    try:
+        account = HappyhorseAccountDB.upsert(
+            email=body.email,
+            password=body.password,
+            access_token=body.access_token,
+            refresh_token=body.refresh_token,
+            expires_at=body.expires_at,
+            cookie=body.cookie,
+            user_agent=body.user_agent,
+            user_id=body.user_id,
+            device_id=body.device_id,
+            bx_umidtoken=body.bx_umidtoken,
+            location=body.location,
+            status=body.status,
+            note=body.note,
+        )
+        _mark_mailbox_channel_by_email(body.email, "happyhorse")
+        return {"data": _happyhorse_public_account(account)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _happyhorse_login_and_save(
+    email: str,
+    password: str,
+    *,
+    visible: bool = True,
+    proxy: str = "",
+    keep_open: bool = False,
+    force: bool = False,
+) -> dict:
+    email = str(email or "").strip()
+    existing = HappyhorseAccountDB.get_by_email(email) if email else None
+    # 已登录过且仍有 accessToken 的账号默认跳过，避免重复打开 Google OAuth
+    if (
+        not force
+        and existing
+        and str(existing.get("access_token") or "").strip()
+        and not HappyhorseAccountDB._is_token_expired(existing)
+    ):
+        _mark_mailbox_channel_by_email(email, "happyhorse")
+        return existing
+
+    login_result = hh.login_with_google(
+        email=email,
+        password=password,
+        visible=visible,
+        proxy=proxy,
+        keep_open=keep_open,
+    )
+    access_token = login_result.get("access_token", "")
+    if not access_token:
+        raise RuntimeError("登录成功但未获取到 accessToken")
+    account = HappyhorseAccountDB.upsert(
+        email=email,
+        password=password,
+        access_token=access_token,
+        refresh_token=login_result.get("refresh_token", ""),
+        expires_at=int(login_result.get("expires_at") or 0),
+        cookie=login_result.get("cookie", ""),
+        user_agent=login_result.get("user_agent", ""),
+        user_id=login_result.get("user_id", ""),
+        device_id=login_result.get("device_id", ""),
+        bx_umidtoken=login_result.get("bx_umidtoken", ""),
+        location=login_result.get("location", ""),
+        status="active",
+        note="Google OAuth 自动登录",
+    )
+    _mark_mailbox_channel_by_email(email, "happyhorse")
+    return account
+
+
+@app.post("/happyhorse/accounts/login")
+def happyhorse_login_account(body: HappyhorseAccountLogin):
+    try:
+        if not body.part_of_batch:
+            hh.begin_login_batch()
+        elif hh.is_login_cancelled():
+            raise hh.HappyHorseLoginCancelled("登录已取消")
+        email = str(body.email or "").strip()
+        existing = HappyhorseAccountDB.get_by_email(email) if email else None
+        skipped = bool(
+            existing
+            and str(existing.get("access_token") or "").strip()
+            and not HappyhorseAccountDB._is_token_expired(existing)
+        )
+        account = _happyhorse_login_and_save(
+            body.email,
+            body.password,
+            visible=body.visible,
+            proxy=body.proxy,
+            keep_open=body.keep_open,
+        )
+        payload = _happyhorse_public_account(account)
+        if skipped:
+            payload["skipped"] = True
+            payload["skip_reason"] = "already_logged_in"
+        return {"data": payload}
+    except hh.HappyHorseLoginCancelled as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except hh.HappyHorseError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/happyhorse/accounts/login/begin")
+def happyhorse_begin_login_batch():
+    """开始一批渠道十一登录前清除取消标记。"""
+    hh.begin_login_batch()
+    return {"data": {"ok": True}}
+
+
+@app.post("/happyhorse/accounts/login/cancel")
+def happyhorse_cancel_login():
+    """取消进行中的渠道十一批量/单次登录任务。"""
+    return {"data": hh.cancel_login_batch()}
+
+
+@app.post("/happyhorse/accounts/login-pool")
+def happyhorse_login_from_mailbox_pool(body: HappyhorseMailboxBatchLogin):
+    """从邮箱库领取并批量登录；以 NDJSON 流式推送进度。"""
+    import concurrent.futures
+    import queue
+    import threading
+
+    hh.begin_login_batch()
+    # 指定 mailbox_ids 时先清失败冷却，便于失败重试
+    for raw_id in body.mailbox_ids or []:
+        try:
+            MailboxDB.clear_channel_failure(int(raw_id), "happyhorse")
+        except Exception:
+            pass
+
+    try:
+        mailboxes = MailboxDB.claim_for_channel(
+            "happyhorse",
+            count=body.count,
+            mailbox_ids=body.mailbox_ids,
+            credential_type="password",
+            provider="google",
+            lease_seconds=21600,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+    def worker(mailbox: dict) -> dict:
+        email = str(mailbox.get("email") or "")
+        password = str(mailbox.get("password") or mailbox.get("google_password") or "")
+        mailbox_id = int(mailbox.get("id") or 0)
+        if hh.is_login_cancelled():
+            MailboxDB.mark_channel_usage(
+                mailbox_id,
+                "happyhorse",
+                "released",
+                account_email=email,
+                error="登录已取消",
+            )
+            return {
+                "ok": False,
+                "email": email,
+                "mailbox_id": mailbox_id,
+                "cancelled": True,
+                "error": "登录已取消",
+            }
+        try:
+            existing = HappyhorseAccountDB.get_by_email(email)
+            already = bool(
+                existing
+                and str(existing.get("access_token") or "").strip()
+                and not HappyhorseAccountDB._is_token_expired(existing)
+            )
+            account = _happyhorse_login_and_save(
+                email,
+                password,
+                visible=body.visible,
+                proxy=body.proxy,
+                keep_open=body.keep_open,
+            )
+            result = {
+                "ok": True,
+                "email": email,
+                "mailbox_id": mailbox_id,
+                "account": _happyhorse_public_account(account),
+            }
+            if already:
+                result["skipped"] = True
+                result["skip_reason"] = "already_logged_in"
+            return result
+        except hh.HappyHorseLoginCancelled:
+            MailboxDB.mark_channel_usage(
+                mailbox_id,
+                "happyhorse",
+                "released",
+                account_email=email,
+                error="登录已取消",
+            )
+            return {
+                "ok": False,
+                "email": email,
+                "mailbox_id": mailbox_id,
+                "cancelled": True,
+                "error": "登录已取消",
+            }
+        except Exception as error:  # noqa: BLE001
+            MailboxDB.mark_channel_usage(
+                mailbox_id,
+                "happyhorse",
+                "failed",
+                account_email=email,
+                error=str(error),
+            )
+            return {
+                "ok": False,
+                "email": email,
+                "mailbox_id": mailbox_id,
+                "error": str(error),
+            }
+
+    concurrency = max(1, min(int(body.concurrency or 1), 5, len(mailboxes)))
+    total = len(mailboxes)
+    event_queue: queue.Queue = queue.Queue()
+
+    def run_batch() -> None:
+        results = []
+        try:
+            event_queue.put(
+                {
+                    "event": "start",
+                    "total": total,
+                    "emails": [str(item.get("email") or "") for item in mailboxes],
+                }
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = {
+                    executor.submit(worker, mailbox): idx
+                    for idx, mailbox in enumerate(mailboxes)
+                }
+                done_count = 0
+                ordered_results = [None] * total
+                for future in concurrent.futures.as_completed(futures):
+                    idx = futures[future]
+                    result = future.result()
+                    ordered_results[idx] = result
+                    results.append(result)
+                    done_count += 1
+                    event_queue.put(
+                        {
+                            "event": "item",
+                            "index": idx + 1,
+                            "total": total,
+                            "done": done_count,
+                            "result": result,
+                        }
+                    )
+                results = [item for item in ordered_results if item is not None]
+            succeeded = sum(1 for result in results if result.get("ok"))
+            cancelled = sum(1 for result in results if result.get("cancelled"))
+            event_queue.put(
+                {
+                    "event": "done",
+                    "results": results,
+                    "succeeded": succeeded,
+                    "failed": len(results) - succeeded,
+                    "cancelled": cancelled,
+                    "total": len(results),
+                }
+            )
+        except Exception as error:  # noqa: BLE001
+            event_queue.put({"event": "error", "error": str(error)})
+        finally:
+            event_queue.put(None)
+
+    threading.Thread(target=run_batch, daemon=True).start()
+
+    def event_stream():
+        while True:
+            item = event_queue.get()
+            if item is None:
+                break
+            yield json.dumps(item, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@app.delete("/happyhorse/accounts")
+def happyhorse_delete_all_accounts():
+    accounts = HappyhorseAccountDB.list_all()
+    deleted = HappyhorseAccountDB.delete_all()
+    for account in accounts:
+        _release_mailbox_channel_by_email(account.get("email", ""), "happyhorse")
+    return {"data": {"deleted": deleted}}
+
+
+@app.delete("/happyhorse/accounts/{account_id}")
+def happyhorse_delete_account(account_id: int):
+    account = HappyhorseAccountDB.get(account_id)
+    HappyhorseAccountDB.delete(account_id)
+    if account:
+        _release_mailbox_channel_by_email(account.get("email", ""), "happyhorse")
+    return {"message": "deleted"}
+
+
+@app.get("/happyhorse/accounts/{account_id}/test")
+def happyhorse_test_account(account_id: int):
+    try:
+        account = HappyhorseAccountDB.get(account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="HappyHorse account not found")
+        client = _happyhorse_client_from_account(account)
+        result = client.test_connection()
+        return {"data": result}
+    except hh.HappyHorseError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/happyhorse/models")
+def happyhorse_models():
+    return {"data": {"models": hh.DEFAULT_MODELS, "ratios": hh.DEFAULT_RATIOS}}
+
+
+@app.post("/happyhorse/tasks/create")
+def happyhorse_create_task(body: HappyhorseTaskCreate):
+    """上传垫图 → 创建项目 → 提交 R2V 任务。"""
+    try:
+        account = hh.pick_account(body.account_id)
+        client = _happyhorse_client_from_account(account)
+
+        all_image_paths = list(body.image_paths or [])
+        if body.image_path:
+            all_image_paths.insert(0, body.image_path)
+
+        uploaded: list[dict] = []
+        for img_path in all_image_paths:
+            if not img_path or not os.path.isfile(img_path):
+                continue
+            uploaded.append(client.upload_image(img_path))
+
+        if not uploaded:
+            raise HTTPException(status_code=400, detail="渠道十一需要至少一张有效垫图")
+
+        cover = uploaded[0]
+        project = client.create_project(
+            cover_oss_path=cover.get("ossPath", ""),
+            cover_media_id=cover.get("mediaId", ""),
+        )
+        project_id = project.get("id")
+        task = client.create_task(
+            project_id=project_id,
+            prompt=body.prompt or "",
+            image_media_ids=[u["mediaId"] for u in uploaded],
+            image_oss_paths=[u["ossPath"] for u in uploaded],
+            aspect_ratio=body.aspect_ratio or "16:9",
+            duration_s=int(body.duration or 3),
+            resolution=body.resolution or "720p",
+        )
+        remote_task_id = task.get("id")
+        task_id = f"hh_{project_id}_{remote_task_id}"
+        TaskDB.add(
+            task_id=task_id,
+            account_id=int(account.get("id") or 0),
+            task_type=TaskType.IMAGE_TO_VIDEO,
+            prompt=body.prompt,
+            model=f"happyhorse:{body.model or 'R2V'}",
+        )
+        return {"data": {
+            "task_id": task_id,
+            "project_id": project_id,
+            "remote_task_id": remote_task_id,
+            "status": task.get("status", "QUEUED"),
+            "account_id": int(account.get("id") or 0),
+            "account_name": account.get("email", ""),
+            "media_ids": [u["mediaId"] for u in uploaded],
+        }}
+    except hh.HappyHorseError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/happyhorse/tasks/{task_id}/status")
+def happyhorse_task_status(task_id: str):
+    try:
+        task = TaskDB.get(task_id) or {}
+        account_id = int(task.get("account_id") or 0)
+        account = HappyhorseAccountDB.get(account_id) if account_id else hh.pick_account(0)
+        if not account:
+            raise HTTPException(status_code=404, detail="HappyHorse account not found for this task")
+
+        # task_id format: hh_{projectId}_{remoteTaskId}
+        parts = str(task_id).split("_")
+        if len(parts) < 3 or parts[0] != "hh":
+            raise HTTPException(status_code=400, detail="无效的 HappyHorse task_id")
+        project_id = parts[1]
+        remote_task_id = "_".join(parts[2:])
+
+        client = _happyhorse_client_from_account(account)
+        item = client.get_task_from_list(project_id, remote_task_id)
+        if not item:
+            return {"data": {
+                "status": "processing",
+                "video_url": "",
+                "thumbnail_url": "",
+                "task_id": task_id,
+                "project_id": project_id,
+                "remote_task_id": remote_task_id,
+            }}
+
+        mapped = hh.map_task_status(str(item.get("status") or ""))
+        video_url, thumbnail_url = hh.extract_result_urls(item)
+        fail_reason = hh.extract_failure_reason(item) if mapped == "failed" else ""
+        if mapped == "completed" and video_url:
+            TaskDB.update_status(task_id, "completed", video_url=video_url)
+        elif mapped == "failed":
+            TaskDB.update_status(task_id, "failed")
+
+        return {"data": {
+            "status": mapped,
+            "video_url": video_url,
+            "thumbnail_url": thumbnail_url,
+            "task_id": task_id,
+            "project_id": project_id,
+            "remote_task_id": remote_task_id,
+            "raw_status": item.get("status"),
+            "progress": item.get("progress"),
+            "fail_reason": fail_reason,
+            "error": fail_reason,
+            "account_id": int(account.get("id") or 0),
+            "account_name": account.get("email", ""),
+        }}
+    except hh.HappyHorseError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/happyhorse/credits")
+def happyhorse_get_credits(account_id: int = 0):
+    try:
+        account = hh.pick_account(account_id) if account_id else hh.pick_account(0)
+        client = _happyhorse_client_from_account(account)
+        credits = client.get_credits_balance()
+        return {"data": {
+            "credits_balance": credits.get("credits_balance", 0),
+            "total_count": credits.get("total_count", 0),
+            "available_count": credits.get("available_count", 0),
+            "in_use_count": credits.get("in_use_count", 0),
+            "used_count": credits.get("used_count", 0),
+            "play_code_details": credits.get("play_code_details", []),
+            "points": credits.get("points", {}),
+            "account_id": int(account.get("id") or 0),
+            "account_name": account.get("email", ""),
+        }}
+    except hh.HappyHorseError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/happyhorse/credits/daily-signin")
+def happyhorse_daily_signin(account_id: int = 0):
+    """每日签到领取积分（DAILY_SIGNIN）。"""
+    try:
+        account = hh.pick_account(account_id) if account_id else hh.pick_account(0)
+        client = _happyhorse_client_from_account(account)
+        grant = client.grant_daily_signin()
+        # 签到后再查一次余额，方便前端直接刷新展示
+        credits = client.get_credits_balance()
+        return {"data": {
+            **grant,
+            "credits_balance": credits.get("credits_balance", 0),
+            "available_count": credits.get("available_count", grant.get("available_count", 0)),
+            "play_code_details": credits.get("play_code_details", []),
+            "account_id": int(account.get("id") or 0),
+            "account_name": account.get("email", ""),
+        }}
+    except hh.HappyHorseError as e:
+        raise HTTPException(status_code=e.status_code or 500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== Tensor.Art 渠道十账号池与任务 ====================
 
 def _tensorart_public_account(account: dict) -> dict:
@@ -3943,6 +4604,290 @@ def tensorart_task_status(task_id: str):
         ) from error
     except HTTPException:
         raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+
+
+# ==================== insMind 渠道十二 ====================
+
+def _insmind_public_account(account: dict) -> dict:
+    return InsmindAccountDB._public(account)
+
+
+@app.get("/insmind/config")
+def insmind_config():
+    accounts = InsmindAccountDB.list_all()
+    configured_count = sum(1 for account in accounts if account.get("configured"))
+    proxy = im.config_status()
+    return {
+        "data": {
+            "configured": configured_count > 0 or im.configured(),
+            "account_count": len(accounts),
+            "configured_count": configured_count,
+            "model": im.MODEL,
+            "resolutions": list(im.INSMIND_RESOLUTION_OPTIONS),
+            "ratios": ["original", "16:9", "9:16", "1:1"],
+            "durations": list(im.INSMIND_DURATION_OPTIONS),
+            "duration_range": [min(im.INSMIND_DURATION_OPTIONS), max(im.INSMIND_DURATION_OPTIONS)],
+            "sku_matrix": {
+                str(duration): list(resolutions)
+                for duration, resolutions in im.INSMIND_VALID_OMNI.items()
+            },
+            "hint": "免费 SKU：5s 支持 480P/720P；10s/15s 仅 480P",
+            **proxy,
+        }
+    }
+
+
+@app.post("/insmind/config")
+def insmind_update_config(body: InsMindConfigUpdate):
+    """保存渠道十二动态代理配置。"""
+    im.save_config(
+        use_proxy=body.use_proxy,
+        proxy_host=body.proxy_host,
+        proxy_port=body.proxy_port,
+        proxy_user=body.proxy_user,
+        proxy_pass=body.proxy_pass,
+    )
+    return {"data": im.config_status()}
+
+
+@app.post("/insmind/test-proxy")
+def insmind_test_proxy():
+    """测试动态代理出口 IP。"""
+    try:
+        return {"data": im.test_proxy()}
+    except Exception as error:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@app.get("/insmind/accounts")
+def insmind_list_accounts():
+    return {"data": InsmindAccountDB.list_all()}
+
+
+@app.post("/insmind/accounts/export")
+def insmind_export_accounts(body: InsMindAccountExport):
+    """导出选中（或全部）账号完整登录态（含 access_token / cookie）。"""
+    account_ids = body.account_ids or []
+    if account_ids:
+        accounts = InsmindAccountDB.get_many(account_ids)
+        if not accounts:
+            raise HTTPException(status_code=404, detail="未找到选中的渠道十二账号")
+    else:
+        accounts = InsmindAccountDB.list_all_internal()
+        if not accounts:
+            raise HTTPException(status_code=404, detail="渠道十二暂无账号可导出")
+    export_fields = (
+        "id",
+        "email",
+        "access_token",
+        "refresh_token",
+        "cookie",
+        "expires_at",
+        "user_id",
+        "org_id",
+        "status",
+        "note",
+        "created_at",
+        "updated_at",
+    )
+    data = [{field: account.get(field) for field in export_fields} for account in accounts]
+    return {"data": data, "total": len(data)}
+
+
+@app.post("/insmind/accounts")
+def insmind_import_account(body: InsMindAccountImport):
+    try:
+        account = InsmindAccountDB.upsert(
+            email=body.email,
+            access_token=body.access_token,
+            refresh_token=body.refresh_token,
+            cookie=body.cookie,
+            expires_at=body.expires_at,
+            user_id=body.user_id,
+            org_id=body.org_id,
+            status=body.status,
+            note=body.note or "手动导入",
+        )
+        return {"data": _insmind_public_account(account)}
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@app.post("/insmind/accounts/register")
+def insmind_register_accounts(body: InsMindRegister):
+    """GPTMail + 图形验证码注册（NDJSON 流式进度；按设置走动态代理）。"""
+    import queue
+
+    count = max(1, min(int(body.count or 1), 999))
+    concurrency = max(1, min(int(body.concurrency or 1), 999, count))
+    max_wait = max(30, min(int(body.max_wait or 90), 300))
+    im.apply_proxy_settings()
+    proxy = im.config_status()
+    event_queue: queue.Queue = queue.Queue()
+
+    def worker(index: int) -> dict:
+        try:
+            registered = im.register_one(max_wait=max_wait)
+            account = InsmindAccountDB.upsert(
+                email=registered["email"],
+                access_token=registered.get("access_token", ""),
+                refresh_token=registered.get("refresh_token", ""),
+                cookie=registered.get("cookie", ""),
+                expires_at=int(registered.get("expires_at") or 0),
+                user_id=registered.get("user_id", ""),
+                org_id=registered.get("org_id", ""),
+                status="active",
+                note="GPTMail 邮箱验证码注册",
+            )
+            return {
+                "ok": True,
+                "index": index + 1,
+                "email": registered.get("email", ""),
+                "account": _insmind_public_account(account),
+            }
+        except Exception as error:  # noqa: BLE001
+            return {"ok": False, "index": index + 1, "email": "", "error": str(error)}
+
+    def run_batch() -> None:
+        try:
+            event_queue.put(
+                {
+                    "event": "start",
+                    "total": count,
+                    "concurrency": concurrency,
+                    "use_proxy": proxy.get("use_proxy"),
+                    "proxy_host": proxy.get("proxy_host"),
+                }
+            )
+            ordered = [None] * count
+            done_count = 0
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = {executor.submit(worker, idx): idx for idx in range(count)}
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    result = future.result()
+                    ordered[idx] = result
+                    done_count += 1
+                    event_queue.put(
+                        {
+                            "event": "item",
+                            "index": idx + 1,
+                            "total": count,
+                            "done": done_count,
+                            "result": result,
+                        }
+                    )
+            results = [item for item in ordered if item is not None]
+            succeeded = sum(1 for result in results if result.get("ok"))
+            event_queue.put(
+                {
+                    "event": "done",
+                    "results": results,
+                    "succeeded": succeeded,
+                    "failed": len(results) - succeeded,
+                    "total": len(results),
+                    "use_proxy": proxy.get("use_proxy"),
+                    "proxy_host": proxy.get("proxy_host"),
+                }
+            )
+        except Exception as error:  # noqa: BLE001
+            event_queue.put({"event": "error", "error": str(error)})
+        finally:
+            event_queue.put(None)
+
+    threading.Thread(target=run_batch, daemon=True).start()
+
+    def event_stream():
+        while True:
+            item = event_queue.get()
+            if item is None:
+                break
+            yield json.dumps(item, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@app.delete("/insmind/accounts")
+def insmind_delete_all_accounts():
+    deleted = InsmindAccountDB.delete_all()
+    return {"data": {"deleted": deleted}}
+
+
+@app.post("/insmind/accounts/batch-delete")
+def insmind_batch_delete_accounts(body: InsMindAccountBatchDelete):
+    """按勾选 id 批量删除渠道十二账号。"""
+    account_ids = [int(item) for item in (body.account_ids or []) if item]
+    if not account_ids:
+        raise HTTPException(status_code=400, detail="请先选择要删除的渠道十二账号")
+    deleted = InsmindAccountDB.delete_many(account_ids)
+    if deleted <= 0:
+        raise HTTPException(status_code=404, detail="未找到要删除的渠道十二账号")
+    return {"data": {"deleted": deleted, "requested": len(account_ids)}}
+
+
+@app.delete("/insmind/accounts/{account_id}")
+def insmind_delete_account(account_id: int):
+    InsmindAccountDB.delete(account_id)
+    return {"message": "deleted"}
+
+
+@app.post("/insmind/tasks/create")
+def insmind_create_task(body: InsMindTaskCreate):
+    try:
+        image_paths = list(body.image_paths or [])
+        if body.image_path:
+            image_paths.insert(0, body.image_path)
+        image_urls = list(body.image_urls or [])
+        if body.image_url:
+            image_urls.insert(0, body.image_url)
+        result = im.create_task(
+            prompt=body.prompt,
+            image_paths=image_paths,
+            image_urls=image_urls,
+            duration=body.duration,
+            resolution=body.resolution,
+            ratio=body.aspect_ratio,
+            account_id=body.account_id,
+        )
+        task_id = str(result["task_id"])
+        account_id = int(result.get("account_id") or 0)
+        TaskDB.add(
+            task_id=task_id,
+            account_id=account_id,
+            task_type=TaskType.IMAGE_TO_VIDEO,
+            prompt=body.prompt,
+            model=f"insmind:{im.MODEL}",
+        )
+        return {"data": {**result, "task_id": task_id, "account_id": account_id}}
+    except im.InsMindError as error:
+        raise HTTPException(status_code=error.status_code or 500, detail=str(error)) from error
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+
+@app.get("/insmind/tasks/{task_id}/status")
+def insmind_task_status(task_id: str):
+    try:
+        task = TaskDB.get(task_id) or {}
+        account_id = int(task.get("account_id") or 0)
+        result = im.get_status(task_id, account_id=account_id)
+        if result["status"] == "completed":
+            TaskDB.update_status(task_id, "completed", video_url=result.get("video_url", ""))
+        elif result["status"] == "failed":
+            TaskDB.update_status(task_id, "failed")
+        else:
+            TaskDB.update_status(task_id, "processing")
+        return {"data": {**result, "task_id": task_id}}
+    except im.InsMindError as error:
+        raise HTTPException(status_code=error.status_code or 500, detail=str(error)) from error
     except Exception as error:
         raise HTTPException(status_code=500, detail=str(error)) from error
 

@@ -22,6 +22,8 @@ const CHANNEL_LABELS = {
   oreateai: '渠道八',
   framia: '渠道九',
   tensorart: '渠道十',
+  happyhorse: '渠道十一',
+  insmind: '渠道十二',
 };
 
 const usageStatusText = (usage) => {

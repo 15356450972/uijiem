@@ -10,8 +10,8 @@
     "dev": "vite --host 127.0.0.1 --port ${VITE_PORT:-5174} --strictPort",
     "build": "vite build",
     "preview": "vite preview",
-    "electron:dev": "sh -lc 'PORT=${VITE_PORT:-5174}; if lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then PORT=$((PORT+1)); fi; VITE_PORT=$PORT concurrently \"npm run dev\" \"wait-on http://localhost:$PORT && electron .\"'",
-    "oreateai:smoke": "electron electron/oreateai-smoke.cjs",
+    "electron:dev": "sh -lc 'unset ELECTRON_RUN_AS_NODE; PORT=${VITE_PORT:-5174}; if lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1; then PORT=$((PORT+1)); fi; VITE_PORT=$PORT concurrently \"npm run dev\" \"wait-on http://localhost:$PORT && env -u ELECTRON_RUN_AS_NODE electron .\"'",
+    "oreateai:smoke": "env -u ELECTRON_RUN_AS_NODE electron electron/oreateai-smoke.cjs",
     "electron:build": "npm run build && npm --prefix dola-video-standalone ci && electron-builder"
   },
   "build": {
@@ -88,6 +88,25 @@
           "package-lock.json",
           "index.mjs",
           "node_modules/**/*"
+        ]
+      },
+      {
+        "from": "happyhorse-google-login",
+        "to": "happyhorse-google-login",
+        "filter": [
+          "package.json",
+          "package-lock.json",
+          "index.mjs",
+          "node_modules/**/*"
+        ]
+      },
+      {
+        "from": "insmind-sdk",
+        "to": "insmind-sdk",
+        "filter": [
+          "**/*",
+          "!**/__pycache__/**/*",
+          "!**/.DS_Store"
         ]
       }
     ],

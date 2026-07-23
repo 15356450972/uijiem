@@ -1,0 +1,13 @@
+{
+  "name": "happyhorse-google-login",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "HappyHorse Google OAuth login automation",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

@@ -2,8 +2,8 @@
 """PyInstaller 打包配置：把 wizstar FastAPI 后端冻结为独立可执行（onedir）。
 
 设计：
-- 入口 backend_entry.py 在运行期把随包的 `wizstar`(内层包父目录) 与
-  `quickframe-sdk-full` 加入 sys.path，因此这两份源码以 *数据目录* 形式随包携带。
+- 入口 backend_entry.py 在运行期把随包的 `wizstar`(内层包父目录)、
+  `quickframe-sdk-full` 与 `insmind-sdk` 加入 sys.path，因此这些源码以 *数据目录* 形式随包携带。
 - quickframe_bridge.py 运行期会校验 `quickframe-sdk-full` 物理目录是否存在，
   并动态 import chain_proxy / register_full / quickframe.client，故必须实地携带该目录。
 - 所有第三方依赖(fastapi/uvicorn/starlette/pydantic/requests/pycryptodome 等)
@@ -23,6 +23,8 @@ datas += [('wizstar/wizstar', 'wizstar/wizstar')]
 datas += [('src/assets/cascades', 'wizstar/wizstar/assets/cascades')]
 # QuickFrame SDK：被 quickframe_bridge 动态导入，且有 isdir 物理校验。
 datas += [('quickframe-sdk-full', 'quickframe-sdk-full')]
+# insMind SDK：被渠道十二桥接模块按目录导入，必须随后端发布。
+datas += [('insmind-sdk', 'insmind-sdk')]
 
 # 第三方依赖整包收集（含数据文件，如 certifi 的 cacert.pem）。
 for pkg in (
@@ -67,7 +69,7 @@ block_cipher = None
 
 a = Analysis(
     ['backend_entry.py'],
-    pathex=['quickframe-sdk-full', 'wizstar'],
+    pathex=['quickframe-sdk-full', 'insmind-sdk', 'wizstar'],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

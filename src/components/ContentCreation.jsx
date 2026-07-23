@@ -243,6 +243,10 @@ const statusUrlForTask = (task) => task.channel === 'pixmax'
             ? `${WIZSTAR_API}/framia/tasks/${task.taskId}/status`
             : task.channel === 'tensorart'
               ? `${WIZSTAR_API}/tensorart/tasks/${task.taskId}/status`
+              : task.channel === 'happyhorse'
+                ? `${WIZSTAR_API}/happyhorse/tasks/${task.taskId}/status`
+                : task.channel === 'insmind'
+                  ? `${WIZSTAR_API}/insmind/tasks/${task.taskId}/status`
               : `${WIZSTAR_API}/tasks/${task.taskId}/status`;
 
 const isLocalFilePathValue = (url = '') => /^\/(?!\/)/.test(String(url || '')) || /^[a-zA-Z]:[\\/]/.test(String(url || '')) || /^\\\\/.test(String(url || ''));
@@ -627,6 +631,18 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
           const seconds = Number.parseInt(String(value || '').replace(/\D/g, ''), 10);
           if (!Number.isFinite(seconds) || seconds < 4 || seconds > 10) return '4秒';
         }
+        if (channel === 'happyhorse') {
+          const seconds = Number.parseInt(String(value || '').replace(/\D/g, ''), 10);
+          if (!Number.isFinite(seconds) || seconds < 3 || seconds > 15) return '3秒';
+          return `${seconds}秒`;
+        }
+      }
+      if (key === 'resolution') {
+        const channel = (settings.generateChannel || localStorage.getItem('maocanju_generate_channel') || DEFAULT_GLOBAL_GENERATION_SETTINGS.generateChannel);
+        if (channel === 'happyhorse') {
+          const res = String(value || '').toLowerCase();
+          return (res === '1080p' || res === '1080') ? '1080p' : '720p';
+        }
       }
       if (key === 'model' && (settings.generateChannel || localStorage.getItem('maocanju_generate_channel')) === 'oiioii' && (!value || value === DEFAULT_GLOBAL_GENERATION_SETTINGS.model)) {
         return OIIOII_DEFAULT_SETTINGS.model;
@@ -789,6 +805,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     '渠道六 Seedance Lite',
     '渠道九 Seedance 2.0 Mini',
     '渠道九 Kling 3.0',
+    '渠道十二 insMind Seedance 2.0 Mini',
   ]);
   const getModelMediaType = (modelName) => IMAGE_MODEL_NAMES.has(modelName) ? 'image' : 'video';
   const getModelLabel = (modelName) => getModelMediaType(modelName) === 'image' ? '图片' : '视频';
@@ -796,7 +813,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     const currentModel = row?.model || globalModel;
     const rowType = row?.type || getModelMediaType(currentModel);
     if (rowType === 'image' && !IMAGE_MODEL_NAMES.has(currentModel)) return generateChannel === 'chatgpt2api' ? '渠道五 GPT-Image2' : generateChannel === 'lovart' ? '渠道七 Lovart' : '渠道四 GPT-Image2';
-    if (rowType === 'video' && IMAGE_MODEL_NAMES.has(currentModel)) return generateChannel === 'oiioii' ? '渠道四 Gemini' : generateChannel === 'dola' ? '渠道六 Seedance 2.0' : generateChannel === 'framia' ? '渠道九 Seedance 2.0 Mini' : generateChannel === 'tensorart' ? '渠道十 Tensor.Art 视频' : 'Seedance 2.0';
+    if (rowType === 'video' && IMAGE_MODEL_NAMES.has(currentModel)) return generateChannel === 'oiioii' ? '渠道四 Gemini' : generateChannel === 'dola' ? '渠道六 Seedance 2.0' : generateChannel === 'framia' ? '渠道九 Seedance 2.0 Mini' : generateChannel === 'tensorart' ? '渠道十 Tensor.Art 视频' : generateChannel === 'happyhorse' ? '渠道十一 HappyHorse R2V' : generateChannel === 'insmind' ? '渠道十二 insMind Seedance 2.0 Mini' : 'Seedance 2.0';
     return currentModel;
   };
   const getRowMediaLabel = (row) => {
@@ -3635,6 +3652,15 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
 
   const updateGlobalDuration = (duration) => {
     setGlobalDuration(duration);
+    // 渠道十二：非 5 秒时强制 480P（SKU 约束）
+    if (generateChannel === 'insmind') {
+      const sec = Math.round(parseDurationSeconds(duration, 5));
+      if (sec !== 5 && String(globalResolution).toUpperCase().includes('720')) {
+        setGlobalResolution('480P');
+        setSegments(prev => prev.map(seg => ({ ...seg, duration, quality: '480P', resolution: '480P' })));
+        return;
+      }
+    }
     setSegments(prev => prev.map(seg => ({ ...seg, duration })));
   };
 
@@ -3676,8 +3702,36 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       10,
       Math.max(4, Math.round(parseDurationSeconds(globalDuration, 4))),
     );
-    const nextDuration = nextChannel === 'tensorart' ? `${tensorartDurationSeconds}秒` : globalDuration;
-    const nextResolution = nextChannel === 'tensorart' ? '480p' : globalResolution;
+    const happyhorseDurationSeconds = Math.min(
+      15,
+      Math.max(3, Math.round(parseDurationSeconds(globalDuration, 3))),
+    );
+    const insmindDurationSeconds = (() => {
+      const raw = Math.round(parseDurationSeconds(globalDuration, 5));
+      const options = [5, 10, 15];
+      return options.reduce((best, cur) => (Math.abs(cur - raw) < Math.abs(best - raw) ? cur : best), 5);
+    })();
+    const nextDuration = nextChannel === 'tensorart'
+      ? `${tensorartDurationSeconds}秒`
+      : nextChannel === 'happyhorse'
+        ? `${happyhorseDurationSeconds}秒`
+        : nextChannel === 'insmind'
+          ? `${insmindDurationSeconds}秒`
+          : globalDuration;
+    const happyhorseResolution = ['1080p', '1080'].includes(String(globalResolution || '').toLowerCase())
+      ? '1080p'
+      : '720p';
+    // 渠道十二：10s/15s 仅 480P；720P 仅 5s
+    const insmindResolution = (insmindDurationSeconds === 5 && String(globalResolution || '').toUpperCase().includes('720'))
+      ? '720P'
+      : '480P';
+    const nextResolution = nextChannel === 'tensorart'
+      ? '480p'
+      : nextChannel === 'happyhorse'
+        ? happyhorseResolution
+        : nextChannel === 'insmind'
+          ? insmindResolution
+          : globalResolution;
     const nextAspectRatio = normalizeAspectRatio(globalAspectRatio, {
       channel: nextChannel,
       modelName,
@@ -3687,7 +3741,7 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     setGenerateChannel(nextChannel);
     setModelPopoverTab(nextType);
     setGlobalAspectRatio(nextAspectRatio);
-    if (nextChannel === 'tensorart') {
+    if (nextChannel === 'tensorart' || nextChannel === 'happyhorse' || nextChannel === 'insmind') {
       setGlobalDuration(nextDuration);
       setGlobalResolution(nextResolution);
     }
@@ -4420,6 +4474,12 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     if (generateChannel === 'framia') {
       return handleGenerateFramia(id, options);
     }
+    if (generateChannel === 'happyhorse') {
+      return handleGenerateHappyHorse(id, options);
+    }
+    if (generateChannel === 'insmind') {
+      return handleGenerateInsmind(id, options);
+    }
     if (generateChannel === 'tensorart') {
       return handleGenerateTensorArt(id, options);
     }
@@ -4589,6 +4649,8 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
     lovart: '渠道七 Lovart',
     oreateai: '渠道八 OreateAI',
     framia: '渠道九 Framia',
+    happyhorse: '渠道十一 HappyHorse',
+    insmind: '渠道十二 insMind',
     tensorart: '渠道十 Tensor.Art',
   }[channel] || '当前通道');
 
@@ -4798,6 +4860,179 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
       return true;
     } catch (e) {
       console.error('[framia] generate failed:', e);
+      if (!silent) alert(`生成失败: ${e.message || e}`);
+      clearRowGenerationPlaceholder(id);
+      return false;
+    }
+  };
+
+  const handleGenerateInsmind = async (id, options = {}) => {
+    const silent = !!options.silent;
+    try {
+      const seg = segments.find(s => s.id === id);
+      const promptText = buildPromptWithSuffix(promptDraftsRef.current[id] ?? seg?.text).trim();
+      if (!promptText) {
+        if (!silent) alert('请先填写该分镜的描述词再生成');
+        resetRowGenerationState(id);
+        return false;
+      }
+
+      const imagePaths = [...new Set([
+        getReferenceLocalPath(seg),
+        ...getSegmentCharacterImageRefs(seg, promptText).map(imageRefToReference),
+        ...getSegmentSceneImageRefs(promptText).map(imageRefToReference),
+      ].filter(Boolean))];
+      const imageUrls = [...new Set([getReferenceRemoteUrl(seg)].filter(Boolean))];
+      if (imagePaths.length === 0 && imageUrls.length === 0) {
+        if (!silent) alert('渠道十二需要至少一张垫图');
+        resetRowGenerationState(id);
+        return false;
+      }
+
+      const durationRaw = Math.round(resolveDurationSeconds(globalDuration, seg?.duration, 5));
+      const durationOptions = [5, 10, 15];
+      const duration = durationOptions.reduce(
+        (best, cur) => (Math.abs(cur - durationRaw) < Math.abs(best - durationRaw) ? cur : best),
+        5,
+      );
+      const resRaw = String(seg?.quality || globalResolution || '480P').toUpperCase();
+      let resolution = resRaw.includes('720') ? '720P' : '480P';
+      if (duration !== 5) resolution = '480P';
+      const createRes = await fetch(`${WIZSTAR_API}/insmind/tasks/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: promptText,
+          image_paths: imagePaths,
+          image_urls: imageUrls,
+          aspect_ratio: seg?.aspectRatio || globalAspectRatio || 'original',
+          resolution,
+          duration,
+        }),
+      });
+      if (!createRes.ok) {
+        let message = `HTTP ${createRes.status}`;
+        try { const error = await createRes.json(); message = error.detail || message; } catch (_) {}
+        throw new Error(message);
+      }
+      const payload = (await createRes.json()).data || {};
+      const taskId = payload.task_id;
+      if (!taskId) throw new Error('渠道十二未返回 task_id');
+
+      registerGenerationTask(id, taskId, 'insmind', 'video', {
+        accountName: payload.account_name || 'insMind',
+        status: payload.status || 'processing',
+      });
+      setSegments(prev => prev.map(item => item.id === id ? {
+        ...item,
+        type: 'video',
+        model: '渠道十二 insMind Seedance 2.0 Mini',
+        pendingTaskId: taskId,
+        pendingTaskIds: [...new Set([...(item.pendingTaskIds || []), taskId])],
+        pendingPrimaryTaskId: taskId,
+        pendingChannel: 'insmind',
+        pendingAccountName: payload.account_name || 'insMind',
+        generating: true,
+        generateStatus: payload.status || 'processing',
+        generationError: '',
+        activeTaskCount: Math.max(1, [...new Set([...(item.pendingTaskIds || []), taskId])].length),
+      } : item));
+      return true;
+    } catch (error) {
+      console.error('[insmind] generate failed:', error);
+      if (!silent) alert(`生成失败: ${error.message || error}`);
+      clearRowGenerationPlaceholder(id);
+      return false;
+    }
+  };
+
+  const handleGenerateHappyHorse = async (id, options = {}) => {
+    const silent = !!options.silent;
+    try {
+      const seg = segments.find(s => s.id === id);
+      const promptText = buildPromptWithSuffix(promptDraftsRef.current[id] ?? seg?.text);
+
+      if (!promptText || promptText.trim().length === 0) {
+        alert('请先填写该分镜的描述词再生成');
+        resetRowGenerationState(id);
+        return false;
+      }
+
+      const localImagePath = getReferenceLocalPath(seg);
+      const selectedModelName = '渠道十一 HappyHorse R2V';
+      const aspectRatio = normalizeAspectRatio(seg?.aspectRatio || globalAspectRatio, {
+        channel: 'happyhorse',
+        modelName: selectedModelName,
+        mediaType: 'video',
+      });
+      // 官网：时长 3–15s；分辨率仅 720p / 1080p（480p 会远端失败）
+      const durationSec = Math.min(15, Math.max(3, Math.round(resolveDurationSeconds(globalDuration, seg?.duration, 3))));
+      const rawResolution = String(seg?.quality || globalResolution || '720p').toLowerCase();
+      const resolution = (rawResolution === '1080p' || rawResolution === '1080') ? '1080p' : '720p';
+
+      const allImagePaths = [
+        localImagePath,
+        ...getSegmentCharacterImageRefs(seg, promptText).map(imageRefToReference),
+        ...getSegmentSceneImageRefs(promptText).map(imageRefToReference),
+      ].filter(Boolean);
+      const imagePaths = [...new Set(allImagePaths)];
+      if (imagePaths.length === 0) {
+        alert('渠道十一需要至少一张本地垫图');
+        resetRowGenerationState(id);
+        return false;
+      }
+
+      const body = {
+        prompt: promptText,
+        model: 'HappyHorse R2V 1.5',
+        aspect_ratio: aspectRatio,
+        resolution,
+        duration: durationSec,
+        image_paths: imagePaths,
+      };
+
+      const createRes = await fetch(`${WIZSTAR_API}/happyhorse/tasks/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!createRes.ok) {
+        let errMsg = `HTTP ${createRes.status}`;
+        try { const err = await createRes.json(); errMsg = err.detail || errMsg; } catch (_) {}
+        throw new Error(errMsg);
+      }
+
+      const taskData = await createRes.json();
+      const payload = taskData.data || {};
+      const taskId = payload.task_id;
+      if (!taskId) throw new Error('渠道十一未返回 task_id');
+      const accountId = payload.account_id || 0;
+      const accountName = payload.account_name || (accountId ? `HappyHorse账号 #${accountId}` : '');
+      registerGenerationTask(id, taskId, 'happyhorse', 'video', {
+        accountId,
+        accountName,
+        status: payload.status || 'processing',
+      });
+
+      setSegments(prev => prev.map(s => s.id === id ? {
+        ...s,
+        type: 'video',
+        model: selectedModelName,
+        pendingTaskId: taskId,
+        pendingTaskIds: [...new Set([...(s.pendingTaskIds || []), taskId])],
+        pendingPrimaryTaskId: taskId,
+        pendingChannel: 'happyhorse',
+        pendingAccountId: accountId,
+        pendingAccountName: accountName,
+        generating: true,
+        generateStatus: payload.status || 'processing',
+        generationError: '',
+        activeTaskCount: Math.max(1, [...new Set([...(s.pendingTaskIds || []), taskId])].length),
+      } : s));
+      return true;
+    } catch (e) {
+      console.error('[happyhorse] generate failed:', e);
       if (!silent) alert(`生成失败: ${e.message || e}`);
       clearRowGenerationPlaceholder(id);
       return false;
@@ -6173,6 +6408,18 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   className={`px-1.5 py-0.5 text-[8px] font-bold transition-all ${generateChannel === 'tensorart' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
                   title="渠道十（Tensor.Art · 图生视频）"
                 >渠道十</button>
+                <button
+                  type="button"
+                  onClick={() => selectGenerationModel('渠道十一 HappyHorse R2V', 'happyhorse')}
+                  className={`px-1.5 py-0.5 text-[8px] font-bold transition-all ${generateChannel === 'happyhorse' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+                  title="渠道十一（HappyHorse · Google 登录图生视频）"
+                >渠道十一</button>
+                <button
+                  type="button"
+                  onClick={() => selectGenerationModel('渠道十二 insMind Seedance 2.0 Mini', 'insmind')}
+                  className={`px-1.5 py-0.5 text-[8px] font-bold transition-all ${generateChannel === 'insmind' ? 'bg-brand text-black' : 'text-dark-muted hover:text-white'}`}
+                  title="渠道十二（insMind · Seedance 图生视频）"
+                >渠道十二</button>
               </div>
             </div>
           </div>
@@ -6216,6 +6463,16 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
           {generateChannel === 'framia' && (
             <div className="mb-1.5 px-2 py-1 rounded-md bg-teal-500/10 border border-teal-500/30 text-[8px] text-teal-300 leading-snug">
               渠道九 Framia：需先在「设置 → 渠道九」通过 Google OAuth 登录采集账号。支持文生视频和图生视频，使用 Seedance / Kling 模型。
+            </div>
+          )}
+          {generateChannel === 'happyhorse' && (
+            <div className="mb-1.5 px-2 py-1 rounded-md bg-emerald-500/10 border border-emerald-500/30 text-[8px] text-emerald-300 leading-snug">
+              渠道十一 HappyHorse：需先在账号池通过 Google OAuth 登录采集账号。图生视频（R2V）支持 3–15 秒、720p/1080p，请为分镜设置本地垫图。
+            </div>
+          )}
+          {generateChannel === 'insmind' && (
+            <div className="mb-1.5 px-2 py-1 rounded-md bg-sky-500/10 border border-sky-500/30 text-[8px] text-sky-300 leading-snug">
+              渠道十二 insMind：需先在设置/账号池注册或导入 token。免费 SKU：5 秒 480P/720P；10/15 秒仅 480P。请为分镜设置垫图。
             </div>
           )}
           {generateChannel === 'tensorart' && (
@@ -6537,6 +6794,52 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                       <span className="absolute top-0.5 right-0.5 scale-75 origin-top-right text-violet-300 text-[6px] font-bold">T10</span>
                       <span className="text-[9px] leading-tight font-semibold text-center">Tensor.Art 默认视频</span>
                       <span className="text-[7px] text-dark-muted mt-0.5 scale-90">图生视频 · 4–10s / 480p</span>
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] text-dark-muted font-bold uppercase tracking-wider">渠道十一（HappyHorse 视频）</p>
+                    {generateChannel === 'happyhorse' && (
+                      <span className="text-[8px] text-brand font-bold px-1.5 py-0.5 rounded bg-brand/10 border border-brand/30">当前通道</span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => selectGenerationModel('渠道十一 HappyHorse R2V', 'happyhorse')}
+                      className={`py-2.5 px-1 rounded-lg border text-center flex flex-col items-center justify-center relative transition-all ${
+                        globalModel === '渠道十一 HappyHorse R2V' && generateChannel === 'happyhorse'
+                          ? 'border-brand bg-brand/10 text-brand font-bold shadow-[0_0_8px_rgba(16,185,129,0.15)]'
+                          : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'
+                      }`}
+                    >
+                      <span className="absolute top-0.5 right-0.5 scale-75 origin-top-right text-emerald-300 text-[6px] font-bold">H11</span>
+                      <span className="text-[9px] leading-tight font-semibold text-center">HappyHorse R2V</span>
+                      <span className="text-[7px] text-dark-muted mt-0.5 scale-90">图生视频 · 3–15s / 720p·1080p</span>
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-[10px] text-dark-muted font-bold uppercase tracking-wider">渠道十二（insMind 视频）</p>
+                    {generateChannel === 'insmind' && (
+                      <span className="text-[8px] text-brand font-bold px-1.5 py-0.5 rounded bg-brand/10 border border-brand/30">当前通道</span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => selectGenerationModel('渠道十二 insMind Seedance 2.0 Mini', 'insmind')}
+                      className={`py-2.5 px-1 rounded-lg border text-center flex flex-col items-center justify-center relative transition-all ${
+                        globalModel === '渠道十二 insMind Seedance 2.0 Mini' && generateChannel === 'insmind'
+                          ? 'border-brand bg-brand/10 text-brand font-bold shadow-[0_0_8px_rgba(16,185,129,0.15)]'
+                          : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'
+                      }`}
+                    >
+                      <span className="absolute top-0.5 right-0.5 scale-75 origin-top-right text-sky-300 text-[6px] font-bold">I12</span>
+                      <span className="text-[9px] leading-tight font-semibold text-center">insMind Seedance Mini</span>
+                      <span className="text-[7px] text-dark-muted mt-0.5 scale-90">图生视频 · 5/10/15s · 480–720P</span>
                     </button>
                   </div>
                 </div>
@@ -7112,6 +7415,61 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   </div>
                 )}
 
+                {/* Section 2b: 渠道十一视频分辨率 */}
+                {getModelMediaType(globalModel) === 'video' && generateChannel === 'happyhorse' && (
+                  <div>
+                    <p className="text-[10px] text-dark-muted font-bold mb-2 uppercase tracking-wider">视频分辨率</p>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {['720p', '1080p'].map(q => (
+                        <button
+                          key={q}
+                          type="button"
+                          onClick={() => updateGlobalResolution(q)}
+                          className={`py-1.5 rounded-lg border text-center text-[10px] font-bold transition-all ${
+                            globalResolution === q
+                              ? 'border-brand bg-brand/10 text-brand font-extrabold shadow-[0_0_6px_rgba(16,185,129,0.15)]'
+                              : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'
+                          }`}
+                        >
+                          {q.toUpperCase()}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Section 2c: 渠道十二视频分辨率 */}
+                {getModelMediaType(globalModel) === 'video' && generateChannel === 'insmind' && (
+                  <div>
+                    <p className="text-[10px] text-dark-muted font-bold mb-2 uppercase tracking-wider">视频分辨率</p>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {['480P', '720P'].map(q => {
+                        const durationSec = Math.round(parseDurationSeconds(globalDuration, 5));
+                        const disabled = q === '720P' && durationSec !== 5;
+                        return (
+                        <button
+                          key={q}
+                          type="button"
+                          disabled={disabled}
+                          onClick={() => updateGlobalResolution(q)}
+                          className={`py-1.5 rounded-lg border text-center text-[10px] font-bold transition-all ${
+                            disabled
+                              ? 'border-dark-border bg-[#1a1b1f] text-dark-muted/50 cursor-not-allowed'
+                              : String(globalResolution).toUpperCase() === q
+                              ? 'border-brand bg-brand/10 text-brand font-extrabold shadow-[0_0_6px_rgba(16,185,129,0.15)]'
+                              : 'border-dark-border bg-[#222328] hover:border-dark-subtle text-white'
+                          }`}
+                          title={disabled ? '720P 仅支持 5 秒' : undefined}
+                        >
+                          {q}
+                        </button>
+                        );
+                      })}
+                    </div>
+                    <p className="mt-1.5 text-[8px] text-dark-muted">720P 仅 5 秒；10/15 秒自动使用 480P</p>
+                  </div>
+                )}
+
                 {/* Section 3: 视频时长 */}
                 {getModelMediaType(globalModel) === 'video' && generateChannel !== 'oreateai' && (
                 <div>
@@ -7119,6 +7477,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                   <div className="grid grid-cols-7 gap-1">
                     {(generateChannel === 'tensorart'
                       ? TENSORART_DURATION_OPTIONS
+                      : generateChannel === 'happyhorse'
+                        ? ['3秒', '4秒', '5秒', '6秒', '7秒', '8秒', '9秒', '10秒', '11秒', '12秒', '13秒', '14秒', '15秒']
+                      : generateChannel === 'insmind'
+                        ? ['5秒', '10秒', '15秒']
                       : ['2秒', '3秒', '4秒', '5秒', '6秒', '7秒', '8秒', '9秒', '10秒', '11秒', '12秒', '13秒', '14秒', '15秒']
                     ).map(d => (
                       <button
@@ -7506,6 +7868,10 @@ export default function ContentCreation({ activeDraft, onBack, onProjectChanged 
                                     ? 'dola'
                                     : nextModel.startsWith('渠道九')
                                       ? 'framia'
+                                      : nextModel.startsWith('渠道十一')
+                                        ? 'happyhorse'
+                                      : nextModel.startsWith('渠道十二')
+                                        ? 'insmind'
                                       : nextModel.startsWith('渠道十')
                                         ? 'tensorart'
                                         : 'wizstar';

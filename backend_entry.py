@@ -26,9 +26,12 @@ def _setup_paths() -> None:
     base = _base_dir()
     # 内层包父目录（使 `import wizstar` 命中真正的包）
     pkg_parent = os.path.join(base, "wizstar")
-    # QuickFrame SDK（被 quickframe_bridge 动态 import chain_proxy / register_full 等）
-    sdk_dir = os.path.join(base, "quickframe-sdk-full")
-    for p in (pkg_parent, sdk_dir):
+    # 外部 SDK（桥接模块按顶层包导入）
+    sdk_dirs = (
+        os.path.join(base, "quickframe-sdk-full"),
+        os.path.join(base, "insmind-sdk"),
+    )
+    for p in (pkg_parent, *sdk_dirs):
         if os.path.isdir(p) and p not in sys.path:
             sys.path.insert(0, p)
 

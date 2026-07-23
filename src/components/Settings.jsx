@@ -10,7 +10,9 @@ import {
   XCircle,
   Activity,
   KeyRound,
-  Globe
+  Globe,
+  Coins,
+  Sparkles,
 } from 'lucide-react';
 import { WIZSTAR_API, WIZSTAR_PORT } from '../config';
 
@@ -187,6 +189,28 @@ export default function Settings({ focusSection = '' }) {
   const [tensorartAccountCount, setTensorartAccountCount] = useState(0);
   const [tensorartRegistering, setTensorartRegistering] = useState(false);
   const [tensorartResult, setTensorartResult] = useState(null);
+  const [happyhorseAccountCount, setHappyhorseAccountCount] = useState(0);
+  const [happyhorseLoginEmail, setHappyhorseLoginEmail] = useState('');
+  const [happyhorseLoginPassword, setHappyhorseLoginPassword] = useState('');
+  const [happyhorseLoggingIn, setHappyhorseLoggingIn] = useState(false);
+  const [happyhorseQuerying, setHappyhorseQuerying] = useState(false);
+  const [happyhorseSigning, setHappyhorseSigning] = useState(false);
+  const [happyhorseResult, setHappyhorseResult] = useState(null);
+  const [happyhorseCredits, setHappyhorseCredits] = useState(null);
+  const [insmindAccountCount, setInsmindAccountCount] = useState(0);
+  const [insmindRegistering, setInsmindRegistering] = useState(false);
+  const [insmindResult, setInsmindResult] = useState(null);
+  const [insmindImportEmail, setInsmindImportEmail] = useState('');
+  const [insmindImportToken, setInsmindImportToken] = useState('');
+  const [insmindImporting, setInsmindImporting] = useState(false);
+  const [insmindUseProxy, setInsmindUseProxy] = useState(true);
+  const [insmindProxyHost, setInsmindProxyHost] = useState('us.ipwo.net');
+  const [insmindProxyPort, setInsmindProxyPort] = useState(7878);
+  const [insmindProxyUser, setInsmindProxyUser] = useState('mengjun66_custom_zone_JP');
+  const [insmindProxyPass, setInsmindProxyPass] = useState('mengjun66');
+  const [insmindProxySaving, setInsmindProxySaving] = useState(false);
+  const [insmindProxyTesting, setInsmindProxyTesting] = useState(false);
+  const [insmindProxyResult, setInsmindProxyResult] = useState(null);
   const oiioiiSectionRef = useRef(null);
 
   const loadOiConfig = async () => {
@@ -306,6 +330,261 @@ export default function Settings({ focusSection = '' }) {
     }
   };
 
+  const loadHappyhorseAccounts = async () => {
+    try {
+      const res = await fetchLocalApi('/happyhorse/accounts');
+      const data = await res.json();
+      const accounts = Array.isArray(data.data) ? data.data : [];
+      setHappyhorseAccountCount(accounts.filter((a) => a.has_token || a.configured).length || accounts.length);
+    } catch (_) { /* backend offline */ }
+  };
+
+  const loginHappyhorseAccount = async () => {
+    if (!happyhorseLoginEmail.trim() || !happyhorseLoginPassword.trim()) {
+      setHappyhorseResult({ ok: false, msg: '请输入邮箱和密码' });
+      return;
+    }
+    setHappyhorseLoggingIn(true);
+    setHappyhorseResult(null);
+    try {
+      const res = await fetchLocalApi('/happyhorse/accounts/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: happyhorseLoginEmail.trim(),
+          password: happyhorseLoginPassword.trim(),
+          visible: true,
+          keep_open: false,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || '登录失败');
+      const skipped = Boolean(data?.data?.skipped);
+      setHappyhorseResult({
+        ok: true,
+        msg: skipped
+          ? `${happyhorseLoginEmail.trim()} 此前已登录，已跳过重复登录`
+          : `已登录 ${happyhorseLoginEmail.trim()}，accessToken 已采集`,
+      });
+      if (!skipped) {
+        setHappyhorseLoginEmail('');
+        setHappyhorseLoginPassword('');
+      }
+      await loadHappyhorseAccounts();
+    } catch (error) {
+      setHappyhorseResult({ ok: false, msg: error.message || String(error) });
+    } finally {
+      setHappyhorseLoggingIn(false);
+    }
+  };
+
+  const queryHappyhorseCredits = async () => {
+    setHappyhorseQuerying(true);
+    setHappyhorseResult(null);
+    try {
+      const res = await fetchLocalApi('/happyhorse/credits');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || '查询积分失败');
+      const credits = data.data || {};
+      setHappyhorseCredits(credits);
+      setHappyhorseResult({
+        ok: true,
+        msg: `${credits.account_name || '账号'} 可用积分 ${credits.credits_balance ?? credits.available_count ?? '-'}`,
+      });
+    } catch (error) {
+      setHappyhorseResult({ ok: false, msg: error.message || String(error) });
+    } finally {
+      setHappyhorseQuerying(false);
+    }
+  };
+
+  const signinHappyhorseDaily = async () => {
+    setHappyhorseSigning(true);
+    setHappyhorseResult(null);
+    try {
+      const res = await fetchLocalApi('/happyhorse/credits/daily-signin', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || '每日签到失败');
+      const result = data.data || {};
+      setHappyhorseCredits({
+        credits_balance: result.credits_balance,
+        available_count: result.available_count,
+        play_code_details: result.play_code_details,
+        account_name: result.account_name,
+        account_id: result.account_id,
+      });
+      setHappyhorseResult({
+        ok: true,
+        msg: `签到成功 +${result.grant_points ?? 0}，当前可用 ${result.credits_balance ?? result.available_count ?? '-'}`,
+      });
+    } catch (error) {
+      setHappyhorseResult({ ok: false, msg: error.message || String(error) });
+    } finally {
+      setHappyhorseSigning(false);
+    }
+  };
+
+  const loadInsmindAccounts = async () => {
+    try {
+      const res = await fetchLocalApi('/insmind/accounts');
+      const data = await res.json();
+      const accounts = Array.isArray(data.data) ? data.data : [];
+      setInsmindAccountCount(accounts.filter((a) => a.configured || a.has_token).length || accounts.length);
+    } catch (_) { /* backend offline */ }
+  };
+
+  const loadInsmindConfig = async () => {
+    try {
+      const res = await fetchLocalApi('/insmind/config');
+      const data = await res.json();
+      const d = data.data || {};
+      setInsmindUseProxy(d.use_proxy !== undefined ? !!d.use_proxy : true);
+      setInsmindProxyHost(d.proxy_host || 'us.ipwo.net');
+      setInsmindProxyPort(d.proxy_port || 7878);
+      setInsmindProxyUser(d.proxy_user || 'mengjun66_custom_zone_JP');
+      if (d.proxy_pass) setInsmindProxyPass(d.proxy_pass);
+      setInsmindAccountCount(d.account_count || 0);
+    } catch (_) { /* backend offline */ }
+  };
+
+  const saveInsmindProxyConfig = async (withTest = false) => {
+    setInsmindProxySaving(true);
+    if (withTest) setInsmindProxyTesting(true);
+    setInsmindProxyResult(null);
+    try {
+      const res = await fetchLocalApi('/insmind/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          use_proxy: insmindUseProxy,
+          proxy_host: insmindProxyHost,
+          proxy_port: parseInt(insmindProxyPort, 10) || 7878,
+          proxy_user: insmindProxyUser,
+          proxy_pass: insmindProxyPass,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || '保存失败');
+      const d = data.data || {};
+      setInsmindUseProxy(!!d.use_proxy);
+      setInsmindProxyHost(d.proxy_host || insmindProxyHost);
+      setInsmindProxyPort(d.proxy_port || insmindProxyPort);
+      setInsmindProxyUser(d.proxy_user || insmindProxyUser);
+
+      if (withTest) {
+        const testRes = await fetchLocalApi('/insmind/test-proxy', { method: 'POST' });
+        const testData = await testRes.json().catch(() => ({}));
+        if (!testRes.ok) throw new Error(testData.detail || '代理测试失败');
+        const t = testData.data || {};
+        setInsmindProxyResult({
+          ok: !!t.ok,
+          msg: t.message || (t.ok ? `出口 IP: ${t.exit_ip}` : '代理测试失败'),
+        });
+      } else {
+        setInsmindProxyResult({ ok: true, msg: '动态代理配置已保存' });
+      }
+    } catch (error) {
+      setInsmindProxyResult({ ok: false, msg: error.message || String(error) });
+    } finally {
+      setInsmindProxySaving(false);
+      setInsmindProxyTesting(false);
+    }
+  };
+
+  const registerInsmindAccount = async () => {
+    setInsmindRegistering(true);
+    setInsmindResult(null);
+    try {
+      const res = await fetchLocalApi('/insmind/accounts/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson, application/json' },
+        body: JSON.stringify({ count: 1, concurrency: 1 }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || '注册失败');
+      }
+
+      let finalSummary = null;
+      let lastError = '';
+      const contentType = String(res.headers.get('content-type') || '');
+      if (!res.body || !res.body.getReader || contentType.includes('application/json')) {
+        const data = await res.json().catch(() => ({}));
+        finalSummary = data.data || {};
+      } else {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            let event;
+            try {
+              event = JSON.parse(trimmed);
+            } catch {
+              continue;
+            }
+            if (event.event === 'item' && event.result && !event.result.ok) {
+              lastError = event.result.error || lastError;
+            }
+            if (event.event === 'done') finalSummary = event;
+            if (event.event === 'error') throw new Error(event.error || '注册失败');
+          }
+        }
+      }
+
+      const result = finalSummary || {};
+      if (!result.succeeded) {
+        const error = lastError
+          || (result.results || []).find((item) => !item.ok)?.error
+          || '注册失败';
+        throw new Error(error);
+      }
+      setInsmindResult({ ok: true, msg: `渠道十二注册成功：${result.results?.[0]?.email || '已入库'}` });
+      await loadInsmindAccounts();
+    } catch (error) {
+      setInsmindResult({ ok: false, msg: error.message || String(error) });
+    } finally {
+      setInsmindRegistering(false);
+    }
+  };
+
+  const importInsmindAccount = async () => {
+    if (!insmindImportEmail.trim() || !insmindImportToken.trim()) {
+      setInsmindResult({ ok: false, msg: '请填写邮箱与 access_token' });
+      return;
+    }
+    setInsmindImporting(true);
+    setInsmindResult(null);
+    try {
+      const res = await fetchLocalApi('/insmind/accounts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: insmindImportEmail.trim(),
+          access_token: insmindImportToken.trim(),
+          note: '设置页手动导入',
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || '导入失败');
+      setInsmindResult({ ok: true, msg: `已导入 ${insmindImportEmail.trim()}` });
+      setInsmindImportEmail('');
+      setInsmindImportToken('');
+      await loadInsmindAccounts();
+    } catch (error) {
+      setInsmindResult({ ok: false, msg: error.message || String(error) });
+    } finally {
+      setInsmindImporting(false);
+    }
+  };
+
   useEffect(() => {
     loadPxConfig();
     loadCgConfig();
@@ -314,6 +593,9 @@ export default function Settings({ focusSection = '' }) {
     loadOreateaiAccounts();
     loadFramiaAccounts();
     loadTensorartAccounts();
+    loadHappyhorseAccounts();
+    loadInsmindAccounts();
+    loadInsmindConfig();
   }, []);
 
   useEffect(() => {
@@ -1039,6 +1321,255 @@ export default function Settings({ focusSection = '' }) {
             </div>
           </div>
 
+          {/* SECTION 9: HappyHorse 渠道十一 — 登录 / 积分 / 签到 */}
+          <div className="space-y-4">
+            <div className="flex items-center justify-between border-b border-dark-border/40 pb-1.5">
+              <div className="flex items-center space-x-2">
+                <Globe className="w-4 h-4 text-emerald-300" />
+                <h3 className="text-xs font-bold text-white uppercase tracking-wider">渠道十一（HappyHorse）</h3>
+              </div>
+              <span className={`flex items-center space-x-1 text-[10px] font-bold ${happyhorseAccountCount > 0 ? 'text-brand' : 'text-amber-400'}`}>
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>{happyhorseAccountCount > 0 ? `${happyhorseAccountCount} 个账号` : '未配置'}</span>
+              </span>
+            </div>
+
+            <div className="rounded-xl border border-dark-border bg-dark-card px-4 py-3">
+              <div className="text-sm font-bold text-white">Google OAuth 登录 + 积分</div>
+              <div className="mt-1 text-[10px] leading-relaxed text-dark-subtle">
+                登录采集 accessToken 后，可查询可用积分（availableCount），并领取每日签到（DAILY_SIGNIN，通常 +50）。批量管理请到「账号池 → 渠道十一」。
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <input
+                  type="email"
+                  placeholder="Google 邮箱"
+                  value={happyhorseLoginEmail}
+                  onChange={(e) => setHappyhorseLoginEmail(e.target.value)}
+                  className="flex-1 px-3 py-2 bg-dark-bg border border-dark-border rounded-lg text-xs text-white placeholder:text-dark-muted focus:outline-none focus:border-brand"
+                />
+                <input
+                  type="password"
+                  placeholder="Google 密码"
+                  value={happyhorseLoginPassword}
+                  onChange={(e) => setHappyhorseLoginPassword(e.target.value)}
+                  className="flex-1 px-3 py-2 bg-dark-bg border border-dark-border rounded-lg text-xs text-white placeholder:text-dark-muted focus:outline-none focus:border-brand"
+                />
+              </div>
+              <div className="flex items-center flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={loginHappyhorseAccount}
+                  disabled={happyhorseLoggingIn}
+                  className="flex items-center space-x-1.5 px-4 py-2 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 rounded-lg text-xs text-black font-bold transition-all"
+                >
+                  {happyhorseLoggingIn ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
+                  <span>{happyhorseLoggingIn ? '登录中...' : '登录并采集'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={queryHappyhorseCredits}
+                  disabled={happyhorseQuerying || happyhorseAccountCount === 0}
+                  className="flex items-center space-x-1.5 px-4 py-2 bg-yellow-500/20 hover:bg-yellow-500/30 disabled:opacity-50 rounded-lg text-xs text-yellow-300 font-bold transition-all"
+                >
+                  {happyhorseQuerying ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Coins className="w-3.5 h-3.5" />}
+                  <span>{happyhorseQuerying ? '查询中...' : '查询积分'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={signinHappyhorseDaily}
+                  disabled={happyhorseSigning || happyhorseAccountCount === 0}
+                  className="flex items-center space-x-1.5 px-4 py-2 bg-brand/20 hover:bg-brand/30 disabled:opacity-50 rounded-lg text-xs text-brand font-bold transition-all"
+                >
+                  {happyhorseSigning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+                  <span>{happyhorseSigning ? '签到中...' : '每日签到'}</span>
+                </button>
+                {happyhorseResult && (
+                  <span className={`flex items-center space-x-1.5 text-[11px] font-medium ${happyhorseResult.ok ? 'text-brand' : 'text-red-400'}`}>
+                    {happyhorseResult.ok ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <XCircle className="w-3.5 h-3.5 shrink-0" />}
+                    <span>{happyhorseResult.msg}</span>
+                  </span>
+                )}
+              </div>
+              {happyhorseCredits && (
+                <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-[11px] text-emerald-200/90">
+                  <div>
+                    账号 {happyhorseCredits.account_name || '-'} · 可用积分{' '}
+                    <span className="font-bold text-emerald-300">
+                      {happyhorseCredits.credits_balance ?? happyhorseCredits.available_count ?? '-'}
+                    </span>
+                  </div>
+                  {Array.isArray(happyhorseCredits.play_code_details) && happyhorseCredits.play_code_details.length > 0 && (
+                    <div className="mt-1 text-dark-muted">
+                      {happyhorseCredits.play_code_details.map((item) => (
+                        <span key={`${item.playCode}-${item.availableCount}`} className="mr-3">
+                          {item.playCode}: {item.availableCount}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* SECTION 10: insMind 渠道十二 — 动态代理 + GPTMail 注册 / 导入 token */}
+          <div className="space-y-4">
+            <div className="flex items-center justify-between border-b border-dark-border/40 pb-1.5">
+              <div className="flex items-center space-x-2">
+                <Globe className="w-4 h-4 text-sky-300" />
+                <h3 className="text-xs font-bold text-white uppercase tracking-wider">渠道十二（insMind）</h3>
+              </div>
+              <span className={`flex items-center space-x-1 text-[10px] font-bold ${insmindAccountCount > 0 ? 'text-brand' : 'text-amber-400'}`}>
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>{insmindAccountCount > 0 ? `${insmindAccountCount} 个账号` : '未配置'}</span>
+              </span>
+            </div>
+
+            {/* 动态代理 */}
+            <div className="space-y-2.5 rounded-xl border border-dark-border bg-dark-card px-4 py-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2">
+                  <Globe className="w-3.5 h-3.5 text-dark-muted" />
+                  <span className="text-[10px] font-bold text-dark-muted uppercase">动态代理（注册用）</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setInsmindUseProxy((v) => !v)}
+                  className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${insmindUseProxy ? 'bg-sky-500' : 'bg-dark-border'}`}
+                  title={insmindUseProxy ? '已开启动态代理' : '未开启（直连，易限流）'}
+                >
+                  <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${insmindUseProxy ? 'translate-x-4' : 'translate-x-1'}`} />
+                </button>
+              </div>
+              <div className={`grid grid-cols-2 gap-3 transition-opacity ${insmindUseProxy ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
+                <div className="space-y-1">
+                  <label className="text-[9px] font-bold text-dark-subtle uppercase">主机</label>
+                  <input
+                    type="text"
+                    value={insmindProxyHost}
+                    onChange={(e) => setInsmindProxyHost(e.target.value)}
+                    placeholder="us.ipwo.net"
+                    className="w-full bg-dark-input text-xs border border-dark-border focus:border-sky-500 focus:outline-none rounded-lg p-2 text-white"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[9px] font-bold text-dark-subtle uppercase">端口</label>
+                  <input
+                    type="number"
+                    value={insmindProxyPort}
+                    onChange={(e) => setInsmindProxyPort(e.target.value)}
+                    placeholder="7878"
+                    className="w-full bg-dark-input text-xs border border-dark-border focus:border-sky-500 focus:outline-none rounded-lg p-2 text-white"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[9px] font-bold text-dark-subtle uppercase">用户名</label>
+                  <input
+                    type="text"
+                    value={insmindProxyUser}
+                    onChange={(e) => setInsmindProxyUser(e.target.value)}
+                    placeholder="mengjun66_custom_zone_JP"
+                    className="w-full bg-dark-input text-xs border border-dark-border focus:border-sky-500 focus:outline-none rounded-lg p-2 text-white"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[9px] font-bold text-dark-subtle uppercase">密码</label>
+                  <input
+                    type="password"
+                    value={insmindProxyPass}
+                    onChange={(e) => setInsmindProxyPass(e.target.value)}
+                    placeholder="proxy password"
+                    className="w-full bg-dark-input text-xs border border-dark-border focus:border-sky-500 focus:outline-none rounded-lg p-2 text-white"
+                  />
+                </div>
+              </div>
+              <span className="text-[9px] text-dark-subtle block leading-relaxed">
+                注册时走动态 IP，可缓解 UMS「短信发送次数超限」(1001012)。面板里的短用户名 <code className="text-sky-300 font-mono">mengjun66</code> 会 407，需带 zone 的完整用户名（默认已填）。
+              </span>
+              <div className="flex items-center flex-wrap gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => saveInsmindProxyConfig(false)}
+                  disabled={insmindProxySaving || insmindProxyTesting}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 bg-sky-500/15 hover:bg-sky-500/25 disabled:opacity-50 rounded-lg text-[11px] text-sky-300 font-bold transition-all"
+                >
+                  {insmindProxySaving && !insmindProxyTesting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                  <span>保存代理</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => saveInsmindProxyConfig(true)}
+                  disabled={insmindProxySaving || insmindProxyTesting}
+                  className="flex items-center space-x-1.5 px-3 py-1.5 bg-emerald-500/15 hover:bg-emerald-500/25 disabled:opacity-50 rounded-lg text-[11px] text-emerald-300 font-bold transition-all"
+                >
+                  {insmindProxyTesting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Globe className="w-3.5 h-3.5" />}
+                  <span>{insmindProxyTesting ? '测试中...' : '保存并测试出口'}</span>
+                </button>
+                {insmindProxyResult && (
+                  <span className={`flex items-center space-x-1.5 text-[11px] font-medium ${insmindProxyResult.ok ? 'text-brand' : 'text-red-400'}`}>
+                    {insmindProxyResult.ok ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <XCircle className="w-3.5 h-3.5 shrink-0" />}
+                    <span>{insmindProxyResult.msg}</span>
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-dark-border bg-dark-card px-4 py-3">
+              <div className="text-sm font-bold text-white">GPTMail 注册 / 导入 token</div>
+              <div className="mt-1 text-[10px] leading-relaxed text-dark-subtle">
+                一键用 GPTMail 邮箱验证码注册（需 YesCaptcha Key，与渠道三共用），或粘贴已有 access_token。免费 SKU：5s 480P/720P，10s/15s 仅 480P。批量管理请到「账号池 → 渠道十二」。
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex items-center gap-3">
+                <input
+                  type="email"
+                  placeholder="邮箱（导入用）"
+                  value={insmindImportEmail}
+                  onChange={(e) => setInsmindImportEmail(e.target.value)}
+                  className="flex-1 px-3 py-2 bg-dark-bg border border-dark-border rounded-lg text-xs text-white placeholder:text-dark-muted focus:outline-none focus:border-brand"
+                />
+                <input
+                  type="password"
+                  placeholder="access_token"
+                  value={insmindImportToken}
+                  onChange={(e) => setInsmindImportToken(e.target.value)}
+                  className="flex-1 px-3 py-2 bg-dark-bg border border-dark-border rounded-lg text-xs text-white placeholder:text-dark-muted focus:outline-none focus:border-brand"
+                />
+              </div>
+              <div className="flex items-center flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={registerInsmindAccount}
+                  disabled={insmindRegistering}
+                  className="flex items-center space-x-1.5 px-4 py-2 bg-sky-500 hover:bg-sky-400 disabled:opacity-50 rounded-lg text-xs text-black font-bold transition-all"
+                >
+                  {insmindRegistering ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+                  <span>{insmindRegistering ? '注册中...' : 'GPTMail 注册'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={importInsmindAccount}
+                  disabled={insmindImporting}
+                  className="flex items-center space-x-1.5 px-4 py-2 bg-brand/20 hover:bg-brand/30 disabled:opacity-50 rounded-lg text-xs text-brand font-bold transition-all"
+                >
+                  {insmindImporting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <KeyRound className="w-3.5 h-3.5" />}
+                  <span>{insmindImporting ? '导入中...' : '导入 token'}</span>
+                </button>
+                {insmindResult && (
+                  <span className={`flex items-center space-x-1.5 text-[11px] font-medium ${insmindResult.ok ? 'text-brand' : 'text-red-400'}`}>
+                    {insmindResult.ok ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <XCircle className="w-3.5 h-3.5 shrink-0" />}
+                    <span>{insmindResult.msg}</span>
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+
           {/* Alert Callout */}
           <div className="bg-blue-500/10 border border-blue-500/20 rounded-xl p-3.5 flex items-start space-x-2.5">
             <Info className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
@@ -1047,7 +1578,6 @@ export default function Settings({ focusSection = '' }) {
               如果您配置了本地 GPU 运行，请确保您的计算机上已安装 Python 3.10.x、PyTorch-CUDA 环境，并提前使用 CMD 在控制台运行 <code className="text-brand font-mono">pip install -r requirements.txt</code> 导入扩散所需的第三方依赖包。
             </div>
           </div>
-
           {/* Action Row */}
           <div className="flex items-center space-x-4 pt-3 border-t border-dark-border/40">
             <button 
